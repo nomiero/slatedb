@@ -39,14 +39,15 @@ This design could also unify internal TTL handling (`RetentionIterator`) with us
 
 - Provide a user-friendly API following established SlateDB patterns (`MergeOperator`).
 - Zero overhead when no filter is configured - existing users are unaffected.
-- Async lifecycle hooks for setup/teardown.
+- Async factory method for setup, async hook for teardown.
 - Access to essential compaction metadata.
 - Design that could potentially be used for internal TTL filtering.
 
 ## Non-Goals
 
 - Replacing the internal `RetentionIterator` immediately.
-- Adding the ability to modify keys or add new keys during compaction.
+- Modifying the key bytes of an entry (filters can only modify values).
+- Emitting new entries during compaction (filters can only keep, drop, or modify existing entries).
 
 ## Design
 
@@ -88,9 +89,7 @@ pub struct EntryAttributes {
     pub create_ts: Option<i64>,
     /// The expiration timestamp (if set).
     pub expire_ts: Option<i64>,
-    /// Whether this entry is a tombstone.
-    pub is_tombstone: bool,
-    /// Whether this entry is a merge operand.
+    /// Whether this entry is a merge operand (resolved without a base value).
     pub is_merge: bool,
 }
 
@@ -100,15 +99,6 @@ pub struct EntryAttributes {
 /// on the same thread as the compactor.
 #[async_trait]
 pub trait CompactionFilter: Send + Sync {
-    /// Called before processing entries. Return Err to abort compaction.
-    ///
-    /// Use this hook to initialize state or load needed configuration during
-    /// filtering.
-    async fn on_compaction_start(
-        &mut self,
-        context: &CompactionContext,
-    ) -> Result<(), CompactionFilterError>;
-
     /// Filter a single entry. Should be fast (synchronous, no I/O).
     ///
     /// This method is called for every entry in the compaction. Keep it
@@ -133,13 +123,18 @@ pub trait CompactionFilter: Send + Sync {
 ///
 /// The factory is shared across all compactions and must be thread-safe (`Send + Sync`).
 /// It creates a new filter instance for each compaction job, providing
-/// isolated state per job.
+/// isolated state per job. The async factory method allows for I/O during
+/// filter initialization (e.g., loading configuration, connecting to services).
+#[async_trait]
 pub trait CompactionFilterFactory: Send + Sync {
-    /// Create a filter for a compaction job.
-    fn create_compaction_filter(
+    /// Create a filter for a compaction job. Return Err to abort compaction.
+    ///
+    /// This is the place to perform any async initialization (loading config,
+    /// connecting to external services, etc.) before the filter processes entries.
+    async fn create_compaction_filter(
         &self,
         context: &CompactionContext,
-    ) -> Box<dyn CompactionFilter>;
+    ) -> Result<Box<dyn CompactionFilter>, CompactionFilterInitError>;
 }
 
 ```
@@ -147,12 +142,10 @@ pub trait CompactionFilterFactory: Send + Sync {
 ### Error Type
 
 ```rust
-#[derive(thiserror::Error)]
-pub enum CompactionFilterError {
-    /// Initialization failed in `on_compaction_start`. This aborts the compaction.
-    #[error("filter initialization failed: {0}")]
-    InitializationError(String),
-}
+/// Error returned when filter initialization fails. This aborts the compaction.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("compaction filter initialization failed: {0}")]
+pub struct CompactionFilterInitError(pub String);
 ```
 
 ### Configuration
@@ -184,9 +177,9 @@ SlateDB uses an LSM-tree architecture with two main storage layers:
 ```
 ┌─────────────────────────────────────────────────┐
 │  L0 (newest data)                               │
-│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐               │
-│  │SST 4│ │SST 3│ │SST 2│ │SST 1│               │
-│  └─────┘ └─────┘ └─────┘ └─────┘               │
+│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐                │
+│  │SST 4│ │SST 3│ │SST 2│ │SST 1│                │
+│  └─────┘ └─────┘ └─────┘ └─────┘                │
 ├─────────────────────────────────────────────────┤
 │  Sorted Runs (compacted, older data below)      │
 │                                                 │
@@ -247,6 +240,19 @@ This ordering ensures:
 2. Expired entries and old versions are already removed.
 3. User filters only see "live" entries that would otherwise be written.
 
+### Entry Types and Filter Behavior
+
+The filter behaves differently for different entry types:
+
+- **Values**: Filter is invoked. Normal key-value entries (`is_merge = false`).
+- **Merge operands**: Filter is invoked. Entries where merge operands were resolved
+  without a base value (`is_merge = true`).
+- **Tombstones**: Filter is **skipped**. Passed through unchanged.
+
+**Why skip tombstones?** Tombstones are deletion markers that must be preserved to
+shadow older versions of the same key in lower levels. Allowing filters to modify
+or drop tombstones could cause deleted data to "resurrect."
+
 ### Potential for Internal TTL Unification
 
 Although user filters run after `RetentionIterator`, the `CompactionFilter`
@@ -258,11 +264,11 @@ that would need to be handled in the filter.
 
 ### Error Handling
 
-| Hook | Error Behavior |
-|------|----------------|
-| `on_compaction_start()` | Returns `Result` - errors abort compaction job |
-| `filter()` | Infallible - filters must handle errors internally |
-| `on_compaction_end()` | Infallible - cleanup cannot fail compaction |
+| Method                       | Error Behavior                                     |
+|------------------------------|----------------------------------------------------|
+| `create_compaction_filter()` | Returns `Result` - errors abort compaction job     |
+| `filter()`                   | Infallible - filters must handle errors internally |
+| `on_compaction_end()`        | Infallible - cleanup cannot fail compaction        |
 
 Creating a fresh filter instance per compaction provides:
 
@@ -277,7 +283,7 @@ all entries in a compaction.
 
 ```rust
 use slatedb::{CompactionFilter, CompactionFilterFactory, CompactionContext,
-              CompactionFilterDecision, EntryAttributes, CompactionFilterError};
+              CompactionFilterDecision, EntryAttributes, CompactionFilterInitError};
 use std::sync::Arc;
 use async_trait::async_trait;
 
@@ -289,12 +295,6 @@ struct PrefixDropFilter {
 
 #[async_trait]
 impl CompactionFilter for PrefixDropFilter {
-    async fn on_compaction_start(&mut self, _ctx: &CompactionContext)
-        -> Result<(), CompactionFilterError> {
-        self.dropped_count = 0;
-        Ok(())
-    }
-
     fn filter(&mut self, key: &[u8], _value: Option<&[u8]>, _attrs: &EntryAttributes)
         -> CompactionFilterDecision {
         if key.starts_with(&self.prefix) {
@@ -318,13 +318,14 @@ struct PrefixDropFilterFactory {
     prefix: Vec<u8>,
 }
 
+#[async_trait]
 impl CompactionFilterFactory for PrefixDropFilterFactory {
-    fn create_compaction_filter(&self, _ctx: &CompactionContext)
-        -> Box<dyn CompactionFilter> {
-        Box::new(PrefixDropFilter {
+    async fn create_compaction_filter(&self, _ctx: &CompactionContext)
+        -> Result<Box<dyn CompactionFilter>, CompactionFilterInitError> {
+        Ok(Box::new(PrefixDropFilter {
             prefix: self.prefix.clone(),
             dropped_count: 0,
-        })
+        }))
     }
 }
 
