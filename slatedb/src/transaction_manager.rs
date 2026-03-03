@@ -16,7 +16,7 @@ fn txn_log(msg: std::fmt::Arguments) {
     static LOG_FILE: OnceLock<std::sync::Mutex<std::io::BufWriter<std::fs::File>>> =
         OnceLock::new();
     let writer = LOG_FILE.get_or_init(|| {
-        let dir = std::env::var("ANTITHESIS_ARTIFACT_DIR").unwrap_or_else(|_| "./artifacts".into());
+        let dir = std::env::var("ANTITHESIS_ARTIFACT_DIR").unwrap_or_else(|_| "/artifacts".into());
         std::fs::create_dir_all(&dir).ok();
         let path = std::path::Path::new(&dir).join("txn_manager.log");
         let file = std::fs::OpenOptions::new()
