@@ -295,9 +295,9 @@ impl TransactionManager {
         };
 
         txn_info!(
-            "txn_mgr: check_has_conflict txn={} started_seq={} write_keys={} read_keys_count={} recent_committed_count={}",
+            "txn_mgr: check_has_conflict txn={} started_seq={} write_keys={} read_keys={} recent_committed_count={}",
             txn_id, txn_state.started_seq, fmt_keys(&txn_state.write_keys),
-            txn_state.read_keys.len(), inner.recent_committed_txns.len()
+            fmt_keys(&txn_state.read_keys), inner.recent_committed_txns.len()
         );
 
         // both SI and SSI need to check write-write conflicts
