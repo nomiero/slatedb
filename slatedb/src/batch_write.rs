@@ -30,9 +30,35 @@ use fail_parallel::fail_point;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use log::warn;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
+
+fn txn_log(msg: std::fmt::Arguments) {
+    use std::sync::OnceLock;
+    static LOG_FILE: OnceLock<std::sync::Mutex<std::io::BufWriter<std::fs::File>>> =
+        OnceLock::new();
+    let writer = LOG_FILE.get_or_init(|| {
+        let dir = std::env::var("ANTITHESIS_ARTIFACT_DIR").unwrap_or_else(|_| "./artifacts".into());
+        std::fs::create_dir_all(&dir).ok();
+        let path = std::path::Path::new(&dir).join("txn_manager.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("failed to open txn_manager.log");
+        std::sync::Mutex::new(std::io::BufWriter::new(file))
+    });
+    if let Ok(mut w) = writer.lock() {
+        let _ = writeln!(w, "{}", msg);
+        let _ = w.flush();
+    }
+}
+
+macro_rules! txn_info {
+    ($($arg:tt)*) => { txn_log(format_args!($($arg)*)) };
+}
 
 use crate::config::WriteOptions;
 use crate::dispatcher::MessageHandler;
@@ -131,10 +157,24 @@ impl DbInner {
         let now = options.now;
         let commit_seq = self.oracle.next_seq();
 
+        {
+            let write_keys: Vec<_> = batch.keys().iter()
+                .map(|k| String::from_utf8_lossy(k).to_string())
+                .collect();
+            txn_info!(
+                "write_batch: begin commit_seq={} txn_id={:?} batch_size={} write_keys={:?}",
+                commit_seq, batch.txn_id, batch.ops.len(), write_keys
+            );
+        }
+
         // Check for transaction conflicts before proceeding with the write batch
         // if this batch is part of a transaction.
         if let Some(txn_id) = batch.txn_id.as_ref() {
             if self.txn_manager.check_has_conflict(txn_id) {
+                txn_info!(
+                    "write_batch: CONFLICT txn_id={} commit_seq={} — aborting",
+                    txn_id, commit_seq
+                );
                 return Err(SlateDBError::TransactionConflict);
             }
         }
@@ -182,10 +222,18 @@ impl DbInner {
         if let Some(txn_id) = &batch.txn_id {
             self.txn_manager
                 .track_recent_committed_txn(txn_id, commit_seq);
+            txn_info!(
+                "write_batch: SUCCESS txn_id={} commit_seq={}",
+                txn_id, commit_seq
+            );
         } else {
             let write_keys = batch.keys();
             self.txn_manager
                 .track_recent_committed_write_batch(&write_keys, commit_seq);
+            txn_info!(
+                "write_batch: SUCCESS non-txn commit_seq={}",
+                commit_seq
+            );
         }
 
         // insert a fail point to make it easier to test the case where the transaction is committed but

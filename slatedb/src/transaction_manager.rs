@@ -6,9 +6,35 @@ use bytes::Bytes;
 use log::warn;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use uuid::Uuid;
+
+fn txn_log(msg: std::fmt::Arguments) {
+    use std::sync::OnceLock;
+    static LOG_FILE: OnceLock<std::sync::Mutex<std::io::BufWriter<std::fs::File>>> =
+        OnceLock::new();
+    let writer = LOG_FILE.get_or_init(|| {
+        let dir = std::env::var("ANTITHESIS_ARTIFACT_DIR").unwrap_or_else(|_| "./artifacts".into());
+        std::fs::create_dir_all(&dir).ok();
+        let path = std::path::Path::new(&dir).join("txn_manager.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("failed to open txn_manager.log");
+        std::sync::Mutex::new(std::io::BufWriter::new(file))
+    });
+    if let Ok(mut w) = writer.lock() {
+        let _ = writeln!(w, "{}", msg);
+        let _ = w.flush();
+    }
+}
+
+macro_rules! txn_info {
+    ($($arg:tt)*) => { txn_log(format_args!($($arg)*)) };
+}
 
 /// Isolation level for database transactions.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
@@ -102,6 +128,15 @@ struct TransactionManagerInner {
     oracle: Arc<DbOracle>,
 }
 
+fn fmt_keys(keys: &HashSet<Bytes>) -> String {
+    let mut sorted: Vec<_> = keys
+        .iter()
+        .map(|k| String::from_utf8_lossy(k).to_string())
+        .collect();
+    sorted.sort();
+    format!("[{}]", sorted.join(", "))
+}
+
 impl TransactionManager {
     pub(crate) fn new(oracle: Arc<DbOracle>, db_rand: Arc<DbRand>) -> Self {
         Self {
@@ -133,6 +168,10 @@ impl TransactionManager {
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             },
+        );
+        txn_info!(
+            "txn_mgr: new_transaction txn={} started_seq={} active_count={} recent_committed_count={}",
+            txn_id, seq, inner.active_txns.len(), inner.recent_committed_txns.len()
         );
         (txn_id, seq)
     }
@@ -186,8 +225,14 @@ impl TransactionManager {
     /// Here's a chance to recycle the recent committed txns.
     pub(crate) fn drop_txn(&self, txn_id: &Uuid) {
         let mut inner = self.inner.write();
-        inner.active_txns.remove(txn_id);
+        let removed = inner.active_txns.remove(txn_id);
+        let before_gc = inner.recent_committed_txns.len();
         inner.recycle_recent_committed_txns();
+        let after_gc = inner.recent_committed_txns.len();
+        txn_info!(
+            "txn_mgr: drop_txn txn={} was_active={} recent_committed_before_gc={} after_gc={} active_count={}",
+            txn_id, removed.is_some(), before_gc, after_gc, inner.active_txns.len()
+        );
     }
 
     /// Track write keys for a transaction. This is used for conflict detection.
@@ -195,7 +240,19 @@ impl TransactionManager {
     pub(crate) fn track_write_keys(&self, txn_id: &Uuid, write_keys: &HashSet<Bytes>) {
         let mut inner = self.inner.write();
         if let Some(txn_state) = inner.active_txns.get_mut(txn_id) {
+            txn_info!(
+                "txn_mgr: track_write_keys txn={} started_seq={} keys={}",
+                txn_id,
+                txn_state.started_seq,
+                fmt_keys(write_keys)
+            );
             txn_state.track_write_keys(write_keys.iter().cloned());
+        } else {
+            txn_info!(
+                "txn_mgr: track_write_keys txn={} NOT FOUND in active_txns, keys={}",
+                txn_id,
+                fmt_keys(write_keys)
+            );
         }
     }
 
@@ -227,25 +284,50 @@ impl TransactionManager {
     pub(crate) fn check_has_conflict(&self, txn_id: &Uuid) -> bool {
         let inner = self.inner.read();
         let txn_state = match inner.active_txns.get(txn_id) {
-            None => return false,
+            None => {
+                txn_info!(
+                    "txn_mgr: check_has_conflict txn={} NOT FOUND in active_txns, returning false",
+                    txn_id
+                );
+                return false;
+            }
             Some(txn_state) => txn_state,
         };
+
+        txn_info!(
+            "txn_mgr: check_has_conflict txn={} started_seq={} write_keys={} read_keys_count={} recent_committed_count={}",
+            txn_id, txn_state.started_seq, fmt_keys(&txn_state.write_keys),
+            txn_state.read_keys.len(), inner.recent_committed_txns.len()
+        );
 
         // both SI and SSI need to check write-write conflicts
         let ww_conflict =
             inner.has_write_write_conflict(&txn_state.write_keys, txn_state.started_seq);
         if ww_conflict {
+            txn_info!(
+                "txn_mgr: check_has_conflict txn={} WRITE-WRITE CONFLICT detected",
+                txn_id
+            );
             return true;
         }
 
         // for SSI, we need to check read-write conflicts. if a transaction does not
         // track the read keys or ranges at all, this transaction is considered as
         // same as a SI transaction.
-        inner.has_read_write_conflict(
+        let rw_conflict = inner.has_read_write_conflict(
             &txn_state.read_keys,
             txn_state.read_ranges.clone(),
             txn_state.started_seq,
-        )
+        );
+        if rw_conflict {
+            txn_info!(
+                "txn_mgr: check_has_conflict txn={} READ-WRITE CONFLICT detected",
+                txn_id
+            );
+        } else {
+            txn_info!("txn_mgr: check_has_conflict txn={} NO CONFLICT", txn_id);
+        }
+        rw_conflict
     }
 
     /// Record a recent committed transaction for conflict detection.
@@ -263,8 +345,19 @@ impl TransactionManager {
             if txn_state.read_only {
                 unreachable!("attempted to commit a read-only transaction");
             }
+            txn_info!(
+                "txn_mgr: committed txn={} started_seq={} committed_seq={} write_keys={} active_count={} recent_committed_count={}",
+                txn_id, txn_state.started_seq, committed_seq, fmt_keys(&txn_state.write_keys),
+                inner.active_txns.len(), inner.recent_committed_txns.len() + 1
+            );
             txn_state.mark_as_committed(committed_seq);
             inner.recent_committed_txns.push_back(txn_state);
+        } else {
+            txn_info!(
+                "txn_mgr: committed txn={} NOT FOUND in active_txns, committed_seq={}",
+                txn_id,
+                committed_seq
+            );
         }
 
         // update the last_committed_seq, so the writes will be visible to the readers.
@@ -281,6 +374,13 @@ impl TransactionManager {
     ) {
         // remove the transaction from active_txns, and add it to recent_committed_txns
         let mut inner = self.inner.write();
+
+        txn_info!(
+            "txn_mgr: committed_write_batch committed_seq={} keys={} recent_committed_count={}",
+            committed_seq,
+            fmt_keys(keys),
+            inner.recent_committed_txns.len() + 1
+        );
 
         inner.recent_committed_txns.push_back(TransactionState {
             read_only: false,
@@ -330,16 +430,19 @@ impl TransactionManagerInner {
 
     fn recycle_recent_committed_txns(&mut self) {
         let min_conflict_seq = self.min_conflict_check_seq();
+        let before_len = self.recent_committed_txns.len();
         if let Some(min_seq) = min_conflict_seq {
-            // Remove transactions that are no longer needed for conflict checking.
-            // A transaction can be garbage collected when all active non-readonly transactions
-            // have started_seq strictly greater than the transaction's committed_seq.
-            // This means we keep transactions where committed_seq >= min_seq.
             self.recent_committed_txns.retain(|txn| {
                 if let Some(committed_seq) = txn.committed_seq {
-                    committed_seq >= min_seq
+                    let keep = committed_seq >= min_seq;
+                    if !keep {
+                        txn_info!(
+                            "txn_mgr: gc evicting committed txn committed_seq={} write_keys={} (min_conflict_seq={})",
+                            committed_seq, fmt_keys(&txn.write_keys), min_seq
+                        );
+                    }
+                    keep
                 } else {
-                    // If committed_seq is not set, this shouldn't happen in practice.
                     warn!(
                         "Found transaction with committed_seq = None, this may cause memory leaks"
                     );
@@ -347,33 +450,54 @@ impl TransactionManagerInner {
                 }
             });
         } else {
-            // No active non-readonly transactions, can drain the entire deque
+            if !self.recent_committed_txns.is_empty() {
+                txn_info!(
+                    "txn_mgr: gc clearing ALL {} recent_committed_txns (no active write txns)",
+                    self.recent_committed_txns.len()
+                );
+            }
             self.recent_committed_txns.clear();
+        }
+        let after_len = self.recent_committed_txns.len();
+        if before_len != after_len {
+            txn_info!(
+                "txn_mgr: gc recycled {} committed txns ({} -> {})",
+                before_len - after_len,
+                before_len,
+                after_len
+            );
         }
     }
 
     fn has_write_write_conflict(&self, write_keys: &HashSet<Bytes>, started_seq: u64) -> bool {
-        // If the current transaction has no write operations, there's no write-write conflict
         if write_keys.is_empty() {
             return false;
         }
 
         for committed_txn in &self.recent_committed_txns {
-            // skip read-only transactions as they don't cause write conflicts
             if committed_txn.read_only {
                 continue;
             }
 
-            // All the recent committed txn should have committed_seq set.
             let other_committed_seq = committed_txn.committed_seq.expect(
                 "all txns in recent_committed_txns should be committed with committed_seq set",
             );
 
-            // if another transaction committed after the current transaction started,
-            // and they have overlapping write keys, then there's a conflict.
             if other_committed_seq > started_seq
                 && !write_keys.is_disjoint(&committed_txn.write_keys)
             {
+                let overlap: HashSet<_> =
+                    write_keys.intersection(&committed_txn.write_keys).collect();
+                let overlap_strs: Vec<_> = overlap
+                    .iter()
+                    .map(|k| String::from_utf8_lossy(k).to_string())
+                    .collect();
+                txn_info!(
+                    "txn_mgr: ww_conflict started_seq={} vs committed_seq={} overlapping_keys={:?}",
+                    started_seq,
+                    other_committed_seq,
+                    overlap_strs
+                );
                 return true;
             }
         }
