@@ -1039,7 +1039,7 @@ impl<'a> SsTableInfo<'a> {
   pub const VT_LAST_ENTRY: flatbuffers::VOffsetT = 18;
   pub const VT_STATS_OFFSET: flatbuffers::VOffsetT = 20;
   pub const VT_STATS_LEN: flatbuffers::VOffsetT = 22;
-  pub const VT_FILTER_POLICY_NAME: flatbuffers::VOffsetT = 24;
+  pub const VT_FILTER_FORMAT: flatbuffers::VOffsetT = 24;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -1057,7 +1057,7 @@ impl<'a> SsTableInfo<'a> {
     builder.add_filter_offset(args.filter_offset);
     builder.add_index_len(args.index_len);
     builder.add_index_offset(args.index_offset);
-    if let Some(x) = args.filter_policy_name { builder.add_filter_policy_name(x); }
+    if let Some(x) = args.filter_format { builder.add_filter_format(x); }
     if let Some(x) = args.last_entry { builder.add_last_entry(x); }
     if let Some(x) = args.first_entry { builder.add_first_entry(x); }
     builder.add_sst_type(args.sst_type);
@@ -1137,11 +1137,11 @@ impl<'a> SsTableInfo<'a> {
     unsafe { self._tab.get::<u64>(SsTableInfo::VT_STATS_LEN, Some(0)).unwrap()}
   }
   #[inline]
-  pub fn filter_policy_name(&self) -> Option<&'a str> {
+  pub fn filter_format(&self) -> Option<&'a str> {
     // Safety:
     // Created from valid Table for this object
     // which contains a valid value in this slot
-    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(SsTableInfo::VT_FILTER_POLICY_NAME, None)}
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(SsTableInfo::VT_FILTER_FORMAT, None)}
   }
 }
 
@@ -1162,7 +1162,7 @@ impl flatbuffers::Verifiable for SsTableInfo<'_> {
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("last_entry", Self::VT_LAST_ENTRY, false)?
      .visit_field::<u64>("stats_offset", Self::VT_STATS_OFFSET, false)?
      .visit_field::<u64>("stats_len", Self::VT_STATS_LEN, false)?
-     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("filter_policy_name", Self::VT_FILTER_POLICY_NAME, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("filter_format", Self::VT_FILTER_FORMAT, false)?
      .finish();
     Ok(())
   }
@@ -1178,7 +1178,7 @@ pub struct SsTableInfoArgs<'a> {
     pub last_entry: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
     pub stats_offset: u64,
     pub stats_len: u64,
-    pub filter_policy_name: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub filter_format: Option<flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for SsTableInfoArgs<'a> {
   #[inline]
@@ -1194,7 +1194,7 @@ impl<'a> Default for SsTableInfoArgs<'a> {
       last_entry: None,
       stats_offset: 0,
       stats_len: 0,
-      filter_policy_name: None,
+      filter_format: None,
     }
   }
 }
@@ -1245,8 +1245,8 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> SsTableInfoBuilder<'a, 'b, A> {
     self.fbb_.push_slot::<u64>(SsTableInfo::VT_STATS_LEN, stats_len, 0);
   }
   #[inline]
-  pub fn add_filter_policy_name(&mut self, filter_policy_name: flatbuffers::WIPOffset<&'b  str>) {
-    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(SsTableInfo::VT_FILTER_POLICY_NAME, filter_policy_name);
+  pub fn add_filter_format(&mut self, filter_format: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(SsTableInfo::VT_FILTER_FORMAT, filter_format);
   }
   #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> SsTableInfoBuilder<'a, 'b, A> {
@@ -1276,7 +1276,7 @@ impl core::fmt::Debug for SsTableInfo<'_> {
       ds.field("last_entry", &self.last_entry());
       ds.field("stats_offset", &self.stats_offset());
       ds.field("stats_len", &self.stats_len());
-      ds.field("filter_policy_name", &self.filter_policy_name());
+      ds.field("filter_format", &self.filter_format());
       ds.finish()
   }
 }

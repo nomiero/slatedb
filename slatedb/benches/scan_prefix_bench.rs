@@ -375,10 +375,10 @@ fn main() {
     let store2 = make_throttled_store();
     let db_prefix_filter = rt.block_on(async {
         let mut settings = base_settings();
-        settings.filter_policy = Some(Arc::new(
+        settings.filter_policies = vec![Arc::new(
             BloomFilterPolicy::new(10)
                 .with_prefix_extractor(Arc::new(FixedPrefixExtractor::new(4))),
-        ));
+        )];
         let db = Db::builder("/bench/prefix_filter", store2.clone())
             .with_settings(settings)
             .with_db_cache(meta_only_cache())

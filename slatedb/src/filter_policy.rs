@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ pub trait FilterPolicy: Send + Sync {
 
     /// Decodes a previously encoded filter.
     ///
-    /// The engine validates that the SST's `filter_policy_name` matches
+    /// The engine validates that the SST's filter policy name matches
     /// `self.name()` before calling this to ensure the policy can deserialize
     /// the data.
     fn decode(&self, data: &[u8]) -> Arc<dyn Filter>;
@@ -79,8 +80,42 @@ pub trait Filter: Send + Sync {
 }
 
 /// A membership query passed to [`Filter::might_match`].
+#[derive(Debug, Clone)]
+pub struct FilterQuery {
+    /// The kind of query (point or prefix).
+    pub kind: FilterQueryKind,
+    /// Opaque hints provided by the caller (e.g., version bounds).
+    /// Keyed by a string name so custom filters can look up relevant hints.
+    pub hints: HashMap<String, Bytes>,
+}
+
+impl FilterQuery {
+    /// Creates a point query with no hints.
+    pub fn point(key: Bytes) -> Self {
+        Self {
+            kind: FilterQueryKind::Point(key),
+            hints: HashMap::new(),
+        }
+    }
+
+    /// Creates a prefix query with no hints.
+    pub fn prefix(prefix: Bytes) -> Self {
+        Self {
+            kind: FilterQueryKind::Prefix(prefix),
+            hints: HashMap::new(),
+        }
+    }
+
+    /// Attaches hints to the query.
+    pub fn with_hints(mut self, hints: HashMap<String, Bytes>) -> Self {
+        self.hints = hints;
+        self
+    }
+}
+
+/// The kind of filter query.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FilterQuery {
+pub enum FilterQueryKind {
     /// Used to test whether a specific key might exist in the SST.
     Point(Bytes),
     /// Used to test whether any key with the given prefix might exist in the SST.

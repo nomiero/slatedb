@@ -385,6 +385,7 @@ impl Reader {
             eager_spawn: true,
             order: IterationOrder::Ascending,
             prefix,
+            filter_hints: options.filter_hints.clone(),
         };
 
         let IteratorSources {
@@ -445,6 +446,7 @@ impl Reader {
             eager_spawn: true,
             order: IterationOrder::Ascending,
             prefix: Some(prefix),
+            filter_hints: options.filter_hints.clone(),
         };
 
         // Build iterators WITHOUT pre-initializing them so that the

@@ -191,7 +191,7 @@ impl From<(SsTableId, u64)> for CachedKey {
 enum CachedItem {
     Block(Arc<Block>),
     SsTableIndex(Arc<SsTableIndexOwned>),
-    Filter(Arc<dyn Filter>),
+    Filters(Vec<Arc<dyn Filter>>),
     SstStats(Arc<SstStats>),
 }
 
@@ -220,10 +220,10 @@ impl CachedEntry {
         }
     }
 
-    /// Create a new `CachedEntry` with the given filter.
-    pub(crate) fn with_filter(filter: Arc<dyn Filter>) -> Self {
+    /// Create a new `CachedEntry` with the given filters.
+    pub(crate) fn with_filters(filters: Vec<Arc<dyn Filter>>) -> Self {
         Self {
-            item: CachedItem::Filter(filter),
+            item: CachedItem::Filters(filters),
         }
     }
 
@@ -248,9 +248,9 @@ impl CachedEntry {
         }
     }
 
-    pub(crate) fn filter(&self) -> Option<Arc<dyn Filter>> {
+    pub(crate) fn filters(&self) -> Option<Vec<Arc<dyn Filter>>> {
         match &self.item {
-            CachedItem::Filter(filter) => Some(filter.clone()),
+            CachedItem::Filters(filters) => Some(filters.clone()),
             _ => None,
         }
     }
@@ -270,7 +270,7 @@ impl CachedEntry {
         match &self.item {
             CachedItem::Block(block) => block.size(),
             CachedItem::SsTableIndex(sst_index) => sst_index.size(),
-            CachedItem::Filter(filter) => filter.size(),
+            CachedItem::Filters(filters) => filters.iter().map(|f| f.size()).sum(),
             CachedItem::SstStats(stats) => stats.size(),
         }
     }
@@ -281,9 +281,9 @@ impl CachedEntry {
             CachedItem::SsTableIndex(sst_index) => {
                 Self::with_sst_index(Arc::new(sst_index.clamp_allocated_size()))
             }
-            CachedItem::Filter(filter) => {
+            CachedItem::Filters(filters) => {
                 // Cannot clamp a trait object generically; return as-is.
-                Self::with_filter(filter.clone())
+                Self::with_filters(filters.clone())
             }
             CachedItem::SstStats(stats) => {
                 Self::with_sst_stats(Arc::new(stats.clamp_allocated_size()))
@@ -371,7 +371,7 @@ impl DbCache for SplitCache {
                     trace!("no block cache available for insertion");
                 }
             }
-            CachedItem::SsTableIndex(_) | CachedItem::Filter(_) | CachedItem::SstStats(_) => {
+            CachedItem::SsTableIndex(_) | CachedItem::Filters(_) | CachedItem::SstStats(_) => {
                 if let Some(ref cache) = self.meta_cache {
                     cache.insert(key, value.clamp_allocated_size()).await;
                 } else {
@@ -709,7 +709,7 @@ mod tests {
         cache
             .insert(
                 key.clone(),
-                CachedEntry::with_filter(sst.filter.unwrap()),
+                CachedEntry::with_filters(sst.filters.clone()),
             )
             .await;
 
@@ -857,18 +857,18 @@ mod tests {
         assert_ne!(cache_a.scope_id, cache_b.scope_id);
 
         let sst = build_test_sst(&SsTableFormat::default(), 1).await;
-        let filter = sst.filter.unwrap();
+        let filters = sst.filters.clone();
         let key = CachedKey::from((SST_ID, 1u64));
 
         cache_a
-            .insert(key.clone(), CachedEntry::with_filter(filter.clone()))
+            .insert(key.clone(), CachedEntry::with_filters(filters.clone()))
             .await;
 
         assert!(cache_a.get_filter(&key).await.unwrap().is_some());
         assert!(cache_b.get_filter(&key).await.unwrap().is_none());
 
         cache_b
-            .insert(key.clone(), CachedEntry::with_filter(filter))
+            .insert(key.clone(), CachedEntry::with_filters(filters))
             .await;
 
         assert_eq!(2, shared_cache.entry_count());

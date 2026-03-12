@@ -2,7 +2,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use crate::filter_policy::{
-    Filter, FilterBuilder, FilterPolicy, FilterQuery, PrefixExtractor,
+    Filter, FilterBuilder, FilterPolicy, FilterQuery, FilterQueryKind, PrefixExtractor,
 };
 #[cfg(test)]
 use crate::utils::clamp_allocated_size_bytes;
@@ -259,14 +259,14 @@ impl BloomFilter {
 
 impl Filter for BloomFilter {
     fn might_match(&self, query: &FilterQuery) -> bool {
-        match query {
-            FilterQuery::Point(key) => {
+        match &query.kind {
+            FilterQueryKind::Point(key) => {
                 if !self.whole_key_filtering {
                     return true; // Cannot answer point queries
                 }
                 self.might_contain(filter_hash(key.as_ref()))
             }
-            FilterQuery::Prefix(prefix) => {
+            FilterQueryKind::Prefix(prefix) => {
                 if !self.has_prefix_filter {
                     return true; // Cannot answer prefix queries
                 }
@@ -549,7 +549,7 @@ mod tests {
         let builder = BloomFilterBuilder::new(10, true, None);
         let filter = builder.build_bloom();
         assert!(filter.might_contain(12345));
-        assert!(filter.might_match(&FilterQuery::Point(Bytes::from("any"))));
+        assert!(filter.might_match(&FilterQuery::point(Bytes::from("any"))));
     }
 
     #[test]
@@ -559,10 +559,10 @@ mod tests {
         let filter = builder.build_bloom();
 
         // Point query for a key that was added should be true
-        assert!(filter.might_match(&FilterQuery::Point(Bytes::from("hello"))));
+        assert!(filter.might_match(&FilterQuery::point(Bytes::from("hello"))));
 
         // Prefix query should return true (no prefix filter configured)
-        assert!(filter.might_match(&FilterQuery::Prefix(Bytes::from("hel"))));
+        assert!(filter.might_match(&FilterQuery::prefix(Bytes::from("hel"))));
     }
 
     #[test]
@@ -572,7 +572,7 @@ mod tests {
         let filter = builder.build_bloom();
 
         // Point query should return true (whole_key_filtering disabled)
-        assert!(filter.might_match(&FilterQuery::Point(Bytes::from("hello"))));
-        assert!(filter.might_match(&FilterQuery::Point(Bytes::from("nonexistent"))));
+        assert!(filter.might_match(&FilterQuery::point(Bytes::from("hello"))));
+        assert!(filter.might_match(&FilterQuery::point(Bytes::from("nonexistent"))));
     }
 }

@@ -430,6 +430,7 @@ impl DbReaderInner {
             eager_spawn: true,
             order: IterationOrder::Ascending,
             prefix: None,
+            filter_hints: std::collections::HashMap::new(),
         };
 
         let replay_options = WalReplayOptions {

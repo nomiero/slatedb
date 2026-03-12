@@ -13,7 +13,7 @@ use crate::bytes_range::BytesRange;
 use crate::db_state::{SsTableHandle, SsTableId};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
-use crate::filter_policy::{Filter, FilterQuery};
+use crate::filter_policy::{Filter, FilterQuery, FilterQueryKind};
 use crate::flatbuffer_types::{SsTableIndex, SsTableIndexOwned};
 use crate::format::block::Block;
 use crate::format::sst::{SST_FORMAT_VERSION, SST_FORMAT_VERSION_V2};
@@ -80,6 +80,8 @@ pub(crate) struct SstIteratorOptions {
     /// When set, prefix scans use this to probe the filter with
     /// `FilterQuery::Prefix` instead of skipping the filter entirely.
     pub(crate) prefix: Option<Bytes>,
+    /// Opaque hints passed through to custom filters at query time.
+    pub(crate) filter_hints: std::collections::HashMap<String, Bytes>,
 }
 
 impl Default for SstIteratorOptions {
@@ -91,6 +93,7 @@ impl Default for SstIteratorOptions {
             eager_spawn: false,
             order: IterationOrder::Ascending,
             prefix: None,
+            filter_hints: std::collections::HashMap::new(),
         }
     }
 }
@@ -198,7 +201,7 @@ enum FilterState {
     Negative,
 }
 
-struct BloomFilterEvaluator {
+struct FilterEvaluator {
     query: FilterQuery,
     db_stats: Option<DbStats>,
     state: FilterState,
@@ -206,10 +209,10 @@ struct BloomFilterEvaluator {
     false_positive_recorded: bool,
 }
 
-impl BloomFilterEvaluator {
-    fn new_point(key: Bytes, db_stats: Option<DbStats>) -> Self {
+impl FilterEvaluator {
+    fn new_point(key: Bytes, hints: std::collections::HashMap<String, Bytes>, db_stats: Option<DbStats>) -> Self {
         Self {
-            query: FilterQuery::Point(key),
+            query: FilterQuery::point(key).with_hints(hints),
             db_stats,
             state: FilterState::NotChecked,
             found_key: false,
@@ -217,46 +220,44 @@ impl BloomFilterEvaluator {
         }
     }
 
-    fn new_prefix(prefix: Bytes, db_stats: Option<DbStats>) -> Self {
+    fn new_prefix(prefix: Bytes, hints: std::collections::HashMap<String, Bytes>, db_stats: Option<DbStats>) -> Self {
         Self {
-            query: FilterQuery::Prefix(prefix),
+            query: FilterQuery::prefix(prefix).with_hints(hints),
             db_stats,
             state: FilterState::NotChecked,
             found_key: false,
             false_positive_recorded: false,
         }
     }
-
 }
 
-impl BloomFilterEvaluator {
-    /// Evaluate the filter against the query (point key or prefix).
-    ///
-    /// ## Arguments
-    /// - `maybe_filter`: An optional filter to evaluate against.
-    async fn evaluate(&mut self, maybe_filter: Option<Arc<dyn Filter>>) {
+impl FilterEvaluator {
+    /// Evaluate filters against the query with AND logic.
+    /// If ANY filter returns false, the SST is skipped.
+    async fn evaluate(&mut self, filters: Vec<Arc<dyn Filter>>) {
         if self.state != FilterState::NotChecked {
             return;
         }
 
-        match maybe_filter {
-            Some(filter) => {
-                if filter.might_match(&self.query) {
-                    if let Some(stats) = &self.db_stats {
-                        stats.sst_filter_positives.inc();
-                    }
-                    self.state = FilterState::Positive;
-                } else {
-                    if let Some(stats) = &self.db_stats {
-                        stats.sst_filter_negatives.inc();
-                    }
-                    self.state = FilterState::Negative;
+        if filters.is_empty() {
+            self.state = FilterState::NoFilter;
+            return;
+        }
+
+        for filter in &filters {
+            if !filter.might_match(&self.query) {
+                if let Some(stats) = &self.db_stats {
+                    stats.sst_filter_negatives.inc();
                 }
-            }
-            None => {
-                self.state = FilterState::NoFilter;
+                self.state = FilterState::Negative;
+                return;
             }
         }
+
+        if let Some(stats) = &self.db_stats {
+            stats.sst_filter_positives.inc();
+        }
+        self.state = FilterState::Positive;
     }
 
     fn is_filtered_out(&self) -> bool {
@@ -264,11 +265,11 @@ impl BloomFilterEvaluator {
     }
 
     fn notify_key_found(&mut self, key: &[u8]) {
-        match &self.query {
-            FilterQuery::Point(k) if key == k.as_ref() => {
+        match &self.query.kind {
+            FilterQueryKind::Point(k) if key == k.as_ref() => {
                 self.found_key = true;
             }
-            FilterQuery::Prefix(p) if key.starts_with(p.as_ref()) => {
+            FilterQueryKind::Prefix(p) if key.starts_with(p.as_ref()) => {
                 self.found_key = true;
             }
             _ => {}
@@ -840,14 +841,14 @@ impl RowEntryIterator for InternalSstIterator<'_> {
     }
 }
 
-struct BloomFilterIterator<'a> {
+struct FilterIterator<'a> {
     inner: InternalSstIterator<'a>,
-    filter: BloomFilterEvaluator,
+    filter: FilterEvaluator,
     initialized: bool,
 }
 
-impl<'a> BloomFilterIterator<'a> {
-    fn new(inner: InternalSstIterator<'a>, filter: BloomFilterEvaluator) -> Self {
+impl<'a> FilterIterator<'a> {
+    fn new(inner: InternalSstIterator<'a>, filter: FilterEvaluator) -> Self {
         Self {
             inner,
             filter,
@@ -865,18 +866,18 @@ impl<'a> BloomFilterIterator<'a> {
 }
 
 #[async_trait]
-impl RowEntryIterator for BloomFilterIterator<'_> {
+impl RowEntryIterator for FilterIterator<'_> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         if !self.initialized {
-            let maybe_filter = self
+            let filters = self
                 .inner
                 .table_store()
-                .read_filter(
+                .read_filters(
                     self.inner.view().table_as_ref(),
                     self.inner.options.cache_blocks,
                 )
                 .await?;
-            self.filter.evaluate(maybe_filter).await;
+            self.filter.evaluate(filters).await;
 
             if self.is_filtered_out() {
                 return Ok(());
@@ -918,7 +919,7 @@ impl RowEntryIterator for BloomFilterIterator<'_> {
 
 enum SstIteratorDelegate<'a> {
     Direct(InternalSstIterator<'a>),
-    Bloom(BloomFilterIterator<'a>),
+    Filter(FilterIterator<'a>),
 }
 
 pub(crate) struct SstIterator<'a> {
@@ -929,12 +930,17 @@ impl<'a> SstIterator<'a> {
     fn from_internal(internal: InternalSstIterator<'a>, db_stats: Option<DbStats>) -> Self {
         let point_key = internal.view().point_key().map(Bytes::copy_from_slice);
         let prefix = internal.options.prefix.clone();
+        let hints = internal.options.filter_hints.clone();
         let delegate = if let Some(key) = point_key {
-            let filter = BloomFilterEvaluator::new_point(key, db_stats);
-            SstIteratorDelegate::Bloom(BloomFilterIterator::new(internal, filter))
+            let filter = FilterEvaluator::new_point(key, hints, db_stats);
+            SstIteratorDelegate::Filter(FilterIterator::new(internal, filter))
         } else if let Some(prefix) = prefix {
-            let filter = BloomFilterEvaluator::new_prefix(prefix, db_stats);
-            SstIteratorDelegate::Bloom(BloomFilterIterator::new(internal, filter))
+            let filter = FilterEvaluator::new_prefix(prefix, hints, db_stats);
+            SstIteratorDelegate::Filter(FilterIterator::new(internal, filter))
+        } else if !hints.is_empty() {
+            // Even without point key or prefix, apply filters if hints are provided
+            let filter = FilterEvaluator::new_point(Bytes::new(), hints, db_stats);
+            SstIteratorDelegate::Filter(FilterIterator::new(internal, filter))
         } else {
             SstIteratorDelegate::Direct(internal)
         };
@@ -979,16 +985,16 @@ impl<'a> SstIterator<'a> {
         options: SstIteratorOptions,
     ) -> Result<Option<Self>, SlateDBError> {
         // Create an uninitialized internal iterator first, then wrap it.
-        // This ensures BloomFilterIterator.init() can check the filter BEFORE
+        // This ensures FilterIterator.init() can check filters BEFORE
         // the inner iterator is initialized (which would read index + data blocks).
         let internal = InternalSstIterator::new_owned(range, table, table_store, options)?;
         match internal {
             Some(inner) => {
                 let mut iterator = Self::from_internal(inner, None);
                 match &mut iterator.delegate {
-                    SstIteratorDelegate::Bloom(bloom_iter) => {
-                        bloom_iter.init().await?;
-                        if bloom_iter.is_filtered_out() {
+                    SstIteratorDelegate::Filter(filter_iter) => {
+                        filter_iter.init().await?;
+                        if filter_iter.is_filtered_out() {
                             return Ok(None);
                         }
                     }
@@ -1036,7 +1042,7 @@ impl<'a> SstIterator<'a> {
         match internal {
             Some(inner) => {
                 let mut iterator = Self::from_internal(inner, None);
-                if let SstIteratorDelegate::Bloom(inner) = &mut iterator.delegate {
+                if let SstIteratorDelegate::Filter(inner) = &mut iterator.delegate {
                     inner.init().await?;
                     if inner.is_filtered_out() {
                         return Ok(None);
@@ -1073,7 +1079,7 @@ impl<'a> SstIterator<'a> {
         match internal {
             Some(inner) => {
                 let mut iterator = Self::from_internal(inner, db_stats);
-                if let SstIteratorDelegate::Bloom(inner) = &mut iterator.delegate {
+                if let SstIteratorDelegate::Filter(inner) = &mut iterator.delegate {
                     inner.init().await?;
                     if inner.is_filtered_out() {
                         return Ok(None);
@@ -1088,7 +1094,7 @@ impl<'a> SstIterator<'a> {
     pub(crate) fn table_id(&self) -> SsTableId {
         match &self.delegate {
             SstIteratorDelegate::Direct(inner) => inner.table_id(),
-            SstIteratorDelegate::Bloom(inner) => inner.table_id(),
+            SstIteratorDelegate::Filter(inner) => inner.table_id(),
         }
     }
 
@@ -1096,7 +1102,7 @@ impl<'a> SstIterator<'a> {
     pub(crate) fn is_filtered_out(&self) -> bool {
         match &self.delegate {
             SstIteratorDelegate::Direct(_) => false,
-            SstIteratorDelegate::Bloom(inner) => inner.is_filtered_out(),
+            SstIteratorDelegate::Filter(inner) => inner.is_filtered_out(),
         }
     }
 }
@@ -1106,21 +1112,21 @@ impl RowEntryIterator for SstIterator<'_> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         match &mut self.delegate {
             SstIteratorDelegate::Direct(inner) => inner.init().await,
-            SstIteratorDelegate::Bloom(inner) => inner.init().await,
+            SstIteratorDelegate::Filter(inner) => inner.init().await,
         }
     }
 
     async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         match &mut self.delegate {
             SstIteratorDelegate::Direct(inner) => inner.next().await,
-            SstIteratorDelegate::Bloom(inner) => inner.next().await,
+            SstIteratorDelegate::Filter(inner) => inner.next().await,
         }
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
         match &mut self.delegate {
             SstIteratorDelegate::Direct(inner) => inner.seek(next_key).await,
-            SstIteratorDelegate::Bloom(inner) => inner.seek(next_key).await,
+            SstIteratorDelegate::Filter(inner) => inner.seek(next_key).await,
         }
     }
 }
@@ -1296,17 +1302,16 @@ mod tests {
         let existing_keys = [b"k1".as_slice(), b"k3".as_slice()];
         let sst_handle = build_single_block_sst(&table_store, &existing_keys).await;
 
-        let filter = table_store
-            .read_filter(&sst_handle, true)
+        let filters = table_store
+            .read_filters(&sst_handle, true)
             .await
-            .expect("filter read should succeed")
-            .expect("filter should exist");
+            .expect("filter read should succeed");
 
         let collision_key = b"k12";
         assert!(
-            filter.might_match(&FilterQuery::Point(bytes::Bytes::copy_from_slice(
+            filters.iter().any(|f| f.might_match(&FilterQuery::point(bytes::Bytes::copy_from_slice(
                 collision_key
-            ))),
+            )))),
             "bloom filter should report collision for hard-coded key"
         );
 
@@ -1426,7 +1431,7 @@ mod tests {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let format = SsTableFormat {
             min_filter_keys: 1,
-            filter_policy: Some(Arc::new(crate::filter::BloomFilterPolicy::new(bits_per_key))),
+            filter_policies: vec![Arc::new(crate::filter::BloomFilterPolicy::new(bits_per_key))],
             ..SsTableFormat::default()
         };
         Arc::new(TableStore::new(
@@ -1777,6 +1782,7 @@ mod tests {
                 eager_spawn: false,
                 order: IterationOrder::Ascending,
                 prefix: None,
+                filter_hints: std::collections::HashMap::new(),
             },
         )
         .await
@@ -1794,6 +1800,7 @@ mod tests {
                 eager_spawn: false,
                 order: IterationOrder::Ascending,
                 prefix: None,
+                filter_hints: std::collections::HashMap::new(),
             },
         )
         .await
@@ -2362,6 +2369,7 @@ mod tests {
             eager_spawn: false,
             order,
             prefix: None,
+            filter_hints: std::collections::HashMap::new(),
         };
         let mut iter = SstIterator::new_owned_initialized(
             BytesRange::from_slice(start_key.as_ref()..=end_key.as_ref()),

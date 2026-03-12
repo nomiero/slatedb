@@ -285,9 +285,10 @@ pub struct SsTableInfo {
     pub stats_offset: u64,
     /// The length of the stats block within the SSTable file.
     pub stats_len: u64,
-    /// The name of the filter policy that produced the filter block.
-    /// `None` means the legacy bloom filter (`"slatedb.BloomFilter"`).
-    pub filter_policy_name: Option<String>,
+    /// Identifies the filter block format.
+    /// `None` or empty means the legacy single bloom filter (raw bytes).
+    /// `"composite"` means a composite block with self-describing list of named filters.
+    pub filter_format: Option<String>,
 }
 
 pub(crate) trait SsTableInfoCodec: Send + Sync {
@@ -868,7 +869,7 @@ mod tests {
             sst_type: SstType::default(),
             stats_offset: 0,
             stats_len: 0,
-            filter_policy_name: None,
+            filter_format: None,
         }
     }
 }

@@ -113,7 +113,7 @@ impl SerializedCachedEntryV1 {
                 // Deserialize with default bloom settings (whole_key_filtering=true, no prefix)
                 // for backward compatibility with existing persistent caches.
                 let filter = BloomFilter::decode(encoded.as_ref(), true, false, None);
-                CachedItem::Filter(Arc::new(filter))
+                CachedItem::Filters(vec![Arc::new(filter)])
             }
             SerializedCachedEntryV1::SstStats(encoded) => {
                 let stats = SstStats::decode(encoded)?;
@@ -148,10 +148,18 @@ impl From<CachedEntry> for SerializedCachedEntry {
                 let encoded = index.data();
                 SerializedCachedEntry::V1(SerializedCachedEntryV1::SsTableIndex(encoded))
             }
-            CachedItem::Filter(filter) => {
-                let mut buf = bytes::BytesMut::new();
-                filter.encode(&mut buf);
-                SerializedCachedEntry::V1(SerializedCachedEntryV1::BloomFilter(buf.freeze()))
+            CachedItem::Filters(filters) => {
+                // For serialization, encode the first filter (backward compatibility with V1 format)
+                if let Some(filter) = filters.first() {
+                    let mut buf = bytes::BytesMut::new();
+                    filter.encode(&mut buf);
+                    SerializedCachedEntry::V1(SerializedCachedEntryV1::BloomFilter(buf.freeze()))
+                } else {
+                    // Empty filters — encode as empty bloom filter
+                    SerializedCachedEntry::V1(SerializedCachedEntryV1::BloomFilter(
+                        bytes::Bytes::new(),
+                    ))
+                }
             }
             CachedItem::SstStats(stats) => {
                 let encoded = stats.encode();
@@ -280,15 +288,15 @@ mod tests {
         }
         let filter = builder.build();
         let entry = CachedEntry {
-            item: CachedItem::Filter(filter.clone()),
+            item: CachedItem::Filters(vec![filter.clone()]),
         };
 
         let encoded = bincode::serialize(&entry).unwrap();
         let decoded: CachedEntry = bincode::deserialize(&encoded).unwrap();
 
-        let decoded_filter = decoded.filter().unwrap();
+        let decoded_filters = decoded.filters().unwrap();
         // Verify via size equality and functional testing
-        assert_eq!(filter.size(), decoded_filter.size());
+        assert_eq!(filter.size(), decoded_filters[0].size());
     }
 
     #[test]

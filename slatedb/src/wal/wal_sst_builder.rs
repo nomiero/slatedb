@@ -267,7 +267,7 @@ impl EncodedWalSsTableBuilder {
             format_version,
             info: footer.info,
             index: footer.index,
-            filter: None,
+            filters: Vec::new(),
             stats: None,
             unconsumed_blocks: self.blocks,
             footer: footer.encoded_bytes,
@@ -365,7 +365,7 @@ mod tests {
         let encoded = builder.build().await.unwrap();
 
         // Then
-        assert!(encoded.filter.is_none());
+        assert!(encoded.filters.is_empty());
         assert_eq!(encoded.info.filter_len, 0);
     }
 
@@ -509,7 +509,7 @@ mod tests {
         // Then
         assert!(encoded.unconsumed_blocks.is_empty());
         assert!(encoded.info.first_entry.is_none());
-        assert!(encoded.filter.is_none());
+        assert!(encoded.filters.is_empty());
     }
 
     #[tokio::test]

@@ -59,7 +59,7 @@ use std::sync::Arc;
 use crate::config::CompressionCodec;
 use crate::db_state::{SsTableInfoCodec, SstType};
 use crate::error::SlateDBError;
-use crate::filter_policy::{FilterBuilder, FilterPolicy};
+use crate::filter_policy::{Filter, FilterBuilder, FilterPolicy};
 use crate::flatbuffer_types::{BlockMeta, BlockMetaArgs};
 use crate::format::sst::{
     BlockBuilder, EncodedSsTable, EncodedSsTableBlock, EncodedSsTableBlockBuilder,
@@ -107,7 +107,7 @@ impl SsTableFormat {
             self.block_size,
             self.min_filter_keys,
             self.sst_codec.clone(),
-            self.filter_policy.clone(),
+            self.filter_policies.clone(),
         );
         if let Some(block_format) = self.block_format {
             builder = builder.with_block_format(block_format);
@@ -138,8 +138,8 @@ pub(crate) struct EncodedSsTableBuilder<'a> {
     sst_format_version: u16,
     min_filter_keys: u32,
     stats: SstStats,
-    filter_policy: Option<Arc<dyn FilterPolicy>>,
-    filter_builder: Option<Box<dyn FilterBuilder>>,
+    filter_policies: Vec<Arc<dyn FilterPolicy>>,
+    filter_builders: Vec<Box<dyn FilterBuilder>>,
     sst_codec: Box<dyn SsTableInfoCodec>,
     compression_codec: Option<CompressionCodec>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
@@ -151,9 +151,10 @@ impl EncodedSsTableBuilder<'_> {
         block_size: usize,
         min_filter_keys: u32,
         sst_codec: Box<dyn SsTableInfoCodec>,
-        filter_policy: Option<Arc<dyn FilterPolicy>>,
+        filter_policies: Vec<Arc<dyn FilterPolicy>>,
     ) -> Self {
-        let filter_builder = filter_policy.as_ref().map(|p| p.builder());
+        let filter_builders: Vec<Box<dyn FilterBuilder>> =
+            filter_policies.iter().map(|p| p.builder()).collect();
         Self {
             current_len: 0,
             blocks: VecDeque::new(),
@@ -168,8 +169,8 @@ impl EncodedSsTableBuilder<'_> {
             sst_format_version: SST_FORMAT_VERSION_LATEST,
             min_filter_keys,
             stats: SstStats::default(),
-            filter_policy,
-            filter_builder,
+            filter_policies,
+            filter_builders,
             index_builder: flatbuffers::FlatBufferBuilder::new(),
             sst_codec,
             compression_codec: None,
@@ -239,7 +240,7 @@ impl EncodedSsTableBuilder<'_> {
             self.first_key = Some(self.index_builder.create_vector(&index_key));
         }
 
-        if let Some(ref mut fb) = self.filter_builder {
+        for fb in &mut self.filter_builders {
             fb.add_key(&entry.key);
         }
         if is_sst_first_key {
@@ -371,15 +372,18 @@ impl EncodedSsTableBuilder<'_> {
         if let Some(transformer) = self.block_transformer.clone() {
             footer_builder = footer_builder.with_block_transformer(transformer);
         }
-        // Add filter if enough keys and a filter policy is configured
-        if self.stats.num_rows() >= self.min_filter_keys as u64 {
-            if let Some(filter_builder) = self.filter_builder.take() {
-                let filter = filter_builder.build();
-                let mut encoded_buf = bytes::BytesMut::new();
-                filter.encode(&mut encoded_buf);
-                let filter_policy_name = self.filter_policy.as_ref().map(|p| p.name().to_string());
-                footer_builder =
-                    footer_builder.with_filter(filter, encoded_buf.freeze(), filter_policy_name);
+        // Add filters if enough keys and filter policies are configured
+        if self.stats.num_rows() >= self.min_filter_keys as u64
+            && !self.filter_builders.is_empty()
+        {
+            let named_filters: Vec<(String, Arc<dyn Filter>)> = self
+                .filter_policies
+                .iter()
+                .zip(self.filter_builders.iter())
+                .map(|(policy, builder)| (policy.name().to_string(), builder.build()))
+                .collect();
+            if !named_filters.is_empty() {
+                footer_builder = footer_builder.with_filters(named_filters);
             }
         }
         footer_builder = footer_builder.with_stats(self.stats);
@@ -390,7 +394,7 @@ impl EncodedSsTableBuilder<'_> {
             format_version: self.sst_format_version,
             info: footer.info,
             index: footer.index,
-            filter: footer.filter,
+            filters: footer.filters,
             stats: footer.stats,
             unconsumed_blocks: self.blocks,
             footer: footer.encoded_bytes,
@@ -613,8 +617,8 @@ mod tests {
     #[rstest]
     #[case::default_sst(SsTableFormat::default(), 0, true)]
     #[case::sst_with_no_filter(SsTableFormat { min_filter_keys: 9, ..SsTableFormat::default() }, 0, false)]
-    #[case::sst_builds_filter_10bpk(SsTableFormat { filter_policy: Some(Arc::new(crate::filter::BloomFilterPolicy::new(10))), ..SsTableFormat::default() }, 0, true)]
-    #[case::sst_builds_filter_20bpk(SsTableFormat { filter_policy: Some(Arc::new(crate::filter::BloomFilterPolicy::new(20))), ..SsTableFormat::default() }, 0, true)]
+    #[case::sst_builds_filter_10bpk(SsTableFormat { filter_policies: vec![Arc::new(crate::filter::BloomFilterPolicy::new(10))], ..SsTableFormat::default() }, 0, true)]
+    #[case::sst_builds_filter_20bpk(SsTableFormat { filter_policies: vec![Arc::new(crate::filter::BloomFilterPolicy::new(20))], ..SsTableFormat::default() }, 0, true)]
     #[tokio::test]
     async fn test_sstable(
         #[case] format: SsTableFormat,
@@ -644,7 +648,7 @@ mod tests {
         let encoded = builder.build().await.unwrap();
         let encoded_info = encoded.info.clone();
 
-        if let Some(filter) = encoded.filter.clone() {
+        for filter in encoded.filters.iter() {
             // Just verify the filter is non-empty
             assert!(filter.size() > 0);
         }
@@ -728,18 +732,19 @@ mod tests {
             .unwrap();
         let sst_handle = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
         let index = table_store.read_index(&sst_handle, true).await.unwrap();
-        let filter = table_store
-            .read_filter(&sst_handle, true)
+        let filters = table_store
+            .read_filters(&sst_handle, true)
             .await
-            .unwrap()
             .unwrap();
 
-        assert!(filter.might_match(&crate::filter_policy::FilterQuery::Point(
-            Bytes::from_static(b"key1")
-        )));
-        assert!(filter.might_match(&crate::filter_policy::FilterQuery::Point(
-            Bytes::from_static(b"key2")
-        )));
+        for filter in &filters {
+            assert!(filter.might_match(&crate::filter_policy::FilterQuery::point(
+                Bytes::from_static(b"key1")
+            )));
+            assert!(filter.might_match(&crate::filter_policy::FilterQuery::point(
+                Bytes::from_static(b"key2")
+            )));
+        }
         assert_eq!(encoded_info, sst_handle.info);
         assert_eq!(1, index.borrow().block_meta().len());
         assert_eq!(
@@ -813,18 +818,19 @@ mod tests {
         );
         let sst_handle = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
         let index = table_store.read_index(&sst_handle, true).await.unwrap();
-        let filter = table_store
-            .read_filter(&sst_handle, true)
+        let filters = table_store
+            .read_filters(&sst_handle, true)
             .await
-            .unwrap()
             .unwrap();
 
-        assert!(filter.might_match(&crate::filter_policy::FilterQuery::Point(
-            Bytes::from_static(b"key1")
-        )));
-        assert!(filter.might_match(&crate::filter_policy::FilterQuery::Point(
-            Bytes::from_static(b"key2")
-        )));
+        for filter in &filters {
+            assert!(filter.might_match(&crate::filter_policy::FilterQuery::point(
+                Bytes::from_static(b"key1")
+            )));
+            assert!(filter.might_match(&crate::filter_policy::FilterQuery::point(
+                Bytes::from_static(b"key2")
+            )));
+        }
         assert_eq!(encoded_info, sst_handle.info);
         assert_eq!(1, index.borrow().block_meta().len());
         assert_eq!(
@@ -1189,18 +1195,19 @@ mod tests {
 
         let sst_handle = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
         let index = table_store.read_index(&sst_handle, true).await.unwrap();
-        let filter = table_store
-            .read_filter(&sst_handle, true)
+        let filters = table_store
+            .read_filters(&sst_handle, true)
             .await
-            .unwrap()
             .unwrap();
 
-        assert!(filter.might_match(&crate::filter_policy::FilterQuery::Point(
-            Bytes::from_static(b"key1")
-        )));
-        assert!(filter.might_match(&crate::filter_policy::FilterQuery::Point(
-            Bytes::from_static(b"key2")
-        )));
+        for filter in &filters {
+            assert!(filter.might_match(&crate::filter_policy::FilterQuery::point(
+                Bytes::from_static(b"key1")
+            )));
+            assert!(filter.might_match(&crate::filter_policy::FilterQuery::point(
+                Bytes::from_static(b"key2")
+            )));
+        }
         assert_eq!(encoded_info, sst_handle.info);
         assert_eq!(1, index.borrow().block_meta().len());
         assert_eq!(

@@ -175,6 +175,8 @@
 //!     min_age: '86400s'
 //! ```
 //!
+use bytes::Bytes;
+
 use crate::filter::BloomFilterPolicy;
 use crate::filter_policy::FilterPolicy;
 use duration_str::{deserialize_duration, deserialize_option_duration};
@@ -330,6 +332,10 @@ pub struct ScanOptions {
     /// The maximum number of concurrent tasks for fetching blocks during scans.
     /// Higher values can improve throughput but use more resources. The default is 1.
     pub max_fetch_tasks: usize,
+    /// Opaque hints passed to custom filters at query time.
+    /// Keyed by a string name so custom filters can look up relevant hints
+    /// (e.g., version bounds for a min/max filter).
+    pub filter_hints: std::collections::HashMap<String, Bytes>,
     #[cfg(dst)]
     /// Force the current timestamp for DST operations. See #719 for details.
     pub now: i64,
@@ -344,6 +350,7 @@ impl Default for ScanOptions {
             read_ahead_bytes: 1,
             cache_blocks: false,
             max_fetch_tasks: 1,
+            filter_hints: std::collections::HashMap::new(),
             #[cfg(dst)]
             now: 0,
         }
@@ -609,14 +616,14 @@ pub struct Settings {
     /// faster without a bloom filter.
     pub min_filter_keys: u32,
 
-    /// The filter policy to use for SSTables. Defaults to `BloomFilterPolicy` with
-    /// 10 bits per key (~0.82% false positive rate). Set to `None` to disable filters.
+    /// Filter policies to use for SSTables. Defaults to a single `BloomFilterPolicy`
+    /// with 10 bits per key (~0.82% false positive rate). Set to empty to disable filters.
     ///
-    /// The filter policy controls how filters are built, serialized, and queried.
-    /// The built-in `BloomFilterPolicy` supports both point-lookup and prefix-scan
-    /// filtering via an optional `PrefixExtractor`.
+    /// Multiple filter policies can be configured — each SST will contain one filter
+    /// per policy, stored in a composite block. During reads, all filters are evaluated
+    /// with AND logic: an SST is skipped if **any** filter returns false.
     #[serde(skip)]
-    pub filter_policy: Option<Arc<dyn FilterPolicy>>,
+    pub filter_policies: Vec<Arc<dyn FilterPolicy>>,
 
     /// The minimum size a memtable needs to be before it is frozen and flushed to
     /// L0 object storage. Writes will still be flushed to the object storage WAL
@@ -715,12 +722,12 @@ impl std::fmt::Debug for Settings {
             )
             .field("garbage_collector_options", &self.garbage_collector_options)
             .field(
-                "filter_policy",
+                "filter_policies",
                 &self
-                    .filter_policy
-                    .as_ref()
+                    .filter_policies
+                    .iter()
                     .map(|p| p.name().to_string())
-                    .unwrap_or_else(|| "None".to_string()),
+                    .collect::<Vec<_>>(),
             )
             .field("default_ttl", &self.default_ttl)
             .field(
@@ -923,7 +930,7 @@ impl Default for Settings {
             compression_codec: None,
             object_store_cache_options: ObjectStoreCacheOptions::default(),
             garbage_collector_options: Some(GarbageCollectorOptions::default()),
-            filter_policy: Some(Arc::new(BloomFilterPolicy::new(10))),
+            filter_policies: vec![Arc::new(BloomFilterPolicy::new(10))],
             default_ttl: None,
             merge_operator: None,
             #[cfg(test)]

@@ -279,6 +279,7 @@ impl TokioCompactionExecutorInner {
             eager_spawn: true,
             order: IterationOrder::Ascending,
             prefix: None,
+            filter_hints: std::collections::HashMap::new(),
         };
 
         let max_parallel = compute_max_parallel(job_args.ssts.len(), &job_args.sorted_runs, 4);
