@@ -10,7 +10,7 @@ use crate::bytes_range::BytesRange;
 use crate::config::{MergeOptions, PutOptions, ReadOptions, ScanOptions, WriteOptions};
 use crate::db::DbInner;
 use crate::db::WriteHandle;
-use crate::db_iter::{DbIterator, DbIteratorRangeTracker};
+use crate::db_iter::{DbIterator, DbIteratorRangeTracker, RecencyPrefixIterator};
 use crate::error::SlateDBError;
 use crate::transaction_manager::{IsolationLevel, TransactionManager};
 use crate::types::KeyValue;
@@ -301,6 +301,50 @@ impl DbTransaction {
                 Some(self.started_seq),
                 range_tracker,
                 Some(prefix_bytes),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Scan all keys that share the provided prefix, returning entries ordered
+    /// by source recency without merging.
+    ///
+    /// See [`Db::scan_prefix_by_recency`](crate::Db::scan_prefix_by_recency) for details.
+    pub async fn scan_prefix_by_recency<P>(
+        &self,
+        prefix: P,
+    ) -> Result<RecencyPrefixIterator, crate::Error>
+    where
+        P: AsRef<[u8]> + Send,
+    {
+        self.scan_prefix_by_recency_with_options(prefix, &ScanOptions::default())
+            .await
+    }
+
+    /// Scan all keys that share the provided prefix with custom options,
+    /// returning entries ordered by source recency without merging.
+    ///
+    /// See [`Db::scan_prefix_by_recency`](crate::Db::scan_prefix_by_recency) for details.
+    pub async fn scan_prefix_by_recency_with_options<P>(
+        &self,
+        prefix: P,
+        options: &ScanOptions,
+    ) -> Result<RecencyPrefixIterator, crate::Error>
+    where
+        P: AsRef<[u8]> + Send,
+    {
+        let prefix_bytes = Bytes::copy_from_slice(prefix.as_ref());
+        self.db_inner.status()?;
+        let db_state = self.db_inner.state.read().view();
+        let write_batch_cloned = self.write_batch.read().clone();
+        self.db_inner
+            .reader
+            .scan_prefix_by_recency(
+                prefix_bytes,
+                options,
+                &db_state,
+                Some(write_batch_cloned),
+                Some(self.started_seq),
             )
             .await
             .map_err(Into::into)

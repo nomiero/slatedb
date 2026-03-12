@@ -23,6 +23,7 @@ use crate::tablestore::TableStore;
 use crate::types::KeyValue;
 use crate::utils::{IdGenerator, WatchableOnceCell};
 use crate::wal_replay::{WalReplayIterator, WalReplayOptions};
+use crate::db_iter::RecencyPrefixIterator;
 use crate::{Checkpoint, DbIterator};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -218,6 +219,18 @@ impl DbReaderInner {
         let db_state = Arc::clone(&self.state.read());
         self.reader
             .scan_with_options(range, options, db_state.as_ref(), None, None, None, prefix)
+            .await
+    }
+
+    async fn scan_prefix_by_recency(
+        &self,
+        prefix: Bytes,
+        options: &ScanOptions,
+    ) -> Result<RecencyPrefixIterator, SlateDBError> {
+        self.check_closed()?;
+        let db_state = Arc::clone(&self.state.read());
+        self.reader
+            .scan_prefix_by_recency(prefix, options, db_state.as_ref(), None, None)
             .await
     }
 
@@ -953,6 +966,40 @@ impl DbReader {
                 options,
                 Some(prefix_bytes),
             )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Scan all keys that share the provided prefix, returning entries ordered
+    /// by source recency without merging.
+    ///
+    /// See [`Db::scan_prefix_by_recency`](crate::Db::scan_prefix_by_recency) for details.
+    pub async fn scan_prefix_by_recency<P>(
+        &self,
+        prefix: P,
+    ) -> Result<RecencyPrefixIterator, crate::Error>
+    where
+        P: AsRef<[u8]> + Send,
+    {
+        self.scan_prefix_by_recency_with_options(prefix, &ScanOptions::default())
+            .await
+    }
+
+    /// Scan all keys that share the provided prefix with custom options,
+    /// returning entries ordered by source recency without merging.
+    ///
+    /// See [`Db::scan_prefix_by_recency`](crate::Db::scan_prefix_by_recency) for details.
+    pub async fn scan_prefix_by_recency_with_options<P>(
+        &self,
+        prefix: P,
+        options: &ScanOptions,
+    ) -> Result<RecencyPrefixIterator, crate::Error>
+    where
+        P: AsRef<[u8]> + Send,
+    {
+        let prefix_bytes = Bytes::copy_from_slice(prefix.as_ref());
+        self.inner
+            .scan_prefix_by_recency(prefix_bytes, options)
             .await
             .map_err(Into::into)
     }

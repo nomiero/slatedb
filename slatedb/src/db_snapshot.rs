@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::bytes_range::BytesRange;
 use crate::config::{ReadOptions, ScanOptions};
-use crate::db_iter::DbIterator;
+use crate::db_iter::{DbIterator, RecencyPrefixIterator};
 use crate::types::KeyValue;
 
 use crate::db::DbInner;
@@ -195,6 +195,49 @@ impl DbSnapshot {
                 Some(self.started_seq),
                 None,
                 Some(prefix_bytes),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Scan all keys that share the provided prefix, returning entries ordered
+    /// by source recency without merging.
+    ///
+    /// See [`Db::scan_prefix_by_recency`](crate::Db::scan_prefix_by_recency) for details.
+    pub async fn scan_prefix_by_recency<P>(
+        &self,
+        prefix: P,
+    ) -> Result<RecencyPrefixIterator, crate::Error>
+    where
+        P: AsRef<[u8]> + Send,
+    {
+        self.scan_prefix_by_recency_with_options(prefix, &ScanOptions::default())
+            .await
+    }
+
+    /// Scan all keys that share the provided prefix with custom options,
+    /// returning entries ordered by source recency without merging.
+    ///
+    /// See [`Db::scan_prefix_by_recency`](crate::Db::scan_prefix_by_recency) for details.
+    pub async fn scan_prefix_by_recency_with_options<P>(
+        &self,
+        prefix: P,
+        options: &ScanOptions,
+    ) -> Result<RecencyPrefixIterator, crate::Error>
+    where
+        P: AsRef<[u8]> + Send,
+    {
+        let prefix_bytes = Bytes::copy_from_slice(prefix.as_ref());
+        self.db_inner.status()?;
+        let db_state = self.db_inner.state.read().view();
+        self.db_inner
+            .reader
+            .scan_prefix_by_recency(
+                prefix_bytes,
+                options,
+                &db_state,
+                None,
+                Some(self.started_seq),
             )
             .await
             .map_err(Into::into)

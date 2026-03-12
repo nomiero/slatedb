@@ -13,6 +13,7 @@ use crate::types::{KeyValue, RowEntry, ValueDeletable};
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
@@ -398,6 +399,84 @@ where
         .map(|iter| MapIterator::new_with_ttl_now(iter, now))
         .map(|iter| Box::new(iter) as Box<dyn RowEntryIterator + 'static>)
         .collect::<Vec<Box<dyn RowEntryIterator>>>()
+}
+
+/// An iterator that evaluates sources sequentially by recency without merging.
+///
+/// Sources are ordered from most recent to least recent:
+/// write batch → active memtable → immutable memtables → L0 SSTs → sorted runs.
+///
+/// Unlike [`DbIterator`], this iterator:
+/// - Does **not** merge entries across sources — each source is fully drained
+///   before moving to the next.
+/// - Returns raw [`RowEntry`] values including tombstones and merge operands.
+/// - Lazily initializes each source iterator only when it becomes the current
+///   source, so reading only from the most recent source avoids I/O for older
+///   sources entirely.
+///
+/// This is useful for prefix scans where the caller wants the most recent data
+/// first (e.g., time-series "get latest N items for sensor X") and can interpret
+/// tombstones and merge operands themselves.
+pub struct RecencyPrefixIterator {
+    /// Iterators ordered from most recent to least recent. Each iterator has
+    /// already been wrapped with sequence-number and TTL filters.
+    iters: VecDeque<Box<dyn RowEntryIterator + 'static>>,
+    /// Whether the current front iterator has been initialized.
+    current_initialized: bool,
+    /// Sticky error — once an error is encountered, all subsequent calls fail.
+    invalidated_error: Option<SlateDBError>,
+}
+
+impl RecencyPrefixIterator {
+    pub(crate) fn new(
+        iters: VecDeque<Box<dyn RowEntryIterator + 'static>>,
+    ) -> Self {
+        Self {
+            iters,
+            current_initialized: false,
+            invalidated_error: None,
+        }
+    }
+
+    /// Returns the next entry from the current source, advancing to the next
+    /// source when the current one is exhausted.
+    ///
+    /// Entries are returned in the order they appear within each source.
+    /// Sources are evaluated sequentially from most recent to least recent.
+    /// Tombstones and merge operands are **not** filtered — the caller receives
+    /// the raw [`RowEntry`].
+    pub async fn next_entry(&mut self) -> Result<Option<RowEntry>, crate::Error> {
+        if let Some(error) = &self.invalidated_error {
+            return Err(error.clone().into());
+        }
+
+        loop {
+            let Some(iter) = self.iters.front_mut() else {
+                return Ok(None);
+            };
+
+            if !self.current_initialized {
+                if let Err(e) = iter.init().await {
+                    self.invalidated_error = Some(e.clone());
+                    return Err(e.into());
+                }
+                self.current_initialized = true;
+            }
+
+            match iter.next().await {
+                Ok(Some(entry)) => return Ok(Some(entry)),
+                Ok(None) => {
+                    // Current source exhausted, move to the next.
+                    self.iters.pop_front();
+                    self.current_initialized = false;
+                }
+                Err(e) => {
+                    self.invalidated_error = Some(e.clone());
+                    return Err(e.into());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -2,9 +2,10 @@ use crate::batch::{WriteBatch, WriteBatchIterator};
 use crate::bytes_range::BytesRange;
 use crate::clock::MonotonicClock;
 use crate::config::{DurabilityLevel, ReadOptions, ScanOptions};
+use crate::db_iter::{apply_filters, RecencyPrefixIterator};
 use crate::db_state::ManifestCore;
 use crate::db_stats::DbStats;
-use crate::iter::{IterationOrder, RowEntryIterator};
+use crate::iter::{EmptyIterator, IterationOrder, RowEntryIterator};
 use crate::mem_table::{ImmutableMemtable, KVTable};
 use crate::oracle::Oracle;
 use crate::sorted_run_iterator::SortedRunIterator;
@@ -16,9 +17,10 @@ use crate::utils::get_now_for_read;
 use crate::utils::{build_concurrent, compute_max_parallel};
 use crate::{db_iter::DbIteratorRangeTracker, error::SlateDBError, DbIterator};
 
+use std::collections::VecDeque;
+
 use bytes::Bytes;
 use futures::future::join;
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 pub(crate) trait DbStateReader {
@@ -406,6 +408,71 @@ impl Reader {
             self.merge_operator.clone(),
         )
         .await
+    }
+
+    /// Create a non-merging prefix iterator that evaluates sources sequentially
+    /// by recency: write batch → memtables → L0 → sorted runs.
+    ///
+    /// Each source is fully drained before moving to the next. Sources are
+    /// lazily initialized, so reading only from the most recent source avoids
+    /// I/O for older ones entirely. Combined with prefix bloom filters, this
+    /// means a prefix read that finds data in the active memtable performs zero
+    /// object-store I/O.
+    ///
+    /// The returned iterator yields raw [`RowEntry`] values including
+    /// tombstones and merge operands.
+    pub(crate) async fn scan_prefix_by_recency(
+        &self,
+        prefix: Bytes,
+        options: &ScanOptions,
+        db_state: &(dyn DbStateReader + Sync),
+        write_batch: Option<WriteBatch>,
+        max_seq: Option<u64>,
+    ) -> Result<RecencyPrefixIterator, SlateDBError> {
+        let max_seq = self.prepare_max_seq(max_seq, options.durability_filter, options.dirty);
+        #[cfg(not(dst))]
+        let now = get_now_for_read(self.mono_clock.clone(), options.durability_filter).await?;
+        #[cfg(dst)]
+        let now = options.now;
+        let read_ahead_blocks = self.table_store.bytes_to_blocks(options.read_ahead_bytes);
+
+        let range = BytesRange::from_prefix(prefix.as_ref());
+
+        let sst_iter_options = SstIteratorOptions {
+            max_fetch_tasks: options.max_fetch_tasks,
+            blocks_to_fetch: read_ahead_blocks,
+            cache_blocks: options.cache_blocks,
+            eager_spawn: true,
+            order: IterationOrder::Ascending,
+            prefix: Some(prefix),
+        };
+
+        let IteratorSources {
+            write_batch_iter,
+            mem_iters,
+            l0_iters,
+            sr_iters,
+        } = self
+            .build_iterator_sources(&range, db_state, write_batch, sst_iter_options, None)
+            .await?;
+
+        // Build the flat list of iterators ordered by recency (most recent first).
+        // Apply seq/TTL filters to each source individually.
+        let write_batch_iter: Box<dyn RowEntryIterator + 'static> = write_batch_iter
+            .map(|iter| Box::new(iter) as Box<dyn RowEntryIterator + 'static>)
+            .unwrap_or_else(|| Box::new(EmptyIterator::new()));
+
+        let mem_iters = apply_filters(mem_iters, max_seq, now);
+        let l0_iters = apply_filters(l0_iters, max_seq, now);
+        let sr_iters = apply_filters(sr_iters, max_seq, now);
+
+        let mut all_iters: VecDeque<Box<dyn RowEntryIterator + 'static>> = VecDeque::new();
+        all_iters.push_back(write_batch_iter);
+        all_iters.extend(mem_iters);
+        all_iters.extend(l0_iters);
+        all_iters.extend(sr_iters);
+
+        Ok(RecencyPrefixIterator::new(all_iters))
     }
 }
 
