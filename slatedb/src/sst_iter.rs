@@ -978,15 +978,22 @@ impl<'a> SstIterator<'a> {
         table_store: Arc<TableStore>,
         options: SstIteratorOptions,
     ) -> Result<Option<Self>, SlateDBError> {
-        let internal =
-            InternalSstIterator::new_owned_initialized(range, table, table_store, options).await?;
+        // Create an uninitialized internal iterator first, then wrap it.
+        // This ensures BloomFilterIterator.init() can check the filter BEFORE
+        // the inner iterator is initialized (which would read index + data blocks).
+        let internal = InternalSstIterator::new_owned(range, table, table_store, options)?;
         match internal {
             Some(inner) => {
                 let mut iterator = Self::from_internal(inner, None);
-                if let SstIteratorDelegate::Bloom(inner) = &mut iterator.delegate {
-                    inner.init().await?;
-                    if inner.is_filtered_out() {
-                        return Ok(None);
+                match &mut iterator.delegate {
+                    SstIteratorDelegate::Bloom(bloom_iter) => {
+                        bloom_iter.init().await?;
+                        if bloom_iter.is_filtered_out() {
+                            return Ok(None);
+                        }
+                    }
+                    SstIteratorDelegate::Direct(inner_iter) => {
+                        inner_iter.init().await?;
                     }
                 }
                 Ok(Some(iterator))

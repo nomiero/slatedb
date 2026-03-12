@@ -447,14 +447,54 @@ impl Reader {
             prefix: Some(prefix),
         };
 
-        let IteratorSources {
-            write_batch_iter,
-            mem_iters,
-            l0_iters,
-            sr_iters,
-        } = self
-            .build_iterator_sources(&range, db_state, write_batch, sst_iter_options, None)
+        // Build iterators WITHOUT pre-initializing them so that the
+        // RecencyPrefixIterator can lazily init each source one at a time.
+        // This avoids paying I/O cost for SSTs we never need to read.
+
+        let write_batch_iter = write_batch.map(|batch| {
+            WriteBatchIterator::new(batch, range.clone(), IterationOrder::Ascending)
+        });
+
+        let mut memtables = VecDeque::new();
+        memtables.push_back(db_state.memtable());
+        for memtable in db_state.imm_memtable() {
+            memtables.push_back(memtable.table());
+        }
+        let mem_iters: Vec<Box<dyn RowEntryIterator + 'static>> = memtables
+            .iter()
+            .map(|table| {
+                Box::new(table.range_ascending(range.clone()))
+                    as Box<dyn RowEntryIterator + 'static>
+            })
+            .collect();
+
+        // L0 SST iterators: created but NOT initialized (no I/O yet).
+        let mut l0_iters: VecDeque<Box<dyn RowEntryIterator + 'static>> = VecDeque::new();
+        for sst in &db_state.core().l0 {
+            let iterator = SstIterator::new_owned_with_stats(
+                range.clone(),
+                sst.clone(),
+                self.table_store.clone(),
+                sst_iter_options.clone(),
+                None,
+            )?;
+            if let Some(iterator) = iterator {
+                l0_iters.push_back(Box::new(iterator));
+            }
+        }
+
+        // Sorted run iterators: created but NOT initialized (no I/O yet).
+        let mut sr_iters: VecDeque<Box<dyn RowEntryIterator + 'static>> = VecDeque::new();
+        for sr in &db_state.core().compacted {
+            let iterator = SortedRunIterator::new_owned(
+                range.clone(),
+                sr.clone(),
+                self.table_store.clone(),
+                sst_iter_options.clone(),
+            )
             .await?;
+            sr_iters.push_back(Box::new(iterator));
+        }
 
         // Build the flat list of iterators ordered by recency (most recent first).
         // Apply seq/TTL filters to each source individually.
