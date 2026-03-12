@@ -23,7 +23,8 @@ use crate::db_cache::stats::DbCacheStats;
 use crate::format::block::Block;
 use crate::sst_stats::SstStats;
 use crate::stats::StatRegistry;
-use crate::{db_state::SsTableId, filter::BloomFilter, flatbuffer_types::SsTableIndexOwned};
+use crate::filter_policy::Filter;
+use crate::{db_state::SsTableId, flatbuffer_types::SsTableIndexOwned};
 use slatedb_common::clock::SystemClock;
 
 #[cfg(feature = "foyer")]
@@ -190,7 +191,7 @@ impl From<(SsTableId, u64)> for CachedKey {
 enum CachedItem {
     Block(Arc<Block>),
     SsTableIndex(Arc<SsTableIndexOwned>),
-    BloomFilter(Arc<BloomFilter>),
+    Filter(Arc<dyn Filter>),
     SstStats(Arc<SstStats>),
 }
 
@@ -219,10 +220,10 @@ impl CachedEntry {
         }
     }
 
-    /// Create a new `CachedEntry` with the given bloom filter.
-    pub(crate) fn with_bloom_filter(bloom_filter: Arc<BloomFilter>) -> Self {
+    /// Create a new `CachedEntry` with the given filter.
+    pub(crate) fn with_filter(filter: Arc<dyn Filter>) -> Self {
         Self {
-            item: CachedItem::BloomFilter(bloom_filter),
+            item: CachedItem::Filter(filter),
         }
     }
 
@@ -247,9 +248,9 @@ impl CachedEntry {
         }
     }
 
-    pub(crate) fn bloom_filter(&self) -> Option<Arc<BloomFilter>> {
+    pub(crate) fn filter(&self) -> Option<Arc<dyn Filter>> {
         match &self.item {
-            CachedItem::BloomFilter(bloom_filter) => Some(bloom_filter.clone()),
+            CachedItem::Filter(filter) => Some(filter.clone()),
             _ => None,
         }
     }
@@ -269,7 +270,7 @@ impl CachedEntry {
         match &self.item {
             CachedItem::Block(block) => block.size(),
             CachedItem::SsTableIndex(sst_index) => sst_index.size(),
-            CachedItem::BloomFilter(bloom_filter) => bloom_filter.size(),
+            CachedItem::Filter(filter) => filter.size(),
             CachedItem::SstStats(stats) => stats.size(),
         }
     }
@@ -280,8 +281,9 @@ impl CachedEntry {
             CachedItem::SsTableIndex(sst_index) => {
                 Self::with_sst_index(Arc::new(sst_index.clamp_allocated_size()))
             }
-            CachedItem::BloomFilter(bloom_filter) => {
-                Self::with_bloom_filter(Arc::new(bloom_filter.clamp_allocated_size()))
+            CachedItem::Filter(filter) => {
+                // Cannot clamp a trait object generically; return as-is.
+                Self::with_filter(filter.clone())
             }
             CachedItem::SstStats(stats) => {
                 Self::with_sst_stats(Arc::new(stats.clamp_allocated_size()))
@@ -369,7 +371,7 @@ impl DbCache for SplitCache {
                     trace!("no block cache available for insertion");
                 }
             }
-            CachedItem::SsTableIndex(_) | CachedItem::BloomFilter(_) | CachedItem::SstStats(_) => {
+            CachedItem::SsTableIndex(_) | CachedItem::Filter(_) | CachedItem::SstStats(_) => {
                 if let Some(ref cache) = self.meta_cache {
                     cache.insert(key, value.clamp_allocated_size()).await;
                 } else {
@@ -680,7 +682,6 @@ mod tests {
 
     use crate::db_cache::{CachedEntry, CachedKey, DbCache, DbCacheWrapper, SplitCache};
     use crate::db_state::SsTableId;
-    use crate::filter::BloomFilterBuilder;
     use crate::format::sst::BlockBuilder;
     use slatedb_common::clock::DefaultSystemClock;
 
@@ -708,7 +709,7 @@ mod tests {
         cache
             .insert(
                 key.clone(),
-                CachedEntry::with_bloom_filter(sst.filter.unwrap()),
+                CachedEntry::with_filter(sst.filter.unwrap()),
             )
             .await;
 
@@ -855,20 +856,19 @@ mod tests {
         let cache_b = DbCacheWrapper::new(shared_cache.clone(), &registry_b, system_clock);
         assert_ne!(cache_a.scope_id, cache_b.scope_id);
 
-        let mut builder = BloomFilterBuilder::new(1);
-        builder.add_key(b"a");
-        let filter = Arc::new(builder.build());
+        let sst = build_test_sst(&SsTableFormat::default(), 1).await;
+        let filter = sst.filter.unwrap();
         let key = CachedKey::from((SST_ID, 1u64));
 
         cache_a
-            .insert(key.clone(), CachedEntry::with_bloom_filter(filter.clone()))
+            .insert(key.clone(), CachedEntry::with_filter(filter.clone()))
             .await;
 
         assert!(cache_a.get_filter(&key).await.unwrap().is_some());
         assert!(cache_b.get_filter(&key).await.unwrap().is_none());
 
         cache_b
-            .insert(key.clone(), CachedEntry::with_bloom_filter(filter))
+            .insert(key.clone(), CachedEntry::with_filter(filter))
             .await;
 
         assert_eq!(2, shared_cache.entry_count());

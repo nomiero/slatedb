@@ -17,7 +17,7 @@ use crate::blob::ReadOnlyBlob;
 use crate::db_cache::{CachedEntry, DbCache};
 use crate::db_state::{SsTableHandle, SsTableId};
 use crate::error::SlateDBError;
-use crate::filter::BloomFilter;
+use crate::filter_policy::Filter;
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::block::Block;
 use crate::format::sst::{EncodedSsTable, SsTableFormat};
@@ -233,13 +233,13 @@ impl TableStore {
         ))
     }
 
-    async fn cache_filter(&self, sst: SsTableId, id: u64, filter: Option<Arc<BloomFilter>>) {
+    async fn cache_filter(&self, sst: SsTableId, id: u64, filter: Option<Arc<dyn Filter>>) {
         let Some(ref cache) = self.cache else {
             return;
         };
         if let Some(filter) = filter {
             cache
-                .insert((sst, id).into(), CachedEntry::with_bloom_filter(filter))
+                .insert((sst, id).into(), CachedEntry::with_filter(filter))
                 .await;
         }
     }
@@ -342,7 +342,7 @@ impl TableStore {
         self.sst_format.read_version(&obj).await
     }
 
-    /// Reads the Bloom filter of an SSTable.
+    /// Reads the filter of an SSTable.
     ///
     /// ## Arguments
     /// - `handle`: The handle of the SSTable to read the filter from.
@@ -351,13 +351,13 @@ impl TableStore {
         &self,
         handle: &SsTableHandle,
         cache_blocks: bool,
-    ) -> Result<Option<Arc<BloomFilter>>, SlateDBError> {
+    ) -> Result<Option<Arc<dyn Filter>>, SlateDBError> {
         if let Some(ref cache) = self.cache {
             if let Some(filter) = cache
                 .get_filter(&(handle.id, handle.info.filter_offset).into())
                 .await
                 .unwrap_or(None)
-                .and_then(|e| e.bloom_filter())
+                .and_then(|e| e.filter())
             {
                 return Ok(Some(filter));
             }
@@ -372,7 +372,7 @@ impl TableStore {
                     cache
                         .insert(
                             (handle.id, handle.info.filter_offset).into(),
-                            CachedEntry::with_bloom_filter(filter.clone()),
+                            CachedEntry::with_filter(filter.clone()),
                         )
                         .await;
                 }

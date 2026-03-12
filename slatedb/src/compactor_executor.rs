@@ -278,20 +278,30 @@ impl TokioCompactionExecutorInner {
             cache_blocks: false, // don't clobber the cache
             eager_spawn: true,
             order: IterationOrder::Ascending,
+            prefix: None,
         };
 
         let max_parallel = compute_max_parallel(job_args.ssts.len(), &job_args.sorted_runs, 4);
         // L0 (borrowed)
         let l0_iters_futures = build_concurrent(job_args.ssts.iter(), max_parallel, |h| {
+            let sst_iter_options = sst_iter_options.clone();
             SstIterator::new_borrowed_initialized(.., h, self.table_store.clone(), sst_iter_options)
         });
 
         // SR (borrowed)
         let sr_iters_futures =
-            build_concurrent(job_args.sorted_runs.iter(), max_parallel, |sr| async {
-                SortedRunIterator::new_borrowed(.., sr, self.table_store.clone(), sst_iter_options)
+            build_concurrent(job_args.sorted_runs.iter(), max_parallel, |sr| {
+                let sst_iter_options = sst_iter_options.clone();
+                async {
+                    SortedRunIterator::new_borrowed(
+                        ..,
+                        sr,
+                        self.table_store.clone(),
+                        sst_iter_options,
+                    )
                     .await
                     .map(Some)
+                }
             });
 
         let (l0_iters_res, sr_iters_res) = join(l0_iters_futures, sr_iters_futures).await;

@@ -132,7 +132,7 @@ impl<'a> SortedRunIterator<'a> {
     async fn advance_table(&mut self) -> Result<(), SlateDBError> {
         self.current_iter = self
             .view
-            .build_next_iter(self.table_store.clone(), self.sst_iter_options)
+            .build_next_iter(self.table_store.clone(), self.sst_iter_options.clone())
             .await?;
         if self.initialized {
             if let Some(iter) = self.current_iter.as_mut() {

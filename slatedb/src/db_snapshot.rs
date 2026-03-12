@@ -145,6 +145,7 @@ impl DbSnapshot {
                 None,
                 Some(self.started_seq),
                 None,
+                None,
             )
             .await
             .map_err(Into::into)
@@ -181,8 +182,22 @@ impl DbSnapshot {
     where
         P: AsRef<[u8]> + Send,
     {
-        self.scan_with_options(BytesRange::from_prefix(prefix.as_ref()), options)
+        let prefix_bytes = Bytes::copy_from_slice(prefix.as_ref());
+        self.db_inner.status()?;
+        let db_state = self.db_inner.state.read().view();
+        self.db_inner
+            .reader
+            .scan_with_options(
+                BytesRange::from_prefix(prefix.as_ref()),
+                options,
+                &db_state,
+                None,
+                Some(self.started_seq),
+                None,
+                Some(prefix_bytes),
+            )
             .await
+            .map_err(Into::into)
     }
 }
 

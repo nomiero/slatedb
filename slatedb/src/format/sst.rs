@@ -2,7 +2,8 @@ use crate::blob::ReadOnlyBlob;
 use crate::config::CompressionCodec;
 use crate::db_state::{SsTableInfo, SsTableInfoCodec, SstType};
 use crate::error::SlateDBError;
-use crate::filter::BloomFilter;
+use crate::filter::BloomFilterPolicy;
+use crate::filter_policy::{Filter, FilterPolicy};
 use crate::flatbuffer_types::{
     BlockMeta, FlatBufferSsTableInfoCodec, SsTableIndex, SsTableIndexArgs, SsTableIndexOwned,
 };
@@ -253,7 +254,7 @@ impl EncodedSsTableBlockBuilder {
 pub(crate) struct EncodedSsTableFooter {
     pub(crate) info: SsTableInfo,
     pub(crate) index: SsTableIndexOwned,
-    pub(crate) filter: Option<Arc<BloomFilter>>,
+    pub(crate) filter: Option<Arc<dyn Filter>>,
     #[allow(dead_code)]
     pub(crate) stats: Option<SstStats>,
     pub(crate) encoded_bytes: Bytes,
@@ -278,7 +279,9 @@ pub(crate) struct EncodedSsTableFooterBuilder<'a, 'b> {
     /// metadata block
     block_meta: Vec<flatbuffers::WIPOffset<BlockMeta<'b>>>,
     /// filter block
-    filter: Option<(Arc<BloomFilter>, Bytes)>,
+    filter: Option<(Arc<dyn Filter>, Bytes)>,
+    /// filter policy name (stored in SST metadata for compatibility checks)
+    filter_policy_name: Option<String>,
     /// stats block
     stats: Option<SstStats>,
     /// SST format version
@@ -308,6 +311,7 @@ impl<'a, 'b> EncodedSsTableFooterBuilder<'a, 'b> {
             index_builder,
             block_meta,
             filter: None,
+            filter_policy_name: None,
             stats: None,
             sst_format_version,
             sst_type,
@@ -332,9 +336,15 @@ impl<'a, 'b> EncodedSsTableFooterBuilder<'a, 'b> {
         self
     }
 
-    /// Adds a bloom filter to the footer.
-    pub(crate) fn with_filter(mut self, filter: Arc<BloomFilter>, encoded_filter: Bytes) -> Self {
+    /// Adds a filter to the footer.
+    pub(crate) fn with_filter(
+        mut self,
+        filter: Arc<dyn Filter>,
+        encoded_filter: Bytes,
+        policy_name: Option<String>,
+    ) -> Self {
         self.filter = Some((filter, encoded_filter));
+        self.filter_policy_name = policy_name;
         self
     }
 
@@ -406,6 +416,7 @@ impl<'a, 'b> EncodedSsTableFooterBuilder<'a, 'b> {
             sst_type: self.sst_type,
             stats_offset,
             stats_len,
+            filter_policy_name: self.filter_policy_name,
         };
         SsTableInfo::encode(&info, &mut buf, self.sst_info_codec);
 
@@ -426,7 +437,7 @@ pub(crate) struct EncodedSsTable {
     pub(crate) format_version: u16,
     pub(crate) info: SsTableInfo,
     pub(crate) index: SsTableIndexOwned,
-    pub(crate) filter: Option<Arc<BloomFilter>>,
+    pub(crate) filter: Option<Arc<dyn Filter>>,
     #[allow(dead_code)]
     pub(crate) stats: Option<SstStats>,
     pub(crate) unconsumed_blocks: VecDeque<EncodedSsTableBlock>,
@@ -536,7 +547,7 @@ pub(crate) struct SsTableFormat {
     pub(crate) block_size: usize,
     pub(crate) min_filter_keys: u32,
     pub(crate) sst_codec: Box<dyn SsTableInfoCodec>,
-    pub(crate) filter_bits_per_key: u32,
+    pub(crate) filter_policy: Option<Arc<dyn FilterPolicy>>,
     pub(crate) compression_codec: Option<CompressionCodec>,
     pub(crate) block_transformer: Option<Arc<dyn BlockTransformer>>,
     pub(crate) block_format: Option<crate::sst_builder::BlockFormat>,
@@ -548,7 +559,7 @@ impl Default for SsTableFormat {
             block_size: 4096,
             min_filter_keys: 0,
             sst_codec: Box::new(FlatBufferSsTableInfoCodec {}),
-            filter_bits_per_key: 10,
+            filter_policy: Some(Arc::new(BloomFilterPolicy::new(10))),
             compression_codec: None,
             block_transformer: None,
             block_format: None,
@@ -609,18 +620,36 @@ impl SsTableFormat {
         &self,
         info: &SsTableInfo,
         obj: &impl ReadOnlyBlob,
-    ) -> Result<Option<Arc<BloomFilter>>, SlateDBError> {
-        let mut filter = None;
-        if info.filter_len > 0 {
-            let filter_end = info.filter_offset + info.filter_len;
-            let filter_offset_range = info.filter_offset..filter_end;
-            let filter_bytes = obj.read_range(filter_offset_range).await?;
-            let compression_codec = info.compression_codec;
-            filter = Some(Arc::new(
-                self.decode_filter(filter_bytes, compression_codec).await?,
-            ));
+    ) -> Result<Option<Arc<dyn Filter>>, SlateDBError> {
+        let policy = match &self.filter_policy {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        if info.filter_len == 0 {
+            return Ok(None);
         }
-        Ok(filter)
+        // Check policy name compatibility. Old SSTs without a name are
+        // assumed to be "slatedb.BloomFilter".
+        let sst_policy_name = info
+            .filter_policy_name
+            .as_deref()
+            .unwrap_or("slatedb.BloomFilter");
+        if sst_policy_name != policy.name() {
+            log::warn!(
+                "Filter policy mismatch: SST has '{}', configured policy is '{}'. Skipping filter.",
+                sst_policy_name,
+                policy.name()
+            );
+            return Ok(None);
+        }
+        let filter_end = info.filter_offset + info.filter_len;
+        let filter_offset_range = info.filter_offset..filter_end;
+        let filter_bytes = obj.read_range(filter_offset_range).await?;
+        let compression_codec = info.compression_codec;
+        Ok(Some(
+            self.decode_filter(filter_bytes, compression_codec, policy.as_ref())
+                .await?,
+        ))
     }
 
     #[allow(dead_code)]
@@ -628,24 +657,37 @@ impl SsTableFormat {
         &self,
         info: &SsTableInfo,
         sst_bytes: &Bytes,
-    ) -> Result<Option<Arc<BloomFilter>>, SlateDBError> {
+    ) -> Result<Option<Arc<dyn Filter>>, SlateDBError> {
+        let policy = match &self.filter_policy {
+            Some(p) => p,
+            None => return Ok(None),
+        };
         if info.filter_len == 0 {
+            return Ok(None);
+        }
+        let sst_policy_name = info
+            .filter_policy_name
+            .as_deref()
+            .unwrap_or("slatedb.BloomFilter");
+        if sst_policy_name != policy.name() {
             return Ok(None);
         }
         let filter_end = info.filter_offset + info.filter_len;
         let filter_offset_range = info.filter_offset as usize..filter_end as usize;
         let filter_bytes = sst_bytes.slice(filter_offset_range);
         let compression_codec = info.compression_codec;
-        Ok(Some(Arc::new(
-            self.decode_filter(filter_bytes, compression_codec).await?,
-        )))
+        Ok(Some(
+            self.decode_filter(filter_bytes, compression_codec, policy.as_ref())
+                .await?,
+        ))
     }
 
     pub(crate) async fn decode_filter(
         &self,
         bytes: Bytes,
         compression_codec: Option<CompressionCodec>,
-    ) -> Result<BloomFilter, SlateDBError> {
+        policy: &dyn FilterPolicy,
+    ) -> Result<Arc<dyn Filter>, SlateDBError> {
         let filter_bytes = self.validate_checksum(bytes)?;
 
         let untransformed_bytes = match &self.block_transformer {
@@ -660,7 +702,7 @@ impl SsTableFormat {
             None => untransformed_bytes,
         };
 
-        Ok(BloomFilter::decode(&decompressed_bytes))
+        Ok(policy.decode(&decompressed_bytes))
     }
 
     pub(crate) async fn read_index(
@@ -965,7 +1007,10 @@ impl SsTableFormat {
 
     fn estimate_encoded_size_filter(&self, entry_num: usize) -> usize {
         if entry_num >= self.min_filter_keys as usize {
-            BloomFilter::estimate_encoded_size(entry_num as u32, self.filter_bits_per_key)
+            match &self.filter_policy {
+                Some(policy) => policy.estimate_size(entry_num),
+                None => 0,
+            }
         } else {
             0usize
         }

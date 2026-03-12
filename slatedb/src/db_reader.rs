@@ -212,11 +212,12 @@ impl DbReaderInner {
         &self,
         range: BytesRange,
         options: &ScanOptions,
+        prefix: Option<Bytes>,
     ) -> Result<DbIterator, SlateDBError> {
         self.check_closed()?;
         let db_state = Arc::clone(&self.state.read());
         self.reader
-            .scan_with_options(range, options, db_state.as_ref(), None, None, None)
+            .scan_with_options(range, options, db_state.as_ref(), None, None, None, prefix)
             .await
     }
 
@@ -415,6 +416,7 @@ impl DbReaderInner {
             cache_blocks: true,
             eager_spawn: true,
             order: IterationOrder::Ascending,
+            prefix: None,
         };
 
         let replay_options = WalReplayOptions {
@@ -908,7 +910,7 @@ impl DbReader {
             .map(|b| Bytes::copy_from_slice(b.as_ref()));
         let range = BytesRange::from((start, end));
         self.inner
-            .scan_with_options(range, options)
+            .scan_with_options(range, options, None)
             .await
             .map_err(Into::into)
     }
@@ -944,8 +946,15 @@ impl DbReader {
     where
         P: AsRef<[u8]> + Send,
     {
-        self.scan_with_options(BytesRange::from_prefix(prefix.as_ref()), options)
+        let prefix_bytes = Bytes::copy_from_slice(prefix.as_ref());
+        self.inner
+            .scan_with_options(
+                BytesRange::from_prefix(prefix.as_ref()),
+                options,
+                Some(prefix_bytes),
+            )
             .await
+            .map_err(Into::into)
     }
 
     /// Close the database reader.

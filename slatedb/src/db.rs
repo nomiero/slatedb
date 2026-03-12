@@ -218,12 +218,13 @@ impl DbInner {
         &self,
         range: BytesRange,
         options: &ScanOptions,
+        prefix: Option<Bytes>,
     ) -> Result<DbIterator, SlateDBError> {
         self.db_stats.scan_requests.inc();
         self.status()?;
         let db_state = self.state.read().view();
         self.reader
-            .scan_with_options(range, options, &db_state, None, None, None)
+            .scan_with_options(range, options, &db_state, None, None, None, prefix)
             .await
     }
 
@@ -509,6 +510,7 @@ impl DbInner {
             cache_blocks: false,
             eager_spawn: true,
             order: IterationOrder::Ascending,
+            prefix: None,
         };
 
         let replay_options = WalReplayOptions {
@@ -999,7 +1001,7 @@ impl Db {
             .map(|b| Bytes::copy_from_slice(b.as_ref()));
         let range = (start, end);
         self.inner
-            .scan_with_options(BytesRange::from(range), options)
+            .scan_with_options(BytesRange::from(range), options, None)
             .await
             .map_err(Into::into)
     }
@@ -1094,9 +1096,10 @@ impl Db {
     where
         P: AsRef<[u8]> + Send,
     {
+        let prefix_bytes = Bytes::copy_from_slice(prefix.as_ref());
         let range = BytesRange::from_prefix(prefix.as_ref());
         self.inner
-            .scan_with_options(range, options)
+            .scan_with_options(range, options, Some(prefix_bytes))
             .await
             .map_err(Into::into)
     }
@@ -3182,7 +3185,7 @@ mod tests {
                 let iter = self
                     .db
                     .inner
-                    .scan_with_options(range, &ScanOptions::default())
+                    .scan_with_options(range, &ScanOptions::default(), None)
                     .await
                     .unwrap();
                 Box::new(iter)
@@ -3222,7 +3225,7 @@ mod tests {
     ) {
         let mut iter = db
             .inner
-            .scan_with_options(range.clone(), scan_options)
+            .scan_with_options(range.clone(), scan_options, None)
             .await
             .unwrap();
         test_utils::assert_ranged_db_scan(table, range, &mut iter).await;
@@ -3365,7 +3368,7 @@ mod tests {
         ) {
             let mut iter = db
                 .inner
-                .scan_with_options(scan_range.clone(), &ScanOptions::default())
+                .scan_with_options(scan_range.clone(), &ScanOptions::default(), None)
                 .await
                 .unwrap();
 
@@ -3742,7 +3745,7 @@ mod tests {
                 ..,
                 sst1,
                 table_store.clone(),
-                sst_iter_options,
+                sst_iter_options.clone(),
             )
             .await
             .unwrap()
@@ -6009,7 +6012,6 @@ mod tests {
             max_unflushed_bytes: 134_217_728,
             l0_max_ssts: 8,
             min_filter_keys,
-            filter_bits_per_key: 10,
             l0_sst_size_bytes,
             compactor_options,
             compression_codec: None,
@@ -6018,6 +6020,7 @@ mod tests {
             garbage_collector_options: None,
             default_ttl: ttl,
             block_format: None,
+            ..Settings::default()
         }
     }
 

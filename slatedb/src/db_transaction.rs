@@ -238,6 +238,7 @@ impl DbTransaction {
                 Some(write_batch_cloned),
                 Some(self.started_seq),
                 range_tracker,
+                None,
             )
             .await
             .map_err(Into::into)
@@ -276,8 +277,33 @@ impl DbTransaction {
     where
         P: AsRef<[u8]> + Send,
     {
-        self.scan_with_options(BytesRange::from_prefix(prefix.as_ref()), options)
+        let prefix_bytes = Bytes::copy_from_slice(prefix.as_ref());
+
+        let range_tracker = if self.isolation_level == IsolationLevel::SerializableSnapshot {
+            let tracker = Arc::new(DbIteratorRangeTracker::new());
+            self.range_trackers.lock().push(tracker.clone());
+            Some(tracker)
+        } else {
+            None
+        };
+
+        self.db_inner.status()?;
+        let db_state = self.db_inner.state.read().view();
+        let write_batch_cloned = self.write_batch.read().clone();
+
+        self.db_inner
+            .reader
+            .scan_with_options(
+                BytesRange::from_prefix(prefix.as_ref()),
+                options,
+                &db_state,
+                Some(write_batch_cloned),
+                Some(self.started_seq),
+                range_tracker,
+                Some(prefix_bytes),
+            )
             .await
+            .map_err(Into::into)
     }
 
     /// Put a key-value pair into the transaction.
@@ -1673,7 +1699,6 @@ mod tests {
             max_unflushed_bytes: 134_217_728,
             l0_max_ssts: 8,
             min_filter_keys,
-            filter_bits_per_key: 10,
             l0_sst_size_bytes,
             compactor_options,
             compression_codec: None,
@@ -1682,6 +1707,7 @@ mod tests {
             garbage_collector_options: None,
             default_ttl: None,
             block_format: None,
+            ..crate::config::Settings::default()
         }
     }
 

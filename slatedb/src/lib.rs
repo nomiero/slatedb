@@ -50,6 +50,10 @@ pub use db_reader::DbReader;
 pub use db_snapshot::DbSnapshot;
 pub use db_transaction::DbTransaction;
 pub use error::{CloseReason, Error, ErrorKind};
+pub use filter::BloomFilterPolicy;
+pub use filter_policy::{
+    Filter, FilterBuilder, FilterPolicy, FilterQuery, FixedPrefixExtractor, PrefixExtractor,
+};
 pub use format::sst::BlockTransformer;
 pub use garbage_collector::stats as garbage_collector_stats;
 pub use garbage_collector::GarbageCollectorBuilder;
@@ -109,6 +113,8 @@ mod dispatcher;
 mod error;
 mod filter;
 mod filter_iterator;
+/// Pluggable filter policy traits for custom filter implementations.
+pub mod filter_policy;
 mod flatbuffer_types;
 mod flush;
 mod format;

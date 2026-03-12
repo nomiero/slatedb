@@ -48,7 +48,6 @@
 //! manifest_poll_interval = "1s"
 //! manifest_update_timeout = "300s"
 //! min_filter_keys = 1000
-//! filter_bits_per_key = 10
 //! l0_sst_size_bytes = 67108864
 //! l0_max_ssts = 8
 //! max_unflushed_bytes = 536870912
@@ -95,7 +94,6 @@
 //!  "manifest_poll_interval": "1s",
 //!  "manifest_update_timeout": "300s",
 //!  "min_filter_keys": 1000,
-//!  "filter_bits_per_key": 10,
 //!  "l0_sst_size_bytes": 67108864,
 //!  "l0_max_ssts": 8,
 //!  "max_unflushed_bytes": 536870912,
@@ -145,7 +143,6 @@
 //! manifest_poll_interval: '1s'
 //! manifest_update_timeout: '300s'
 //! min_filter_keys: 1000
-//! filter_bits_per_key: 10
 //! l0_sst_size_bytes: 67108864
 //! l0_max_ssts: 8
 //! max_unflushed_bytes: 536870912
@@ -178,6 +175,8 @@
 //!     min_age: '86400s'
 //! ```
 //!
+use crate::filter::BloomFilterPolicy;
+use crate::filter_policy::FilterPolicy;
 use duration_str::{deserialize_duration, deserialize_option_duration};
 use figment::providers::{Env, Format, Json, Toml, Yaml};
 use figment::{Figment, Metadata, Provider};
@@ -610,12 +609,14 @@ pub struct Settings {
     /// faster without a bloom filter.
     pub min_filter_keys: u32,
 
-    /// The number of bits to use per key for bloom filters. We recommend setting this
-    /// to the default value of 10, which yields a filter with an expected fpp of ~.0082
-    /// Note that this is evaluated per-sorted-run, so the expected number of false positives
-    /// per request is the fpp * number of sorted runs. So for large dbs with lots of runs,
-    /// you may benefit from setting this higher (if you have enough memory available)
-    pub filter_bits_per_key: u32,
+    /// The filter policy to use for SSTables. Defaults to `BloomFilterPolicy` with
+    /// 10 bits per key (~0.82% false positive rate). Set to `None` to disable filters.
+    ///
+    /// The filter policy controls how filters are built, serialized, and queried.
+    /// The built-in `BloomFilterPolicy` supports both point-lookup and prefix-scan
+    /// filtering via an optional `PrefixExtractor`.
+    #[serde(skip)]
+    pub filter_policy: Option<Arc<dyn FilterPolicy>>,
 
     /// The minimum size a memtable needs to be before it is frozen and flushed to
     /// L0 object storage. Writes will still be flushed to the object storage WAL
@@ -713,7 +714,14 @@ impl std::fmt::Debug for Settings {
                 &self.object_store_cache_options,
             )
             .field("garbage_collector_options", &self.garbage_collector_options)
-            .field("filter_bits_per_key", &self.filter_bits_per_key)
+            .field(
+                "filter_policy",
+                &self
+                    .filter_policy
+                    .as_ref()
+                    .map(|p| p.name().to_string())
+                    .unwrap_or_else(|| "None".to_string()),
+            )
             .field("default_ttl", &self.default_ttl)
             .field(
                 "merge_operator",
@@ -915,7 +923,7 @@ impl Default for Settings {
             compression_codec: None,
             object_store_cache_options: ObjectStoreCacheOptions::default(),
             garbage_collector_options: Some(GarbageCollectorOptions::default()),
-            filter_bits_per_key: 10,
+            filter_policy: Some(Arc::new(BloomFilterPolicy::new(10))),
             default_ttl: None,
             merge_operator: None,
             #[cfg(test)]

@@ -1,30 +1,135 @@
 use std::mem::size_of;
+use std::sync::Arc;
 
+use crate::filter_policy::{
+    Filter, FilterBuilder, FilterPolicy, FilterQuery, PrefixExtractor,
+};
+#[cfg(test)]
 use crate::utils::clamp_allocated_size_bytes;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes};
+#[cfg(test)]
+use bytes::BytesMut;
 use siphasher::sip::SipHasher13;
 
-pub(crate) struct BloomFilterBuilder {
+// ---------------------------------------------------------------------------
+// BloomFilterPolicy
+// ---------------------------------------------------------------------------
+
+/// Built-in bloom filter policy.
+///
+/// Supports both full-key filtering (point lookups) and prefix filtering
+/// (prefix scans) using a single bloom filter per SST.
+pub struct BloomFilterPolicy {
     bits_per_key: u32,
-    key_hashes: Vec<u64>,
+    whole_key_filtering: bool,
+    prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+    name: String,
 }
 
-#[derive(PartialEq, Eq)]
-pub(crate) struct BloomFilter {
-    num_probes: u16,
-    buffer: Bytes,
+impl std::fmt::Debug for BloomFilterPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BloomFilterPolicy")
+            .field("bits_per_key", &self.bits_per_key)
+            .field("whole_key_filtering", &self.whole_key_filtering)
+            .field(
+                "prefix_extractor",
+                &self.prefix_extractor.as_ref().map(|e| e.name()),
+            )
+            .field("name", &self.name)
+            .finish()
+    }
 }
 
-impl BloomFilterBuilder {
-    pub(crate) fn new(bits_per_key: u32) -> Self {
+impl BloomFilterPolicy {
+    /// Creates a new bloom filter policy with the given bits per key.
+    ///
+    /// Defaults to `whole_key_filtering = true` and no prefix extractor.
+    pub fn new(bits_per_key: u32) -> Self {
         Self {
             bits_per_key,
-            key_hashes: Vec::new(),
+            whole_key_filtering: true,
+            prefix_extractor: None,
+            name: "slatedb.BloomFilter".to_string(),
         }
     }
 
-    pub(crate) fn add_key(&mut self, key: &[u8]) {
-        self.key_hashes.push(filter_hash(key))
+    /// Configures a prefix extractor for prefix-based filtering.
+    ///
+    /// When set, prefix hashes are added to the filter during SST
+    /// construction. Prefix scans probe the filter with the prefix hash.
+    pub fn with_prefix_extractor(mut self, extractor: Arc<dyn PrefixExtractor>) -> Self {
+        self.name = format!("slatedb.BloomFilter:prefix={}", extractor.name());
+        self.prefix_extractor = Some(extractor);
+        self
+    }
+
+    /// Controls whether full-key hashes are added to the filter.
+    ///
+    /// When `true` (default), point lookups probe the filter with the
+    /// full-key hash. When `false`, point lookups skip the filter.
+    pub fn with_whole_key_filtering(mut self, enabled: bool) -> Self {
+        self.whole_key_filtering = enabled;
+        self
+    }
+
+    /// Returns the prefix extractor, if configured.
+    pub fn prefix_extractor(&self) -> Option<&Arc<dyn PrefixExtractor>> {
+        self.prefix_extractor.as_ref()
+    }
+}
+
+impl FilterPolicy for BloomFilterPolicy {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn builder(&self) -> Box<dyn FilterBuilder> {
+        Box::new(BloomFilterBuilder::new(
+            self.bits_per_key,
+            self.whole_key_filtering,
+            self.prefix_extractor.clone(),
+        ))
+    }
+
+    fn decode(&self, data: &[u8]) -> Arc<dyn Filter> {
+        Arc::new(BloomFilter::decode(
+            data,
+            self.whole_key_filtering,
+            self.prefix_extractor.is_some(),
+            self.prefix_extractor.clone(),
+        ))
+    }
+
+    fn estimate_size(&self, num_keys: usize) -> usize {
+        BloomFilter::estimate_encoded_size(num_keys as u32, self.bits_per_key)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BloomFilterBuilder
+// ---------------------------------------------------------------------------
+
+pub(crate) struct BloomFilterBuilder {
+    bits_per_key: u32,
+    whole_key_filtering: bool,
+    prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+    key_hashes: Vec<u64>,
+    last_prefix: Option<Vec<u8>>,
+}
+
+impl BloomFilterBuilder {
+    pub(crate) fn new(
+        bits_per_key: u32,
+        whole_key_filtering: bool,
+        prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+    ) -> Self {
+        Self {
+            bits_per_key,
+            whole_key_filtering,
+            prefix_extractor,
+            key_hashes: Vec::new(),
+            last_prefix: None,
+        }
     }
 
     pub(crate) fn filter_size_bytes(num_keys: u32, bits_per_key: u32) -> usize {
@@ -33,8 +138,17 @@ impl BloomFilterBuilder {
         filter_bits.div_ceil(8) as usize
     }
 
-    pub(crate) fn build(&self) -> BloomFilter {
+    fn build_bloom(&self) -> BloomFilter {
         let num_probes = optimal_num_probes(self.bits_per_key);
+        if self.key_hashes.is_empty() {
+            return BloomFilter {
+                num_probes,
+                whole_key_filtering: self.whole_key_filtering,
+                has_prefix_filter: self.prefix_extractor.is_some(),
+                prefix_extractor: self.prefix_extractor.clone(),
+                buffer: Bytes::new(),
+            };
+        }
         let filter_bytes =
             BloomFilterBuilder::filter_size_bytes(self.key_hashes.len() as u32, self.bits_per_key);
         let filter_bits = (filter_bytes * 8) as u32;
@@ -47,32 +161,71 @@ impl BloomFilterBuilder {
         }
         BloomFilter {
             num_probes,
+            whole_key_filtering: self.whole_key_filtering,
+            has_prefix_filter: self.prefix_extractor.is_some(),
+            prefix_extractor: self.prefix_extractor.clone(),
             buffer: Bytes::from(buffer),
         }
     }
 }
 
+impl FilterBuilder for BloomFilterBuilder {
+    fn add_key(&mut self, key: &[u8]) {
+        // Add prefix hash if extractor is configured (deduplicated)
+        if let Some(ref extractor) = self.prefix_extractor {
+            if let Some(prefix) = extractor.extract(key) {
+                let is_same_prefix = self.last_prefix.as_deref() == Some(prefix);
+                if !is_same_prefix {
+                    self.key_hashes.push(filter_hash(prefix));
+                    self.last_prefix = Some(prefix.to_vec());
+                }
+            }
+        }
+        // Add full-key hash if whole_key_filtering is enabled
+        if self.whole_key_filtering {
+            self.key_hashes.push(filter_hash(key));
+        }
+    }
+
+    fn build(&self) -> Arc<dyn Filter> {
+        Arc::new(self.build_bloom())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BloomFilter
+// ---------------------------------------------------------------------------
+
+pub(crate) struct BloomFilter {
+    num_probes: u16,
+    whole_key_filtering: bool,
+    has_prefix_filter: bool,
+    prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+    buffer: Bytes,
+}
+
 impl BloomFilter {
-    pub(crate) fn decode(mut buf: &[u8]) -> BloomFilter {
+    pub(crate) fn decode(
+        mut buf: &[u8],
+        whole_key_filtering: bool,
+        has_prefix_filter: bool,
+        prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+    ) -> BloomFilter {
         let num_probes = buf.get_u16();
         BloomFilter {
             num_probes,
+            whole_key_filtering,
+            has_prefix_filter,
+            prefix_extractor,
             buffer: Bytes::copy_from_slice(buf),
         }
     }
 
-    pub(crate) fn encode(&self) -> Bytes {
-        let mut encoded = BytesMut::with_capacity(size_of::<u16>() + self.buffer.len());
-        encoded.put_u16(self.num_probes);
-        encoded.put(self.buffer.slice(..));
-        encoded.freeze()
-    }
-
-    /// estimate the size of BloomFilter encoded in SST
+    /// Estimate the size of a BloomFilter encoded in an SST.
     pub(crate) fn estimate_encoded_size(num_keys: u32, filter_bits_per_key: u32) -> usize {
         let filter_bytes = BloomFilterBuilder::filter_size_bytes(num_keys, filter_bits_per_key);
-        let num_probes_size = std::mem::size_of::<u16>();
-        let checksum_len = std::mem::size_of::<u32>();
+        let num_probes_size = size_of::<u16>();
+        let checksum_len = size_of::<u32>();
         filter_bytes + num_probes_size + checksum_len
     }
 
@@ -81,6 +234,9 @@ impl BloomFilter {
     }
 
     pub(crate) fn might_contain(&self, hash: u64) -> bool {
+        if self.buffer.is_empty() {
+            return true;
+        }
         for p in probes_for_key(hash, self.num_probes, self.filter_bits()) {
             if !check_bit(p as usize, &self.buffer) {
                 return false;
@@ -89,18 +245,59 @@ impl BloomFilter {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn clamp_allocated_size(&self) -> Self {
         Self {
             num_probes: self.num_probes,
+            whole_key_filtering: self.whole_key_filtering,
+            has_prefix_filter: self.has_prefix_filter,
+            prefix_extractor: self.prefix_extractor.clone(),
             buffer: clamp_allocated_size_bytes(&self.buffer),
         }
     }
+}
 
-    /// Returns the size of the bloom filter in bytes.
-    pub(crate) fn size(&self) -> usize {
+impl Filter for BloomFilter {
+    fn might_match(&self, query: &FilterQuery) -> bool {
+        match query {
+            FilterQuery::Point(key) => {
+                if !self.whole_key_filtering {
+                    return true; // Cannot answer point queries
+                }
+                self.might_contain(filter_hash(key.as_ref()))
+            }
+            FilterQuery::Prefix(prefix) => {
+                if !self.has_prefix_filter {
+                    return true; // Cannot answer prefix queries
+                }
+                // Check that the scan prefix is valid for the extractor.
+                // If the prefix is not in domain (e.g. user scans with a
+                // 2-byte prefix but the extractor expects 3 bytes), the
+                // filter must not be consulted — doing so could produce
+                // false negatives.
+                if let Some(ref extractor) = self.prefix_extractor {
+                    if !extractor.in_domain(prefix.as_ref()) {
+                        return true; // Cannot safely answer this query
+                    }
+                }
+                self.might_contain(filter_hash(prefix.as_ref()))
+            }
+        }
+    }
+
+    fn encode(&self, writer: &mut dyn BufMut) {
+        writer.put_u16(self.num_probes);
+        writer.put_slice(&self.buffer);
+    }
+
+    fn size(&self) -> usize {
         self.buffer.len()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 pub(crate) fn filter_hash(key: &[u8]) -> u64 {
     // sip hash is the default rust hash function, however its only
@@ -236,14 +433,14 @@ mod tests {
     fn test_filter_effective() {
         let keys_to_test = 100000;
         let key_sz = size_of::<u32>();
-        let mut builder = BloomFilterBuilder::new(10);
+        let mut builder = BloomFilterBuilder::new(10, true, None);
         for i in 0..keys_to_test {
             let mut bytes = BytesMut::with_capacity(key_sz);
             bytes.reserve(key_sz);
             bytes.put_u32(i);
-            builder.add_key(bytes.freeze().as_ref());
+            FilterBuilder::add_key(&mut builder, bytes.freeze().as_ref());
         }
-        let filter = builder.build();
+        let filter = builder.build_bloom();
 
         // check all entries in filter
         for i in 0..keys_to_test {
@@ -272,9 +469,9 @@ mod tests {
 
     #[test]
     fn test_bloom_filter_size() {
-        let mut builder = BloomFilterBuilder::new(10);
-        builder.add_key(b"test_key");
-        let filter = builder.build();
+        let mut builder = BloomFilterBuilder::new(10, true, None);
+        FilterBuilder::add_key(&mut builder, b"test_key");
+        let filter = builder.build_bloom();
 
         // The exact size may vary, so we'll check if it's greater than zero
         assert!(
@@ -292,11 +489,11 @@ mod tests {
 
     #[test]
     fn test_should_clamp_allocated_bytes() {
-        let mut builder = BloomFilterBuilder::new(10);
+        let mut builder = BloomFilterBuilder::new(10, true, None);
         for i in 0..100 {
-            builder.add_key(format!("{}", i).as_bytes());
+            FilterBuilder::add_key(&mut builder, format!("{}", i).as_bytes());
         }
-        let filter = builder.build();
+        let filter = builder.build_bloom();
         let mut extended_buf = BytesMut::with_capacity(filter.size() + 100);
         extended_buf.put(filter.buffer.as_ref());
         extended_buf.put_bytes(0u8, 100);
@@ -345,5 +542,37 @@ mod tests {
             BloomFilter::estimate_encoded_size(num_keys, bits_per_key),
             expected_size
         );
+    }
+
+    #[test]
+    fn test_empty_filter_returns_true() {
+        let builder = BloomFilterBuilder::new(10, true, None);
+        let filter = builder.build_bloom();
+        assert!(filter.might_contain(12345));
+        assert!(filter.might_match(&FilterQuery::Point(Bytes::from("any"))));
+    }
+
+    #[test]
+    fn test_might_match_point_query() {
+        let mut builder = BloomFilterBuilder::new(10, true, None);
+        FilterBuilder::add_key(&mut builder, b"hello");
+        let filter = builder.build_bloom();
+
+        // Point query for a key that was added should be true
+        assert!(filter.might_match(&FilterQuery::Point(Bytes::from("hello"))));
+
+        // Prefix query should return true (no prefix filter configured)
+        assert!(filter.might_match(&FilterQuery::Prefix(Bytes::from("hel"))));
+    }
+
+    #[test]
+    fn test_whole_key_filtering_disabled() {
+        let mut builder = BloomFilterBuilder::new(10, false, None);
+        FilterBuilder::add_key(&mut builder, b"hello");
+        let filter = builder.build_bloom();
+
+        // Point query should return true (whole_key_filtering disabled)
+        assert!(filter.might_match(&FilterQuery::Point(Bytes::from("hello"))));
+        assert!(filter.might_match(&FilterQuery::Point(Bytes::from("nonexistent"))));
     }
 }

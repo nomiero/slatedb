@@ -13,7 +13,7 @@ use crate::bytes_range::BytesRange;
 use crate::db_state::{SsTableHandle, SsTableId};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
-use crate::filter::{self, BloomFilter};
+use crate::filter_policy::{Filter, FilterQuery};
 use crate::flatbuffer_types::{SsTableIndex, SsTableIndexOwned};
 use crate::format::block::Block;
 use crate::format::sst::{SST_FORMAT_VERSION, SST_FORMAT_VERSION_V2};
@@ -70,13 +70,16 @@ impl<B: BlockLike> DataBlockIterator<B> {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SstIteratorOptions {
     pub(crate) max_fetch_tasks: usize,
     pub(crate) blocks_to_fetch: usize,
     pub(crate) cache_blocks: bool,
     pub(crate) eager_spawn: bool,
     pub(crate) order: IterationOrder,
+    /// When set, prefix scans use this to probe the filter with
+    /// `FilterQuery::Prefix` instead of skipping the filter entirely.
+    pub(crate) prefix: Option<Bytes>,
 }
 
 impl Default for SstIteratorOptions {
@@ -87,6 +90,7 @@ impl Default for SstIteratorOptions {
             cache_blocks: true,
             eager_spawn: false,
             order: IterationOrder::Ascending,
+            prefix: None,
         }
     }
 }
@@ -195,7 +199,7 @@ enum FilterState {
 }
 
 struct BloomFilterEvaluator {
-    key: Bytes,
+    query: FilterQuery,
     db_stats: Option<DbStats>,
     state: FilterState,
     found_key: bool,
@@ -203,32 +207,41 @@ struct BloomFilterEvaluator {
 }
 
 impl BloomFilterEvaluator {
-    fn new(key: Bytes, db_stats: Option<DbStats>) -> Self {
+    fn new_point(key: Bytes, db_stats: Option<DbStats>) -> Self {
         Self {
-            key,
+            query: FilterQuery::Point(key),
             db_stats,
             state: FilterState::NotChecked,
             found_key: false,
             false_positive_recorded: false,
         }
     }
+
+    fn new_prefix(prefix: Bytes, db_stats: Option<DbStats>) -> Self {
+        Self {
+            query: FilterQuery::Prefix(prefix),
+            db_stats,
+            state: FilterState::NotChecked,
+            found_key: false,
+            false_positive_recorded: false,
+        }
+    }
+
 }
 
 impl BloomFilterEvaluator {
-    /// Evaluate the bloom filter against the key.
+    /// Evaluate the filter against the query (point key or prefix).
     ///
     /// ## Arguments
-    /// - `maybe_filter`: An optional bloom filter to evaluate against.
-    async fn evaluate(&mut self, maybe_filter: Option<Arc<BloomFilter>>) {
+    /// - `maybe_filter`: An optional filter to evaluate against.
+    async fn evaluate(&mut self, maybe_filter: Option<Arc<dyn Filter>>) {
         if self.state != FilterState::NotChecked {
             return;
         }
 
-        let key_hash = filter::filter_hash(self.key.as_ref());
-
         match maybe_filter {
             Some(filter) => {
-                if filter.might_contain(key_hash) {
+                if filter.might_match(&self.query) {
                     if let Some(stats) = &self.db_stats {
                         stats.sst_filter_positives.inc();
                     }
@@ -251,8 +264,14 @@ impl BloomFilterEvaluator {
     }
 
     fn notify_key_found(&mut self, key: &[u8]) {
-        if key == self.key.as_ref() {
-            self.found_key = true;
+        match &self.query {
+            FilterQuery::Point(k) if key == k.as_ref() => {
+                self.found_key = true;
+            }
+            FilterQuery::Prefix(p) if key.starts_with(p.as_ref()) => {
+                self.found_key = true;
+            }
+            _ => {}
         }
     }
 
@@ -909,12 +928,15 @@ pub(crate) struct SstIterator<'a> {
 impl<'a> SstIterator<'a> {
     fn from_internal(internal: InternalSstIterator<'a>, db_stats: Option<DbStats>) -> Self {
         let point_key = internal.view().point_key().map(Bytes::copy_from_slice);
-        let delegate = match point_key {
-            Some(key) => {
-                let filter = BloomFilterEvaluator::new(key, db_stats);
-                SstIteratorDelegate::Bloom(BloomFilterIterator::new(internal, filter))
-            }
-            None => SstIteratorDelegate::Direct(internal),
+        let prefix = internal.options.prefix.clone();
+        let delegate = if let Some(key) = point_key {
+            let filter = BloomFilterEvaluator::new_point(key, db_stats);
+            SstIteratorDelegate::Bloom(BloomFilterIterator::new(internal, filter))
+        } else if let Some(prefix) = prefix {
+            let filter = BloomFilterEvaluator::new_prefix(prefix, db_stats);
+            SstIteratorDelegate::Bloom(BloomFilterIterator::new(internal, filter))
+        } else {
+            SstIteratorDelegate::Direct(internal)
         };
         Self { delegate }
     }
@@ -1105,7 +1127,7 @@ mod tests {
     use crate::db_cache::SplitCache;
     use crate::db_state::SsTableId;
     use crate::db_stats::DbStats;
-    use crate::filter;
+    use crate::filter_policy::FilterQuery;
     use crate::format::sst::SsTableFormat;
     use crate::object_stores::ObjectStores;
     use crate::sst_builder::BlockFormat;
@@ -1274,9 +1296,10 @@ mod tests {
             .expect("filter should exist");
 
         let collision_key = b"k12";
-        let hash = filter::filter_hash(collision_key);
         assert!(
-            filter.might_contain(hash),
+            filter.might_match(&FilterQuery::Point(bytes::Bytes::copy_from_slice(
+                collision_key
+            ))),
             "bloom filter should report collision for hard-coded key"
         );
 
@@ -1391,12 +1414,12 @@ mod tests {
             .is_some());
     }
 
-    fn bloom_filter_enabled_table_store(filter_bits_per_key: u32) -> Arc<TableStore> {
+    fn bloom_filter_enabled_table_store(bits_per_key: u32) -> Arc<TableStore> {
         let root_path = Path::from("");
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let format = SsTableFormat {
             min_filter_keys: 1,
-            filter_bits_per_key,
+            filter_policy: Some(Arc::new(crate::filter::BloomFilterPolicy::new(bits_per_key))),
             ..SsTableFormat::default()
         };
         Arc::new(TableStore::new(
@@ -1746,6 +1769,7 @@ mod tests {
                 cache_blocks: true,
                 eager_spawn: false,
                 order: IterationOrder::Ascending,
+                prefix: None,
             },
         )
         .await
@@ -1762,6 +1786,7 @@ mod tests {
                 cache_blocks: true,
                 eager_spawn: false,
                 order: IterationOrder::Ascending,
+                prefix: None,
             },
         )
         .await
@@ -2329,6 +2354,7 @@ mod tests {
             cache_blocks: true,
             eager_spawn: false,
             order,
+            prefix: None,
         };
         let mut iter = SstIterator::new_owned_initialized(
             BytesRange::from_slice(start_key.as_ref()..=end_key.as_ref()),

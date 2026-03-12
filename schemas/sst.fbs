@@ -49,6 +49,11 @@ table SsTableInfo {
 
     // Length of the stats block. Length will be zero if stats are not present.
     stats_len: ulong;
+
+    // Name of the filter policy that produced the filter block.
+    // Used to verify compatibility when reading. Missing or empty means
+    // the legacy bloom filter ("slatedb.BloomFilter").
+    filter_policy_name: string;
 }
 
 // Per-SST statistics collected during SST building.

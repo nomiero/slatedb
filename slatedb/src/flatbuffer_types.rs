@@ -140,6 +140,7 @@ impl FlatBufferSsTableInfoCodec {
             sst_type: info.sst_type().into(),
             stats_offset: info.stats_offset(),
             stats_len: info.stats_len(),
+            filter_policy_name: info.filter_policy_name().map(|s| s.to_string()),
         }
     }
 
@@ -436,6 +437,10 @@ impl<'b> DbFlatBufferBuilder<'b> {
             None => None,
             Some(last_entry_vector) => Some(self.builder.create_vector(last_entry_vector)),
         };
+        let filter_policy_name = info
+            .filter_policy_name
+            .as_deref()
+            .map(|s| self.builder.create_string(s));
 
         FbSsTableInfo::create(
             &mut self.builder,
@@ -450,6 +455,7 @@ impl<'b> DbFlatBufferBuilder<'b> {
                 sst_type: info.sst_type.into(),
                 stats_offset: info.stats_offset,
                 stats_len: info.stats_len,
+                filter_policy_name,
             },
         )
     }

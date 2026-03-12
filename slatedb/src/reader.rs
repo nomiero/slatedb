@@ -115,7 +115,7 @@ impl Reader {
             let l0 = self.build_point_l0_iters(
                 range,
                 db_state,
-                sst_iter_options,
+                sst_iter_options.clone(),
                 point_lookup_stats.clone(),
             )?;
             let sr = self.build_point_sr_iters(
@@ -128,7 +128,7 @@ impl Reader {
             (l0, sr)
         } else {
             let l0_future =
-                self.build_range_l0_iters(range, db_state, sst_iter_options, max_parallel);
+                self.build_range_l0_iters(range, db_state, sst_iter_options.clone(), max_parallel);
             let sr_future =
                 self.build_range_sr_iters(range, db_state, sst_iter_options, max_parallel);
             let (l0_res, sr_res) = join(l0_future, sr_future).await;
@@ -156,7 +156,7 @@ impl Reader {
                 range.clone(),
                 sst.clone(),
                 self.table_store.clone(),
-                sst_iter_options,
+                sst_iter_options.clone(),
                 db_stats.clone(),
             )?;
             if let Some(iterator) = iterator {
@@ -181,7 +181,7 @@ impl Reader {
                     range.clone(),
                     handle.clone(),
                     self.table_store.clone(),
-                    sst_iter_options,
+                    sst_iter_options.clone(),
                     db_stats.clone(),
                 )?;
                 if let Some(iterator) = iterator {
@@ -207,6 +207,7 @@ impl Reader {
             move |sst| {
                 let table_store = table_store.clone();
                 let range = range_clone.clone();
+                let sst_iter_options = sst_iter_options.clone();
                 async move {
                     SstIterator::new_owned_initialized(
                         range.clone(),
@@ -239,6 +240,7 @@ impl Reader {
             move |sr| {
                 let table_store = table_store.clone();
                 let range = range_clone.clone();
+                let sst_iter_options = sst_iter_options.clone();
                 async move {
                     SortedRunIterator::new_owned_initialized(
                         range.clone(),
@@ -364,6 +366,7 @@ impl Reader {
         write_batch: Option<WriteBatch>,
         max_seq: Option<u64>,
         range_tracker: Option<Arc<DbIteratorRangeTracker>>,
+        prefix: Option<Bytes>,
     ) -> Result<DbIterator, SlateDBError> {
         let max_seq = self.prepare_max_seq(max_seq, options.durability_filter, options.dirty);
         #[cfg(not(dst))]
@@ -379,6 +382,7 @@ impl Reader {
             cache_blocks: options.cache_blocks,
             eager_spawn: true,
             order: IterationOrder::Ascending,
+            prefix,
         };
 
         let IteratorSources {
@@ -1795,6 +1799,7 @@ mod tests {
                 &test_db_state,
                 write_batch,
                 test_case.max_seq,
+                None,
                 None,
             )
             .await?;
