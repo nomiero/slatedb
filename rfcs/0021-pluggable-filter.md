@@ -32,6 +32,9 @@ Table of Contents:
   * [Migration requires disabling the old filter](#migration-requires-disabling-the-old-filter)
   * [No support for multiple concurrent filters](#no-support-for-multiple-concurrent-filters)
   * [Mitigation: array of filter policies](#mitigation-array-of-filter-policies)
+- [Future Enhancements](#future-enhancements)
+  * [Recency-Based Iterator](#recency-based-iterator)
+  * [Block-Level Filter Granularity](#block-level-filter-granularity)
 - [Alternatives](#alternatives)
 - [Open Questions](#open-questions)
 - [References](#references)
@@ -481,17 +484,10 @@ scans probe the same bloom filter with `filter_hash(prefix)`. The default
 configuration (no `prefix_extractor`) returns `true` for prefix queries — no
 filtering. This is safe: point lookups still use the full-key hash.
 
-**Limitation — prefix filtering alone is not ideal for recency access
-patterns:**
+Note: prefix filtering alone is not ideal for recency access patterns where
+the caller only needs a recent entry for a prefix. See
+[Recency-Based Iterator](#recency-based-iterator) in Future Enhancements.
 
-Prefix bloom filters significantly improve prefix scans by skipping SSTs that
-don't contain matching keys. However, for use cases like time-series data
-(keyed by `{sensor_id}:{timestamp}`) or versioned data where the caller only
-needs the first or *n*-th most recent item for a prefix, the merge-based scan
-still reads from every *matching* SST and merges them to produce global sort
-order — even though the caller knows the data is naturally sorted by recency
-(newest to oldest). A non-merging iterator that returns data newest-first
-similar to `Get()` but as an iterator address this gap.
 ### Write Path Integration
 
 The SST builder receives a `FilterPolicy` and calls `builder()` to
@@ -596,7 +592,8 @@ SlateDB features and components that this RFC interacts with. Check all that app
   `"slatedb.BloomFilter:prefix=delim:"`), causing old SSTs' filters to be
   skipped entirely — including the full-key hashes that are still valid for
   point lookups. Those SSTs regain filtering after compaction rewrites them
-  with the new policy.
+  with the new policy. See [Migration requires disabling the old filter](#migration-requires-disabling-the-old-filter)
+  in Limitations for details and mitigation options.
 - **Compactor policy**: If the compactor runs in a separate process from the
   writer (e.g., distributed compaction), it must be configured with the same
   `FilterPolicy`. Otherwise, compacted SSTs will be written with a different
@@ -674,6 +671,48 @@ block encoding, the write path iterates over policies instead of calling one,
 and the read path evaluates multiple filters in sequence. The trait interfaces
 themselves are unchanged.
 
+## Future Enhancements
+
+### Recency-Based Iterator
+
+Prefix bloom filters skip SSTs that don't contain matching keys, but the
+merge-based scan still reads from every *matching* SST and merges them to
+produce global sort order. For workloads where the caller only needs the most
+recent entry for a prefix (e.g., latest version of a versioned key, most
+recent reading from a sensor), this is wasteful — the answer is almost always
+in the newest SST.
+
+A recency-based iterator would return entries newest-first (most recent SST
+first, then next most recent) without merging, similar to how `get()` walks
+sources in recency order and returns the first match. Combined with prefix
+bloom filters, the iterator would skip SSTs with no matching prefix, read
+matching SSTs in recency order, and stop early once the caller has enough
+results.
+
+When combined with block-level min/max filters and filter hints (e.g., a
+`version_upper_bound` hint), the recency iterator could also skip irrelevant
+blocks within an SST, making "get oldest version" queries efficient as well.
+
+### Block-Level Filter Granularity
+
+This RFC's filters operate at SST granularity — the reader either skips an
+entire SST or reads it. This is appropriate for bloom filters (which need many
+keys for good false-positive rates) but too coarse for metadata-style filters.
+
+For example, a min/max version filter on an SST whose blocks span versions
+`[1,50]`, `[51,100]`, and `[101,150]` can only report the SST-level range
+`[1,150]`. A query for version ≤ 110 must read the entire SST even though only
+the first block is relevant. With per-block metadata, the remaining blocks
+would be skipped without loading them from storage.
+
+The `FilterPolicy`, `FilterBuilder`, and `Filter` traits defined in this RFC
+are sufficient to support block-level granularity. The core change is
+configuration: each policy would declare whether it applies at SST level,
+block level, or both. On the write path, block-level builders are finalized
+and reset per block in `finish_block()` instead of once at SST completion.
+On the read path, per-block filter data stored in `BlockMeta` is checked
+before loading a data block, using the same `might_match` interface.
+
 ## Alternatives
 
 **1. Separate filter structures per SST:**
@@ -715,6 +754,22 @@ yield the same prefix, that prefix is used for filter evaluation.
 
 - Pro: Prefix filtering works transparently for any range that happens to be a prefix range.
 - Con: Implicit behavior — the caller has no control over whether the filter is used.
+
+### Should `filter_policy` be singular or an array?
+
+The Limitations section proposes `filter_policies: Vec<Arc<dyn FilterPolicy>>` as
+a mitigation for both the migration problem and multi-filter composition. But the
+main Design section specifies `filter_policy: Option<Arc<dyn FilterPolicy>>`
+(singular). The RFC argues for the array but doesn't commit to it — it's unclear
+whether the implementation should ship with the singular or array form.
+
+The recommended approach is to use an array (`filter_policies: Vec<...>`). It
+solves the migration problem (old and new policies coexist until compaction
+rewrites all SSTs), enables natural multi-filter composition (e.g., bloom +
+min/max), and the additional complexity is modest — the trait interfaces are
+unchanged. Starting with a singular slot and migrating later would be a breaking
+API change, so it's better to start with the array form even if most users
+configure a single policy.
 
 ### Should range scan filtering be added?
 
