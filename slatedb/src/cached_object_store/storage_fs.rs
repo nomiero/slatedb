@@ -19,8 +19,16 @@ use std::time::Duration;
 use tokio::sync::{Mutex, OnceCell};
 use walkdir::WalkDir;
 
-use crate::cached_object_store::storage::{LocalCacheEntry, LocalCacheHead, LocalCacheStorage};
+use crate::cached_object_store::storage::{
+    LocalCacheEntry, LocalCacheHead, LocalCacheStorage, LocalCacheTee,
+};
 use crate::utils::format_bytes_si;
+
+/// Suffix attached to in-flight tee files so a startup sweep can reliably
+/// distinguish them from committed cache files. Visible cache files use the
+/// fixed `_part*` / `_head` naming; tee files insert `.tmp-<rand>` before
+/// any final rename.
+const TEE_TMP_INFIX: &str = ".tmp-";
 
 /// A cached file handle node. Callers that obtain an `Arc<CachedFileHandle>`
 /// keep the underlying fd alive even after the entry is evicted from the cache.
@@ -208,6 +216,73 @@ impl LocalCacheStorage for FsCacheStorage {
         if let Some(evictor) = &self.evictor {
             evictor.start().await
         }
+    }
+
+    fn begin_tee(&self, location: &Path, part_size: usize) -> Option<Box<dyn LocalCacheTee>> {
+        Some(Box::new(FsCacheTee::new(
+            self.root_folder.clone(),
+            location.clone(),
+            part_size,
+            self.evictor.clone(),
+            self.rand.clone(),
+            self.file_handle_cache.clone(),
+        )))
+    }
+
+    async fn remove(&self, location: &Path) -> object_store::Result<()> {
+        let dir = self.root_folder.join(location.to_string());
+
+        // Enumerate cached part/head files in a single blocking task, capture
+        // their sizes for evictor accounting, then delete the directory in one
+        // shot. This avoids N spawn_blocking trips for big SSTs.
+        let dir_for_blocking = dir.clone();
+        #[allow(clippy::disallowed_methods)]
+        let entries = tokio::task::spawn_blocking(
+            move || -> std::io::Result<Vec<(std::path::PathBuf, u64)>> {
+                let read_dir = match std::fs::read_dir(&dir_for_blocking) {
+                    Ok(rd) => rd,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+                    Err(err) => return Err(err),
+                };
+                let mut out = Vec::new();
+                for entry in read_dir {
+                    let entry = entry?;
+                    let metadata = entry.metadata()?;
+                    if metadata.is_file() {
+                        out.push((entry.path(), metadata.len()));
+                    }
+                }
+                // Best-effort directory removal. If a concurrent writer recreates
+                // the directory after we listed it, remove_dir_all may still
+                // succeed; if it fails NotFound we treat that as success.
+                match std::fs::remove_dir_all(&dir_for_blocking) {
+                    Ok(()) => Ok(out),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(out),
+                    Err(err) => Err(err),
+                }
+            },
+        )
+        .await
+        .map_err(wrap_io_err)?
+        .map_err(wrap_io_err)?;
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // Invalidate any cached file handles in one lock acquisition per path.
+        // The lock is internal to FileHandleCache; we already hold no other
+        // locks at this point.
+        for (path, _) in entries.iter() {
+            self.file_handle_cache.invalidate(path);
+        }
+
+        // Batch-update the evictor accounting in a single critical section.
+        if let Some(evictor) = &self.evictor {
+            evictor.forget_entries(entries).await;
+        }
+
+        Ok(())
     }
 }
 
@@ -505,6 +580,411 @@ impl LocalCacheEntry for FsCacheEntry {
     }
 }
 
+/// A streaming tee writer that funnels SST bytes into the on-disk cache as
+/// they are produced. Writes go to per-part temp files via a dedicated worker
+/// task so the producer (the SST writer) only pays the cost of an mpsc send
+/// per part. On commit, all temp files are renamed to their final names; on
+/// drop without commit, temp files are cleaned up best-effort.
+///
+/// Bottleneck notes:
+///
+/// - A single worker task per tee keeps writes to disk in order without
+///   blocking the producer. The mpsc has a small fixed capacity (4) which
+///   bounds buffered memory at ~4 * part_size while still smoothing over
+///   short bursts.
+/// - The producer copies bytes into a part-sized `BytesMut` once; this memcpy
+///   would happen on disk write anyway. There is no extra clone.
+/// - Renames at commit time happen in a single `spawn_blocking` task to keep
+///   syscall overhead off the runtime.
+pub(crate) struct FsCacheTee {
+    root_folder: std::path::PathBuf,
+    location: Path,
+    part_size: usize,
+    rand: Arc<DbRand>,
+    file_handle_cache: FileHandleCache,
+    evictor: Option<Arc<FsCacheEvictor>>,
+
+    /// Buffer for the in-progress part. Drained when full.
+    part_buf: bytes::BytesMut,
+    /// 0-based index of the next part to be written.
+    next_part_number: usize,
+    /// Cumulative bytes accepted via `extend` so far. Used to populate the
+    /// committed head's `size` field, which must match the upstream object's
+    /// size for `read_head` to return a sensible value.
+    total_bytes: u64,
+    /// Tracks every temp file we have asked the worker to write, paired with
+    /// the final name to rename to on commit. Always in flush order.
+    pending: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    /// Channel to the worker. Dropping closes the channel and the worker
+    /// drains and exits.
+    tx: Option<tokio::sync::mpsc::Sender<TeeMsg>>,
+    /// Worker join handle, awaited at commit / drop time.
+    worker: Option<tokio::task::JoinHandle<object_store::Result<()>>>,
+    /// Set once any extend / flush hits an error. After this point the tee
+    /// is poisoned: extends are silently dropped and commit cleans up.
+    poisoned: bool,
+}
+
+impl std::fmt::Debug for FsCacheTee {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FsCacheTee")
+            .field("location", &self.location.as_ref())
+            .field("part_size", &self.part_size)
+            .field("next_part_number", &self.next_part_number)
+            .field("pending", &self.pending.len())
+            .field("poisoned", &self.poisoned)
+            .finish()
+    }
+}
+
+enum TeeMsg {
+    Write {
+        tmp_path: std::path::PathBuf,
+        bytes: Bytes,
+    },
+}
+
+impl FsCacheTee {
+    fn new(
+        root_folder: std::path::PathBuf,
+        location: Path,
+        part_size: usize,
+        evictor: Option<Arc<FsCacheEvictor>>,
+        rand: Arc<DbRand>,
+        file_handle_cache: FileHandleCache,
+    ) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TeeMsg>(4);
+        let worker = tokio::spawn(Self::run_worker(rx));
+        Self {
+            root_folder,
+            location,
+            part_size,
+            rand,
+            file_handle_cache,
+            evictor,
+            part_buf: bytes::BytesMut::with_capacity(part_size),
+            next_part_number: 0,
+            total_bytes: 0,
+            pending: Vec::new(),
+            tx: Some(tx),
+            worker: Some(worker),
+            poisoned: false,
+        }
+    }
+
+    async fn run_worker(
+        mut rx: tokio::sync::mpsc::Receiver<TeeMsg>,
+    ) -> object_store::Result<()> {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                TeeMsg::Write { tmp_path, bytes } => {
+                    if let Err(e) = Self::write_tmp_file(tmp_path, bytes).await {
+                        // Drain the rest of the channel without writing so
+                        // the producer doesn't block on an unread channel.
+                        while rx.recv().await.is_some() {}
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn write_tmp_file(
+        tmp_path: std::path::PathBuf,
+        bytes: Bytes,
+    ) -> object_store::Result<()> {
+        #[allow(clippy::disallowed_methods)]
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            if let Some(parent) = tmp_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            Ok(())
+        })
+        .await
+        .map_err(wrap_io_err)?
+        .map_err(wrap_io_err)
+    }
+
+    fn make_rand_suffix(&self) -> String {
+        let mut rng = self.rand.rng();
+        (0..16).map(|_| rng.sample(Alphanumeric) as char).collect()
+    }
+
+    /// Reserve the next part: returns (final_path, tmp_path). The final_path
+    /// matches what `FsCacheEntry::read_part` expects so a successful rename
+    /// makes the part discoverable. The tmp file lives in the same folder
+    /// (so rename is atomic) with a `.tmp-<rand>` infix that the startup
+    /// sweep recognizes.
+    fn reserve_part_paths(&self, part_number: usize) -> (std::path::PathBuf, std::path::PathBuf) {
+        let final_path = FsCacheEntry::make_part_path(
+            self.root_folder.clone(),
+            &self.location,
+            part_number,
+            self.part_size,
+        );
+        let final_name = final_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tmp_name = format!("{}{}{}", final_name, TEE_TMP_INFIX, self.make_rand_suffix());
+        let mut tmp = final_path.clone();
+        tmp.set_file_name(tmp_name);
+        (final_path, tmp)
+    }
+
+    fn reserve_head_paths(&self) -> (std::path::PathBuf, std::path::PathBuf) {
+        let final_path = {
+            let mut p = self.root_folder.join(self.location.to_string());
+            p.push("_head");
+            p
+        };
+        let tmp_name = format!(
+            "_head{}{}",
+            TEE_TMP_INFIX,
+            self.make_rand_suffix()
+        );
+        let mut tmp = final_path.clone();
+        tmp.set_file_name(tmp_name);
+        (final_path, tmp)
+    }
+
+    /// Send one buffered part to the worker. Caller must reset `part_buf`
+    /// afterwards.
+    async fn dispatch_part(&mut self, payload: Bytes) -> object_store::Result<()> {
+        let part_number = self.next_part_number;
+        self.next_part_number += 1;
+        let (final_path, tmp_path) = self.reserve_part_paths(part_number);
+        self.pending.push((tmp_path.clone(), final_path));
+
+        let tx = match self.tx.as_ref() {
+            Some(tx) => tx,
+            None => return Ok(()),
+        };
+        // Send is awaited; if the worker is slow, the producer waits. With
+        // capacity 4 this caps memory at ~4 * part_size in flight. If the
+        // channel is closed (worker died), we mark poisoned and stop.
+        if tx
+            .send(TeeMsg::Write {
+                tmp_path,
+                bytes: payload,
+            })
+            .await
+            .is_err()
+        {
+            self.poisoned = true;
+        }
+        Ok(())
+    }
+
+    /// Best-effort cleanup of any temp files we have registered. Awaits the
+    /// worker first if a join handle is provided, so we don't race with an
+    /// in-flight write that would resurrect a tmp file after we deleted it.
+    fn schedule_cleanup(
+        pending: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+        worker: Option<tokio::task::JoinHandle<object_store::Result<()>>>,
+    ) {
+        if pending.is_empty() && worker.is_none() {
+            return;
+        }
+        #[allow(clippy::disallowed_methods)]
+        tokio::spawn(async move {
+            // Drain the worker first so any tmp file it was about to create
+            // exists on disk before we try to delete it.
+            if let Some(handle) = worker {
+                let _ = handle.await;
+            }
+            if pending.is_empty() {
+                return;
+            }
+            #[allow(clippy::disallowed_methods)]
+            let _ = tokio::task::spawn_blocking(move || {
+                for (tmp_path, _final_path) in pending {
+                    let _ = std::fs::remove_file(&tmp_path);
+                }
+            })
+            .await;
+        });
+    }
+}
+
+#[async_trait::async_trait]
+impl LocalCacheTee for FsCacheTee {
+    async fn extend(&mut self, buf: &[u8]) -> object_store::Result<()> {
+        if self.poisoned {
+            return Ok(());
+        }
+        self.total_bytes += buf.len() as u64;
+        let mut remaining = buf;
+        while !remaining.is_empty() {
+            let need = self.part_size - self.part_buf.len();
+            let take = remaining.len().min(need);
+            self.part_buf.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            if self.part_buf.len() == self.part_size {
+                let payload = std::mem::replace(
+                    &mut self.part_buf,
+                    bytes::BytesMut::with_capacity(self.part_size),
+                )
+                .freeze();
+                self.dispatch_part(payload).await?;
+                if self.poisoned {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn commit(
+        mut self: Box<Self>,
+        meta: &ObjectMeta,
+        attrs: &Attributes,
+    ) -> object_store::Result<()> {
+        // Flush the tail.
+        if !self.poisoned && !self.part_buf.is_empty() {
+            let payload =
+                std::mem::replace(&mut self.part_buf, bytes::BytesMut::new()).freeze();
+            self.dispatch_part(payload).await?;
+        }
+
+        // Build a head snapshot using the upstream meta but with the size we
+        // actually wrote to disk. Some callers may pass a stub meta; this is
+        // the canonical source of truth for cache reads.
+        let head_meta = ObjectMeta {
+            location: meta.location.clone(),
+            last_modified: meta.last_modified,
+            size: self.total_bytes,
+            e_tag: meta.e_tag.clone(),
+            version: meta.version.clone(),
+        };
+        let head: LocalCacheHead = (&head_meta, attrs).into();
+        let head_bytes = match serde_json::to_vec(&head) {
+            Ok(v) => Bytes::from(v),
+            Err(e) => {
+                // Can't write a head; cleanup and bail.
+                let pending = std::mem::take(&mut self.pending);
+                drop(self.tx.take());
+                let worker = self.worker.take();
+                Self::schedule_cleanup(pending, worker);
+                return Err(wrap_io_err(e));
+            }
+        };
+
+        // Reserve and dispatch the head.
+        let (head_final, head_tmp) = self.reserve_head_paths();
+        self.pending.push((head_tmp.clone(), head_final.clone()));
+        let head_idx = self.pending.len() - 1;
+        if let Some(tx) = self.tx.as_ref() {
+            if tx
+                .send(TeeMsg::Write {
+                    tmp_path: head_tmp.clone(),
+                    bytes: head_bytes,
+                })
+                .await
+                .is_err()
+            {
+                self.poisoned = true;
+            }
+        }
+
+        // Drop the sender so the worker exits, then await its result.
+        drop(self.tx.take());
+        let worker_result = match self.worker.take() {
+            Some(handle) => handle.await.unwrap_or_else(|e| Err(wrap_io_err(e))),
+            None => Ok(()),
+        };
+
+        if self.poisoned || worker_result.is_err() {
+            let pending = std::mem::take(&mut self.pending);
+            // Worker has already exited (we awaited it above); pass None.
+            Self::schedule_cleanup(pending, None);
+            return worker_result;
+        }
+
+        // All temp files are on disk and fsynced. Now atomically rename in
+        // a single blocking task. Order matters: rename all parts before the
+        // head, so that once read_head() returns Some(...) every part is
+        // visible.
+        let pending = std::mem::take(&mut self.pending);
+        let evictor = self.evictor.clone();
+        let file_handle_cache = self.file_handle_cache.clone();
+
+        #[allow(clippy::disallowed_methods)]
+        let rename_result = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<(std::path::PathBuf, u64)>> {
+            // Reorder so the head rename is last.
+            let mut parts: Vec<(std::path::PathBuf, std::path::PathBuf)> = pending;
+            // The head was pushed at head_idx; move it to the end.
+            if head_idx < parts.len() {
+                let head_pair = parts.remove(head_idx);
+                parts.push(head_pair);
+            }
+            let mut renamed = Vec::with_capacity(parts.len());
+            for (tmp, final_) in parts {
+                std::fs::rename(&tmp, &final_)?;
+                let size = std::fs::metadata(&final_).map(|m| m.len()).unwrap_or(0);
+                renamed.push((final_, size));
+            }
+            Ok(renamed)
+        })
+        .await
+        .map_err(wrap_io_err)?
+        .map_err(wrap_io_err);
+
+        let renamed = match rename_result {
+            Ok(r) => r,
+            Err(e) => {
+                // Best-effort: any unrenamed temp files will be picked up by
+                // the next startup sweep. Final files that did rename remain
+                // and will be admitted by the evictor's periodic scan.
+                return Err(e);
+            }
+        };
+
+        // Invalidate any stale file handles (the rename replaces inodes).
+        for (path, _) in renamed.iter() {
+            file_handle_cache.invalidate(path);
+        }
+
+        // Register sizes with the evictor in one batch so the new entries
+        // are accounted for and trigger eviction if we just pushed past the
+        // limit. We use track_entry_accessed in evict=true mode for the
+        // last entry so a single eviction sweep runs after all parts.
+        if let Some(evictor) = evictor {
+            let count = renamed.len();
+            for (i, (path, size)) in renamed.into_iter().enumerate() {
+                let trigger_evict = i + 1 == count;
+                evictor
+                    .track_entry_accessed(path, size as usize, trigger_evict)
+                    .await;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for FsCacheTee {
+    fn drop(&mut self) {
+        // Producer dropped without committing. Take whatever we registered
+        // and clean it up off-thread, after the worker has fully drained
+        // (so we don't race with an in-flight write that would recreate a
+        // tmp file we just unlinked).
+        let pending = std::mem::take(&mut self.pending);
+        // Closing the channel lets the worker drain and exit.
+        drop(self.tx.take());
+        let worker = self.worker.take();
+        Self::schedule_cleanup(pending, worker);
+    }
+}
+
 type FsCacheEvictorWork = (std::path::PathBuf, usize, bool);
 // Minimum time between aggregated "evictor queue is full" warnings.
 const QUEUE_FULL_LOG_INTERVAL_MS: i64 = 30_000;
@@ -524,6 +1004,7 @@ struct FsCacheEvictor {
     last_queue_full_log_ms: AtomicI64,
     background_evict_handle: OnceCell<tokio::task::JoinHandle<()>>,
     background_scan_handle: OnceCell<tokio::task::JoinHandle<()>>,
+    inner: OnceCell<Arc<FsCacheEvictorInner>>,
     stats: Arc<CachedObjectStoreStats>,
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
@@ -552,6 +1033,7 @@ impl FsCacheEvictor {
             last_queue_full_log_ms: AtomicI64::new(i64::MIN),
             background_evict_handle: OnceCell::new(),
             background_scan_handle: OnceCell::new(),
+            inner: OnceCell::new(),
             stats,
             system_clock,
             rand,
@@ -570,6 +1052,11 @@ impl FsCacheEvictor {
 
         let guard = self.rx.lock();
         let rx = guard.await.take().expect("evictor already started");
+
+        // Make the inner state reachable for direct callers (e.g. forget_entries
+        // from invalidate()) before flipping `started` so observers don't see a
+        // started evictor without a populated inner.
+        self.inner.set(inner.clone()).ok();
 
         self.started.store(true, Ordering::Release);
 
@@ -626,6 +1113,32 @@ impl FsCacheEvictor {
                 system_clock.clone().sleep(scan_interval).await;
                 inner.clone().scan_entries(true).await;
             }
+        }
+    }
+
+    /// Drop accounting for a batch of cache entries that were just removed
+    /// from disk. Bypasses the mpsc channel (which is reserved for foreground
+    /// access events) and updates state in a single critical section, so a
+    /// large SST with many parts costs one lock acquisition instead of N.
+    ///
+    /// Lazy initialization note: when called before `start()`, the in-memory
+    /// state is empty (the background scan hasn't populated it yet), so most
+    /// entries will be missing and we just no-op for them. The on-disk files
+    /// are already gone, and the next scan won't pick them up. Safe.
+    async fn forget_entries(&self, entries: Vec<(std::path::PathBuf, u64)>) {
+        if entries.is_empty() {
+            return;
+        }
+        // Delegate straight to the inner state holder. We need to grab a stable
+        // Arc<FsCacheEvictorInner>; we don't have one stored here because
+        // start() owns it. We could add one, but for now: only act if started.
+        // Pre-start, the in-memory accounting is empty so there is nothing to
+        // forget; we only need to delete files (already done by the caller).
+        if !self.started() {
+            return;
+        }
+        if let Some(inner) = self.inner.get() {
+            inner.forget_entries(entries).await;
         }
     }
 
@@ -726,14 +1239,30 @@ impl FsCacheEvictorInner {
     async fn scan_entries(self: Arc<Self>, evict: bool) {
         let root_folder = self.root_folder.clone();
 
+        // Walk the cache folder once. While we're at it, sweep any orphan tee
+        // tmp files (named "<original>.tmp-<rand>") left behind by an aborted
+        // pre-warm write or a process crash. Doing this inside the scan adds
+        // zero extra syscalls beyond `unlink` per orphan, and runs every
+        // scan_interval so transient crashes self-heal.
         #[allow(clippy::disallowed_methods)]
         let paths = tokio::task::spawn_blocking(move || {
-            WalkDir::new(&root_folder)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_file())
-                .map(|e| e.path().to_path_buf())
-                .collect::<Vec<_>>()
+            let mut keep = Vec::new();
+            for entry in WalkDir::new(&root_folder).into_iter().filter_map(|e| e.ok()) {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path().to_path_buf();
+                let is_orphan = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(TEE_TMP_INFIX));
+                if is_orphan {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                keep.push(path);
+            }
+            keep
         })
         .await
         .unwrap_or_default();
@@ -828,6 +1357,52 @@ impl FsCacheEvictorInner {
         };
 
         evicted_bytes
+    }
+
+    /// Drop accounting for a batch of cache entries that have already been
+    /// removed from disk by an external caller (e.g. invalidation after a
+    /// remote DELETE). Takes the cache_state lock once for the whole batch
+    /// and updates metrics in one pass.
+    async fn forget_entries(&self, entries: Vec<(std::path::PathBuf, u64)>) {
+        if entries.is_empty() {
+            return;
+        }
+        let _track_guard = self.track_lock.lock().await;
+
+        let (entry_count, total_bytes, removed_count) = {
+            let mut cache_state = self.cache_state.lock().await;
+            let mut total: u64 = 0;
+            let mut removed_count: u64 = 0;
+            for (path, _size_hint) in entries.iter() {
+                if let Some(removed) = cache_state.entries.remove(path) {
+                    cache_state.keys.swap_remove(removed.key_index);
+                    if removed.key_index < cache_state.keys.len() {
+                        let swapped_key = cache_state.keys[removed.key_index].clone();
+                        if let Some(swapped) = cache_state.entries.get_mut(&swapped_key) {
+                            swapped.key_index = removed.key_index;
+                        }
+                    }
+                    self.cache_size_bytes
+                        .fetch_sub(removed.size_bytes as u64, Ordering::SeqCst);
+                    total += removed.size_bytes as u64;
+                    removed_count += 1;
+                }
+            }
+            (cache_state.entries.len(), total, removed_count)
+        };
+
+        self.stats.object_store_cache_keys.set(entry_count as i64);
+        self.stats
+            .object_store_cache_bytes
+            .set(self.cache_size_bytes.load(Ordering::Relaxed) as i64);
+        if removed_count > 0 {
+            self.stats
+                .object_store_cache_evicted_bytes
+                .increment(total_bytes);
+            self.stats
+                .object_store_cache_evicted_keys
+                .increment(removed_count);
+        }
     }
 
     /// Evict cache entries until the cache size is below the target size.
@@ -1304,5 +1879,254 @@ mod tests {
         // cache_keys should be updated after eviction
         let keys = lookup_metric(&recorder, CACHE_KEYS).unwrap();
         assert!(keys >= 1, "expected cache_keys >= 1, got {keys}");
+    }
+
+    #[tokio::test]
+    async fn test_remove_drops_parts_head_and_evictor_accounting() {
+        // Spin up an FsCacheStorage with the evictor started so the on-disk
+        // accounting is real. Save a few parts and a head, then remove() and
+        // assert files, the evictor's cache_size_bytes, and the metrics all go
+        // back to a clean slate.
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_test_remove_")
+            .tempdir()
+            .unwrap();
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let helper = MetricsRecorderHelper::new(recorder.clone(), Default::default());
+        let stats = Arc::new(CachedObjectStoreStats::new(&helper));
+        let storage = FsCacheStorage::new(
+            temp_dir.path().to_path_buf(),
+            Some(1024 * 1024),
+            None,
+            stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        );
+        storage.start_evictor().await;
+
+        let location = Path::from("compacted/x.sst");
+        let part_size = 1024;
+        let entry = storage.entry(&location, part_size);
+        for part_number in 0..3 {
+            entry
+                .save_part(part_number, Bytes::from(vec![0u8; part_size]))
+                .await
+                .unwrap();
+        }
+        let now = Utc::now();
+        let meta = ObjectMeta {
+            location: location.clone(),
+            last_modified: now,
+            size: (part_size * 3) as u64,
+            e_tag: None,
+            version: None,
+        };
+        let attrs = Attributes::new();
+        entry.save_head((&meta, &attrs)).await.unwrap();
+
+        // Sanity: parts and head exist.
+        assert_eq!(entry.cached_parts().await.unwrap().len(), 3);
+        assert!(entry.read_head().await.unwrap().is_some());
+
+        // Drive the evictor channel so the in-memory state has caught up to
+        // the writes before we measure. The save_part path enqueues
+        // track_entry_accessed events through a bounded mpsc channel; we
+        // poll for the accounting to reflect the writes instead of using a
+        // fixed sleep, which is flaky under parallel test load.
+        let inner = storage.evictor.as_ref().unwrap().inner.get().unwrap().clone();
+        let mut cache_size_before = 0u64;
+        for _ in 0..50 {
+            cache_size_before = inner.cache_size_bytes.load(Ordering::SeqCst);
+            if cache_size_before > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            cache_size_before > 0,
+            "evictor should have tracked the saved parts within 1s"
+        );
+
+        storage.remove(&location).await.unwrap();
+
+        // Files should be gone.
+        let leftover: Vec<_> = walkdir::WalkDir::new(temp_dir.path())
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "expected all cache files to be removed, found {:?}",
+            leftover
+        );
+
+        // Evictor accounting should be back to zero for these entries.
+        let cache_size_after = inner.cache_size_bytes.load(Ordering::SeqCst);
+        assert_eq!(cache_size_after, 0);
+    }
+
+    #[tokio::test]
+    async fn test_tee_commit_populates_parts_and_head() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_test_tee_commit_")
+            .tempdir()
+            .unwrap();
+        let recorder = MetricsRecorderHelper::noop();
+        let storage = FsCacheStorage::new(
+            temp_dir.path().to_path_buf(),
+            Some(1024 * 1024),
+            None,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        );
+        storage.start_evictor().await;
+
+        let location = Path::from("compacted/tee.sst");
+        let part_size = 1024;
+        let payload: Vec<u8> = (0..2500u32).map(|i| (i % 251) as u8).collect();
+
+        let mut tee = storage.begin_tee(&location, part_size).expect("tee");
+        // Push in irregular chunks to exercise buffering across part
+        // boundaries.
+        for chunk in payload.chunks(300) {
+            tee.extend(chunk).await.unwrap();
+        }
+        let meta = ObjectMeta {
+            location: location.clone(),
+            last_modified: Utc::now(),
+            size: payload.len() as u64,
+            e_tag: None,
+            version: None,
+        };
+        tee.commit(&meta, &Attributes::new()).await.unwrap();
+
+        // Read every byte back via the cache entry.
+        let entry = storage.entry(&location, part_size);
+        let mut got = Vec::with_capacity(payload.len());
+        let mut part_number = 0;
+        while got.len() < payload.len() {
+            let remaining = payload.len() - got.len();
+            let want = remaining.min(part_size);
+            let chunk = entry
+                .read_part(part_number, 0..want)
+                .await
+                .unwrap()
+                .expect("part should be cached after commit");
+            got.extend_from_slice(&chunk);
+            part_number += 1;
+        }
+        assert_eq!(got, payload);
+
+        let head = entry.read_head().await.unwrap().expect("head should exist");
+        assert_eq!(head.0.size, payload.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_tee_drop_without_commit_leaves_no_temp_files() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_test_tee_abort_")
+            .tempdir()
+            .unwrap();
+        let recorder = MetricsRecorderHelper::noop();
+        let storage = FsCacheStorage::new(
+            temp_dir.path().to_path_buf(),
+            Some(1024 * 1024),
+            None,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        );
+        storage.start_evictor().await;
+
+        let location = Path::from("compacted/abort.sst");
+        let part_size = 1024;
+        {
+            let mut tee = storage.begin_tee(&location, part_size).expect("tee");
+            // Write enough to flush at least one part to a tmp file.
+            tee.extend(&vec![0xab; 2048]).await.unwrap();
+            // Drop without commit. The Drop impl schedules cleanup off-thread.
+        }
+
+        // Give the cleanup task a moment to run. Cleanup is fire-and-forget;
+        // the test waits long enough for the spawned blocking task to finish
+        // a small handful of unlinks.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let leftover: Vec<_> = walkdir::WalkDir::new(temp_dir.path())
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "expected no cache files after drop without commit, found {:?}",
+            leftover
+                .iter()
+                .map(|e| e.path().to_path_buf())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_sweeps_orphan_tee_tmp_files() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_test_tmp_sweep_")
+            .tempdir()
+            .unwrap();
+        // Pre-seed the directory with a mix of legitimate cache files and
+        // orphan tmp files, simulating a process that crashed mid-tee.
+        let object_dir = temp_dir.path().join("compacted/orphan.sst");
+        std::fs::create_dir_all(&object_dir).unwrap();
+        let legit = object_dir.join("_part1kb-000000000");
+        std::fs::write(&legit, b"keep-me").unwrap();
+        let orphan_part = object_dir.join("_part1kb-000000000.tmp-abcdef");
+        std::fs::write(&orphan_part, b"discard-me").unwrap();
+        let orphan_head = object_dir.join("_head.tmp-xyz");
+        std::fs::write(&orphan_head, b"discard-me-too").unwrap();
+
+        let recorder = MetricsRecorderHelper::noop();
+        let inner = Arc::new(FsCacheEvictorInner::new(
+            temp_dir.path().to_path_buf(),
+            1024 * 1024,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DbRand::default()),
+            FileHandleCache::new(1000),
+        ));
+
+        inner.scan_entries(false).await;
+
+        assert!(legit.exists(), "legit cache file must survive sweep");
+        assert!(!orphan_part.exists(), "orphan part tmp must be swept");
+        assert!(!orphan_head.exists(), "orphan head tmp must be swept");
+    }
+
+    #[tokio::test]
+    async fn test_remove_missing_location_is_ok() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_test_remove_missing_")
+            .tempdir()
+            .unwrap();
+        let recorder = MetricsRecorderHelper::noop();
+        let storage = FsCacheStorage::new(
+            temp_dir.path().to_path_buf(),
+            Some(1024),
+            None,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        );
+        storage.start_evictor().await;
+
+        // Removing a never-cached location must be a clean no-op.
+        storage
+            .remove(&Path::from("never/seen.sst"))
+            .await
+            .unwrap();
     }
 }

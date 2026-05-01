@@ -494,22 +494,30 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Create path resolver and table store
         let path_resolver = PathResolver::new_with_external_ssts(path.clone(), external_ssts);
-        let table_store = Arc::new(TableStore::new_with_fp_registry(
-            ObjectStores::new(
-                maybe_cached_main_object_store.clone(),
-                retrying_wal_object_store.clone(),
+        let table_store = Arc::new(
+            TableStore::new_with_fp_registry(
+                ObjectStores::new(
+                    maybe_cached_main_object_store.clone(),
+                    retrying_wal_object_store.clone(),
+                ),
+                sst_format.clone(),
+                path_resolver.clone(),
+                self.fp_registry.clone(),
+                self.db_cache.as_ref().map(|c| {
+                    Arc::new(DbCacheWrapper::new(
+                        c.clone(),
+                        &recorder,
+                        system_clock.clone(),
+                    )) as Arc<dyn DbCache>
+                }),
+            )
+            .with_cached_object_store(cached_object_store.clone())
+            .with_prewarm_compacted_on_write(
+                self.settings
+                    .object_store_cache_options
+                    .prewarm_cache_on_compaction,
             ),
-            sst_format.clone(),
-            path_resolver.clone(),
-            self.fp_registry.clone(),
-            self.db_cache.as_ref().map(|c| {
-                Arc::new(DbCacheWrapper::new(
-                    c.clone(),
-                    &recorder,
-                    system_clock.clone(),
-                )) as Arc<dyn DbCache>
-            }),
-        ));
+        );
 
         // Get next WAL ID before writing manifest
         let replay_after_wal_id = match &latest_manifest {

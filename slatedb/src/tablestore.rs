@@ -9,11 +9,12 @@ use futures::{future::join_all, StreamExt};
 use log::{debug, warn};
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutMode, PutOptions};
+use object_store::{ObjectMeta, ObjectStore, PutMode, PutOptions};
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
 use crate::blob::ReadOnlyBlob;
+use crate::cached_object_store::{CachedObjectStore, LocalCacheTee};
 use crate::db_cache::{CachedEntry, CachedKey, DbCache, EncodedCachedFilter};
 use crate::db_state::{SsTableHandle, SsTableId};
 use crate::error::SlateDBError;
@@ -36,6 +37,15 @@ pub(crate) struct TableStore {
     fp_registry: Arc<FailPointRegistry>,
     /// In-memory cache for data blocks, indices, and filters
     cache: Option<Arc<dyn DbCache>>,
+    /// Optional handle to the on-disk cached object store, used to invalidate
+    /// cached SST parts when the upstream object is deleted (e.g. by GC after
+    /// compaction). When `None`, no on-disk cache is configured and SST
+    /// deletes do not need to perform any cache cleanup.
+    cached_object_store: Option<Arc<CachedObjectStore>>,
+    /// When true, compacted-SST writes tee their bytes into the on-disk cache
+    /// as they are produced, avoiding a re-read from the upstream store on
+    /// the first read after the manifest commit.
+    prewarm_compacted_on_write: bool,
 }
 
 struct ReadOnlyObject {
@@ -102,7 +112,28 @@ impl TableStore {
             path_resolver,
             fp_registry,
             cache,
+            cached_object_store: None,
+            prewarm_compacted_on_write: false,
         }
+    }
+
+    /// Attach the on-disk cached object store so SST deletes can invalidate
+    /// stale local cache entries. Builder-style setter so existing call sites
+    /// (tests, compactor harnesses) that don't go through `DbBuilder` keep
+    /// working without modification.
+    pub(crate) fn with_cached_object_store(
+        mut self,
+        cached_object_store: Option<Arc<CachedObjectStore>>,
+    ) -> Self {
+        self.cached_object_store = cached_object_store;
+        self
+    }
+
+    /// Enable streaming tee writes for compacted SSTs. Only takes effect when
+    /// a cached object store is also attached.
+    pub(crate) fn with_prewarm_compacted_on_write(mut self, enabled: bool) -> Self {
+        self.prewarm_compacted_on_write = enabled;
+        self
     }
 
     /// Get the number of blocks for a size specified in bytes.
@@ -176,11 +207,25 @@ impl TableStore {
     pub(crate) fn table_writer(&self, id: SsTableId) -> EncodedSsTableWriter<'_> {
         let object_store = self.object_stores.store_for(&id);
         let path = self.path(&id);
+
+        // Begin a cache tee for compacted SSTs only when both the on-disk
+        // cache is configured and pre-warming is enabled. WAL SSTs are
+        // intentionally excluded: they're short-lived and pre-warming them
+        // would churn the cache.
+        let cache_tee = match (&self.cached_object_store, &id) {
+            (Some(cached), SsTableId::Compacted(_)) if self.prewarm_compacted_on_write => {
+                cached.begin_tee(&path)
+            }
+            _ => None,
+        };
+
         EncodedSsTableWriter {
             id,
             builder: self.sst_format.table_builder(),
-            writer: BufWriter::new(object_store, path),
+            writer: BufWriter::new(object_store, path.clone()),
             table_store: self,
+            cache_tee,
+            sst_path: path,
             #[cfg(test)]
             blocks_written: 0,
         }
@@ -291,12 +336,25 @@ impl TableStore {
         decoded
     }
 
-    /// Delete an SSTable from the object store.
+    /// Delete an SSTable from the object store. After a successful upstream
+    /// delete, also drop any on-disk cache entries for this SST so the cache
+    /// does not hold bytes for an object that no longer exists. The cache
+    /// invalidation is best-effort and runs only after the remote DELETE
+    /// succeeds; pre-DELETE we keep cache entries because a reader holding
+    /// an older manifest snapshot may still legitimately read the SST.
     pub(crate) async fn delete_sst(&self, id: &SsTableId) -> Result<(), SlateDBError> {
         let object_store = self.object_stores.store_for(id);
         let path = self.path(id);
         debug!("deleting SST [path={}]", path);
-        object_store.delete(&path).await.map_err(SlateDBError::from)
+        object_store
+            .delete(&path)
+            .await
+            .map_err(SlateDBError::from)?;
+
+        if let Some(cached) = &self.cached_object_store {
+            cached.invalidate(&path).await;
+        }
+        Ok(())
     }
 
     /// Reads metadata for a specific SST object (WAL or compacted).
@@ -737,6 +795,12 @@ pub(crate) struct EncodedSsTableWriter<'a> {
     builder: EncodedSsTableBuilder<'a>,
     writer: BufWriter,
     table_store: &'a TableStore,
+    /// Optional streaming tee into the on-disk cache. When present, every
+    /// byte written to `writer` is also pushed into the tee, so the SST is
+    /// available locally without a re-fetch after the multipart upload
+    /// completes. The tee is consumed at `close()` time via `commit`.
+    cache_tee: Option<Box<dyn LocalCacheTee>>,
+    sst_path: Path,
     #[cfg(test)]
     blocks_written: usize,
 }
@@ -754,11 +818,52 @@ impl EncodedSsTableWriter<'_> {
     pub(crate) async fn close(mut self) -> Result<SsTableHandle, SlateDBError> {
         let mut encoded_sst = self.builder.build().await?;
         while let Some(block) = encoded_sst.unconsumed_blocks.pop_front() {
-            self.writer.write_all(block.encoded_bytes.as_ref()).await?;
+            let bytes = block.encoded_bytes.as_ref();
+            self.writer.write_all(bytes).await?;
+            if let Some(tee) = self.cache_tee.as_mut() {
+                let _ = tee.extend(bytes).await;
+            }
         }
 
-        self.writer.write_all(encoded_sst.footer.as_ref()).await?;
+        let footer = encoded_sst.footer.as_ref();
+        self.writer.write_all(footer).await?;
+        if let Some(tee) = self.cache_tee.as_mut() {
+            let _ = tee.extend(footer).await;
+        }
         self.writer.shutdown().await?;
+
+        // Commit the tee only after the upstream multipart upload has fully
+        // succeeded (shutdown finalizes the upload). This is the invariant
+        // that keeps the cache from holding bytes the upstream never accepted.
+        if let Some(tee) = self.cache_tee.take() {
+            let total_size = encoded_sst.info.filter_offset
+                + encoded_sst.info.filter_len
+                + footer.len() as u64;
+            // total_size above is a best-effort hint; the tee tracks the
+            // truth itself via accumulated extend() bytes. We use the upstream
+            // Path for `location` so the head matches what cached reads would
+            // expect to see.
+            // last_modified is a stub: the cache does not use this field for
+            // invalidation, only echoes it back from cached_head(). Avoid
+            // threading a SystemClock through TableStore just for this; the
+            // upstream object's real last_modified is filled in lazily the
+            // next time we hit the upstream HEAD.
+            let head_meta = ObjectMeta {
+                location: self.sst_path.clone(),
+                last_modified: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+                size: total_size,
+                e_tag: None,
+                version: None,
+            };
+            let attrs = object_store::Attributes::new();
+            if let Err(e) = tee.commit(&head_meta, &attrs).await {
+                warn!(
+                    "cache pre-warm tee commit failed [path={}, error={:?}]",
+                    self.sst_path, e
+                );
+            }
+        }
+
         self.table_store
             .cache_filters(self.id, encoded_sst.info.filter_offset, encoded_sst.filters)
             .await;
@@ -771,7 +876,11 @@ impl EncodedSsTableWriter<'_> {
 
     async fn drain_blocks(&mut self) -> Result<(), SlateDBError> {
         while let Some(block) = self.builder.next_block() {
-            self.writer.write_all(block.encoded_bytes.as_ref()).await?;
+            let bytes = block.encoded_bytes.as_ref();
+            self.writer.write_all(bytes).await?;
+            if let Some(tee) = self.cache_tee.as_mut() {
+                let _ = tee.extend(bytes).await;
+            }
             #[cfg(test)]
             {
                 self.blocks_written += 1;
@@ -1760,5 +1869,110 @@ mod tests {
                 assert_eq!(num_blocks, ts.bytes_to_blocks(bytes));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_compacted_sst_writer_prewarms_disk_cache() {
+        use crate::bytes_generator::OrderedBytesGenerator;
+        use crate::cached_object_store::stats::CachedObjectStoreStats;
+        use crate::cached_object_store::{CachedObjectStore, FsCacheStorage};
+        use rand::Rng;
+
+        // Build the on-disk cache + cached object store wrapping an InMemory
+        // upstream. Resolve the cache root by issuing a HEAD/GET so begin_tee
+        // returns Some.
+        let cache_dir = {
+            let mut rng = rand::rng();
+            let suffix: String = (0..10)
+                .map(|_| rng.sample(rand::distr::Alphanumeric) as char)
+                .collect();
+            let path = format!("/tmp/testtee-{}", suffix);
+            let _ = std::fs::remove_dir_all(&path);
+            std::path::PathBuf::from(path)
+        };
+
+        let upstream: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let stats = Arc::new(CachedObjectStoreStats::new(&recorder));
+        let cache_storage = Arc::new(FsCacheStorage::new(
+            cache_dir.clone(),
+            None,
+            None,
+            stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        ));
+        let cached =
+            CachedObjectStore::new(upstream.clone(), cache_storage.clone(), 1024, false, stats)
+                .unwrap();
+
+        // Resolve the root: write a sentinel to upstream and read it through
+        // the cache. This populates the resolved_root OnceCell so subsequent
+        // begin_tee calls succeed.
+        let sentinel = Path::from("warmup");
+        upstream
+            .put(&sentinel, object_store::PutPayload::from_bytes(Bytes::from_static(b"x")))
+            .await
+            .unwrap();
+        let _ = cached.cached_head(&sentinel).await.unwrap();
+
+        // Build a TableStore with the cache attached and prewarm enabled.
+        // The path resolver puts SSTs under "/root/compacted/<id>.sst".
+        let cached_arc: Arc<dyn ObjectStore> = cached.clone();
+        let ts = Arc::new(
+            TableStore::new(
+                ObjectStores::new(cached_arc, None),
+                SsTableFormat::default(),
+                Path::from("/root"),
+                None,
+            )
+            .with_cached_object_store(Some(cached.clone()))
+            .with_prewarm_compacted_on_write(true),
+        );
+
+        // Drive the writer via table_writer, which is the path the tee hooks
+        // into.
+        let id = SsTableId::Compacted(ulid::Ulid::new());
+        let mut writer = ts.table_writer(id);
+        let mut keygen = OrderedBytesGenerator::new_with_suffix(&[], &[0u8; 16]);
+        for _ in 0..256 {
+            let k = keygen.next();
+            let v = Bytes::from_static(&[0u8; 64]);
+            writer
+                .add(RowEntry::new(k, ValueDeletable::Value(v), 0u64, None, None))
+                .await
+                .unwrap();
+        }
+        let _handle = writer.close().await.unwrap();
+
+        // The committed cache directory must contain at least one part file
+        // and a head, under "<cache_dir>/<sst path>".
+        let sst_cache_dir = cache_dir.join("root/compacted").join(format!("{}.sst", id.unwrap_compacted_id()));
+        let mut found_part = false;
+        let mut found_head = false;
+        for entry in walkdir::WalkDir::new(&sst_cache_dir).into_iter().flatten() {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("_part") && !name.contains(".tmp-") {
+                found_part = true;
+            } else if name == "_head" {
+                found_head = true;
+            } else if name.contains(".tmp-") {
+                panic!("tmp file should not be visible after commit: {}", name);
+            }
+        }
+        assert!(
+            found_part,
+            "expected at least one cached part file under {:?}",
+            sst_cache_dir
+        );
+        assert!(
+            found_head,
+            "expected a cached head file under {:?}",
+            sst_cache_dir
+        );
     }
 }

@@ -59,6 +59,36 @@ impl CachedObjectStore {
         self.cache_storage.start_evictor().await;
     }
 
+    /// Begin a streaming tee write for `location`. Returns `None` if the
+    /// cache root has not yet been resolved (no successful GET/HEAD has
+    /// happened) or the underlying storage refuses tee writes. Callers fall
+    /// back to lazy cache population on the first read.
+    pub(crate) fn begin_tee(
+        &self,
+        location: &Path,
+    ) -> Option<Box<dyn crate::cached_object_store::LocalCacheTee>> {
+        let cache_location = self.cache_location_for(location)?;
+        self.cache_storage
+            .begin_tee(&cache_location, self.part_size_bytes)
+    }
+
+    /// Remove cached parts and head metadata for `location`, if any. This is
+    /// best-effort and never fails the caller: errors are logged. If the
+    /// cache root has not yet been resolved (no GET/HEAD has succeeded for
+    /// any object), this is a no-op since the cache cannot hold any entry
+    /// for this location.
+    pub(crate) async fn invalidate(&self, location: &Path) {
+        let Some(cache_location) = self.cache_location_for(location) else {
+            return;
+        };
+        if let Err(e) = self.cache_storage.remove(&cache_location).await {
+            warn!(
+                "failed to invalidate cache entry [location={}, error={:?}]",
+                location, e
+            );
+        }
+    }
+
     /// Build a `CachedObjectStore` from `ObjectStoreCacheOptions`, returning `None`
     /// if caching is not configured (i.e. `root_folder` is `None`). When `Some` is
     /// returned the evictor has already been started.
@@ -1540,5 +1570,87 @@ mod tests {
             let cached_parts = entry.cached_parts().await.unwrap();
             assert_eq!(cached_parts.len(), 0); // No parts should be cached
         }
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_removes_cached_parts_and_head() {
+        let backing_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let recorder = MetricsRecorderHelper::noop();
+        let stats = Arc::new(CachedObjectStoreStats::new(&recorder));
+        let cache_storage = Arc::new(FsCacheStorage::new(
+            new_test_cache_folder(),
+            None,
+            None,
+            stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        ));
+        let cached_store =
+            CachedObjectStore::new(backing_store.clone(), cache_storage, 1024, false, stats)
+                .unwrap();
+
+        // Seed the upstream object and pull it through the cache so the cache
+        // has both parts and a head entry, plus a resolved root.
+        let location = Path::from("compacted/abc.sst");
+        let payload = gen_rand_bytes(2500); // > one part, < two parts
+        backing_store
+            .put(&location, PutPayload::from_bytes(payload.clone()))
+            .await
+            .unwrap();
+        let _ = cached_store
+            .cached_get_opts(&location, GetOptions::default())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        let entry = cached_store.cache_storage.entry(&location, 1024);
+        assert!(
+            !entry.cached_parts().await.unwrap().is_empty(),
+            "expected cache to be populated after a GET"
+        );
+        assert!(
+            entry.read_head().await.unwrap().is_some(),
+            "expected head metadata to be cached"
+        );
+
+        // Invalidate and confirm the per-object directory is empty.
+        cached_store.invalidate(&location).await;
+        let entry = cached_store.cache_storage.entry(&location, 1024);
+        assert!(
+            entry.cached_parts().await.unwrap().is_empty(),
+            "cache parts should be gone after invalidate"
+        );
+        assert!(
+            entry.read_head().await.unwrap().is_none(),
+            "head should be gone after invalidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_unresolved_root_is_noop() {
+        // Before any successful GET/HEAD, the cache root is unresolved and the
+        // cache cannot hold entries for any location. invalidate() must not
+        // panic or error in this state.
+        let backing_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let recorder = MetricsRecorderHelper::noop();
+        let stats = Arc::new(CachedObjectStoreStats::new(&recorder));
+        let cache_storage = Arc::new(FsCacheStorage::new(
+            new_test_cache_folder(),
+            None,
+            None,
+            stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        ));
+        let cached_store =
+            CachedObjectStore::new(backing_store, cache_storage, 1024, false, stats).unwrap();
+
+        cached_store
+            .invalidate(&Path::from("compacted/never-fetched.sst"))
+            .await;
     }
 }

@@ -74,6 +74,42 @@ pub trait LocalCacheStorage: Send + Sync + std::fmt::Debug + Display + 'static {
     fn entry(&self, location: &Path, part_size: usize) -> Box<dyn LocalCacheEntry>;
 
     async fn start_evictor(&self);
+
+    /// Remove all cached parts and head metadata for `location`. Best-effort:
+    /// returns Ok even when nothing was cached. Callers (e.g. GC after a
+    /// remote DELETE) use this to keep the cache from holding stale entries.
+    async fn remove(&self, location: &Path) -> object_store::Result<()>;
+
+    /// Begin a streaming tee write to the cache for `location`. Bytes pushed
+    /// into the returned tee are buffered into part-sized chunks and written
+    /// to per-part temp files. The tee becomes a visible cache entry only
+    /// after `commit` succeeds (atomic rename of all part files, then the
+    /// head). If dropped without `commit`, the temp files are best-effort
+    /// cleaned. Implementations that don't support tee writes may return
+    /// `None`; callers fall back to lazy cache population via reads.
+    fn begin_tee(&self, location: &Path, part_size: usize) -> Option<Box<dyn LocalCacheTee>>;
+}
+
+/// A streaming, transactional cache writer. The producer (e.g. an SST writer)
+/// calls `extend` repeatedly with the same byte slices it hands to the
+/// upstream object store, then calls `commit` after the upstream write
+/// succeeds.
+#[async_trait]
+pub trait LocalCacheTee: Send + Sync + std::fmt::Debug {
+    /// Buffer the given bytes for caching. May internally flush a completed
+    /// part to a temp file. Errors are logged inside the implementation; a
+    /// returned error puts the tee into a poisoned state and `commit` will
+    /// no-op clean up.
+    async fn extend(&mut self, buf: &[u8]) -> object_store::Result<()>;
+
+    /// Atomically publish all buffered + flushed parts as a visible cache
+    /// entry, with the given head metadata. After `commit`, the tee is spent
+    /// and must not be reused.
+    async fn commit(
+        self: Box<Self>,
+        meta: &ObjectMeta,
+        attrs: &Attributes,
+    ) -> object_store::Result<()>;
 }
 
 #[async_trait]
