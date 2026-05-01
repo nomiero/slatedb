@@ -1355,6 +1355,15 @@ pub struct ObjectStoreCacheOptions {
     /// When the limit is reached, the least recently used handle is closed.
     /// Default is 1000.
     pub max_open_file_handles: usize,
+
+    /// When the on-disk cache is configured, also write compaction output SSTs
+    /// directly into the cache as they are produced. This avoids re-fetching
+    /// the just-written object from the upstream store on the first read after
+    /// the manifest commit. The tee writes go to per-part temp files and are
+    /// renamed only after the upstream multipart upload succeeds, so a partial
+    /// or aborted compaction never leaves a half-written SST visible in the
+    /// cache. Has no effect when `root_folder` is `None`. Default is true.
+    pub prewarm_cache_on_compaction: bool,
 }
 
 impl Default for ObjectStoreCacheOptions {
@@ -1370,6 +1379,7 @@ impl Default for ObjectStoreCacheOptions {
             preload_disk_cache_on_startup: None,
             scan_interval: Some(Duration::from_secs(3600)),
             max_open_file_handles: 1000,
+            prewarm_cache_on_compaction: true,
         }
     }
 }
