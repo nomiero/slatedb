@@ -343,9 +343,17 @@ impl CachedObjectStore {
         payload: object_store::PutPayload,
         opts: object_store::PutOptions,
     ) -> object_store::Result<PutResult> {
-        // Only cache if the cache_puts option is enabled
-        if !self.cache_puts {
-            // If caching is disabled, just write to the upstream object store without cloning
+        // Only cache if the cache_puts option is enabled, AND the put is for
+        // a compacted SST. WAL frames, manifests, and compactions metadata
+        // are excluded:
+        //   - WAL: only used for crash recovery; caching it wastes disk and
+        //     write bandwidth on data we never re-read on the hot path.
+        //   - manifests / compactions metadata: small, mutable, and read
+        //     through dedicated paths that don't benefit from this layer.
+        // Compacted SSTs are the only PUT-shaped writes worth caching here.
+        // Streaming SST writes (multipart uploads) flow through the prewarm
+        // tee in EncodedSsTableWriter, not through this method.
+        if !self.cache_puts || !Self::is_compacted_sst_path(location) {
             return self.object_store.put_opts(location, payload, opts).await;
         }
 
@@ -372,6 +380,14 @@ impl CachedObjectStore {
         }
 
         Ok(result)
+    }
+
+    /// True when `location` points at a compacted-SST file. We match on a
+    /// `compacted/` path segment rather than any specific root prefix so the
+    /// detection works under prefix-stores, multi-tenant layouts, and tests
+    /// that mount the DB under arbitrary paths.
+    fn is_compacted_sst_path(location: &Path) -> bool {
+        location.parts().any(|p| p.as_ref() == "compacted")
     }
 
     // if an object is not cached before, maybe_prefetch_range will try to prefetch the object from the
@@ -1626,6 +1642,82 @@ mod tests {
         assert!(
             entry.read_head().await.unwrap().is_none(),
             "head should be gone after invalidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_puts_skips_wal_and_manifest_paths() {
+        // cache_puts=true should only populate the cache for compacted-SST
+        // paths. WAL frames and manifest writes go straight to upstream so
+        // we don't burn local disk on bytes we'll never re-read on the hot
+        // path.
+        let backing_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let recorder = MetricsRecorderHelper::noop();
+        let stats = Arc::new(CachedObjectStoreStats::new(&recorder));
+        let cache_storage = Arc::new(FsCacheStorage::new(
+            new_test_cache_folder(),
+            None,
+            None,
+            stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        ));
+        let cached =
+            CachedObjectStore::new(backing_store.clone(), cache_storage, 1024, true, stats)
+                .unwrap();
+
+        // Resolve the cache root by reading something through the cache
+        // (otherwise cache_location_for returns None and the cache writes
+        // skip for an unrelated reason).
+        let warm = Path::from("warmup-object");
+        backing_store
+            .put(&warm, PutPayload::from_bytes(Bytes::from_static(b"hi")))
+            .await
+            .unwrap();
+        let _ = cached.cached_head(&warm).await.unwrap();
+
+        // Put to a WAL path. The upstream should accept it but the cache
+        // should not have any parts for it.
+        let wal_path = Path::from("db/wal/00000000000000000001.sst");
+        cached
+            .put(&wal_path, PutPayload::from_bytes(Bytes::from_static(b"wal-frame")))
+            .await
+            .unwrap();
+        let wal_entry = cached.cache_storage.entry(&wal_path, 1024);
+        assert!(
+            wal_entry.cached_parts().await.unwrap().is_empty(),
+            "WAL puts must not populate the cache"
+        );
+
+        // Put to a manifest path. Same expectation.
+        let manifest_path = Path::from("db/manifest/0001.manifest");
+        cached
+            .put(
+                &manifest_path,
+                PutPayload::from_bytes(Bytes::from_static(b"manifest-bytes")),
+            )
+            .await
+            .unwrap();
+        let manifest_entry = cached.cache_storage.entry(&manifest_path, 1024);
+        assert!(
+            manifest_entry.cached_parts().await.unwrap().is_empty(),
+            "manifest puts must not populate the cache"
+        );
+
+        // Put to a compacted SST path. This one *should* land in the cache.
+        let compacted_path = Path::from("db/compacted/01HQ.sst");
+        cached
+            .put(
+                &compacted_path,
+                PutPayload::from_bytes(Bytes::from_static(b"compacted-sst-bytes")),
+            )
+            .await
+            .unwrap();
+        let compacted_entry = cached.cache_storage.entry(&compacted_path, 1024);
+        assert!(
+            !compacted_entry.cached_parts().await.unwrap().is_empty(),
+            "compacted SST puts must populate the cache when cache_puts=true"
         );
     }
 
