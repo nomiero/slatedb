@@ -51,7 +51,7 @@ use crate::config::{
     FlushOptions, FlushType, MergeOptions, PutOptions, ReadOptions, ScanOptions, Settings,
     WriteOptions,
 };
-use crate::db_iter::DbIterator;
+use crate::db_iter::{DbIterator, RecencyPrefixIterator};
 use crate::db_snapshot::DbSnapshot;
 use crate::db_state::{DbState, SsTableId};
 use crate::db_stats::DbStats;
@@ -272,6 +272,18 @@ impl DbInner {
                     prefix: Some(prefix),
                 },
             )
+            .await
+    }
+
+    pub(crate) async fn scan_prefix_by_recency(
+        &self,
+        prefix: Bytes,
+        options: &ScanOptions,
+    ) -> Result<RecencyPrefixIterator, SlateDBError> {
+        self.check_closed()?;
+        let db_state = self.state.read().view();
+        self.reader
+            .scan_prefix_by_recency(prefix, options, &db_state, None, None)
             .await
     }
 
@@ -1132,6 +1144,50 @@ impl Db {
         let prefix = Bytes::copy_from_slice(prefix.as_ref());
         self.inner
             .scan_prefix_with_options(prefix, options)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Scan all keys that share the provided prefix, evaluating sources by
+    /// recency without merging.
+    ///
+    /// Sources are evaluated sequentially from most recent (active memtable)
+    /// to least recent (oldest sorted run). Each source is fully drained
+    /// before moving to the next, and sources are lazily initialized, so
+    /// reading only from the most recent source avoids I/O for older
+    /// sources entirely. Combined with prefix bloom filters, a prefix read
+    /// that finds data in the active memtable performs zero object-store
+    /// I/O.
+    ///
+    /// Returns raw [`crate::types::RowEntry`] values, including tombstones
+    /// and merge operands; the caller is responsible for interpreting them.
+    pub async fn scan_prefix_by_recency<P>(
+        &self,
+        prefix: P,
+    ) -> Result<RecencyPrefixIterator, crate::Error>
+    where
+        P: AsRef<[u8]> + Send,
+    {
+        self.scan_prefix_by_recency_with_options(prefix, &ScanOptions::default())
+            .await
+    }
+
+    /// Scan all keys that share the provided prefix with custom options,
+    /// evaluating sources by recency without merging.
+    ///
+    /// See [`scan_prefix_by_recency`](Self::scan_prefix_by_recency) for
+    /// details.
+    pub async fn scan_prefix_by_recency_with_options<P>(
+        &self,
+        prefix: P,
+        options: &ScanOptions,
+    ) -> Result<RecencyPrefixIterator, crate::Error>
+    where
+        P: AsRef<[u8]> + Send,
+    {
+        let prefix = Bytes::copy_from_slice(prefix.as_ref());
+        self.inner
+            .scan_prefix_by_recency(prefix, options)
             .await
             .map_err(Into::into)
     }
