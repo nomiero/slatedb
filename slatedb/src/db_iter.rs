@@ -11,7 +11,6 @@ use crate::types::{KeyValue, RowEntry, ValueDeletable};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use log::warn;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ops::RangeBounds;
@@ -447,27 +446,8 @@ impl RecencyPrefixIterator {
             return Err(error.clone().into());
         }
 
-        // Slow-path tracing: count how many sources we walk past before
-        // finding (or failing to find) a row to return. For point-style
-        // recency reads (e.g. mineraldb's `get_at`), the expectation is
-        // 0 sources walked past (front source has the row) or a small
-        // number (front has nothing, walk past until first hit). High
-        // values per call indicate either many false-positive filter
-        // matches or sources whose iterators init'd but yielded
-        // nothing.
-        const HIGH_SOURCES_WALKED_THRESHOLD: usize = 4;
-        let mut sources_walked: usize = 0;
-        let initial_iters = self.iters.len();
-
         loop {
             let Some(iter) = self.iters.front_mut() else {
-                if sources_walked >= HIGH_SOURCES_WALKED_THRESHOLD {
-                    warn!(
-                        "RecencyPrefixIterator::next_entry walked {} sources without a hit \
-                         (initial source count={})",
-                        sources_walked, initial_iters,
-                    );
-                }
                 return Ok(None);
             };
 
@@ -481,20 +461,18 @@ impl RecencyPrefixIterator {
 
             match iter.next().await {
                 Ok(Some(entry)) => {
-                    if sources_walked >= HIGH_SOURCES_WALKED_THRESHOLD {
-                        warn!(
-                            "RecencyPrefixIterator::next_entry walked {} sources before a hit \
-                             (initial source count={})",
-                            sources_walked, initial_iters,
-                        );
-                    }
                     return Ok(Some(entry));
                 }
                 Ok(None) => {
                     // Current source exhausted; move to the next.
+                    // Walking past a filter-NEG source is essentially free
+                    // (one in-memory filter probe, no data block fetch);
+                    // walking past a filter-POS source that had no matching
+                    // key is the genuinely-wasteful case and is already
+                    // tracked separately as sst_filter_*_false_positives in
+                    // [`DbStats`].
                     self.iters.pop_front();
                     self.current_initialized = false;
-                    sources_walked += 1;
                 }
                 Err(e) => {
                     self.invalidated_error = Some(e.clone());
