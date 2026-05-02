@@ -12,7 +12,7 @@
 //! - flush request semantics
 //! - flush waiter bookkeeping
 
-use log::debug;
+use log::{debug, warn};
 
 use super::tracker::TrackerMessage;
 use super::uploader::UploadedMemtable;
@@ -464,7 +464,20 @@ impl ManifestWriterHandler {
         .into_iter()
         .flatten()
         .min();
+        // Slow-path tracing: when a batch of memtables finishes
+        // uploading, this function takes state.write() to install the
+        // new L0 SSTs into the manifest. Held while iterating
+        // `staged_batch` and rebuilding the manifest. Foreground
+        // readers blocked by this acquisition appear as a per-second
+        // dip aligned with flush completion.
+        const SLOW_MANIFEST_WRITE_LOCK_THRESHOLD: std::time::Duration =
+            std::time::Duration::from_millis(1);
+        #[allow(clippy::disallowed_methods)]
+        let acquire_start = tokio::time::Instant::now();
         let mut guard = self.db.state.write();
+        let acquire_elapsed = acquire_start.elapsed();
+        #[allow(clippy::disallowed_methods)]
+        let work_start = tokio::time::Instant::now();
         let manifest = guard.modify(|modifier| {
             for uploaded in staged_batch {
                 let uploaded_tracker = uploaded.imm_memtable.sequence_tracker();
@@ -518,7 +531,18 @@ impl ManifestWriterHandler {
             Ok(modifier.state.manifest.clone())
         })?;
 
+        let work_elapsed = work_start.elapsed();
         drop(guard);
+        if acquire_elapsed > SLOW_MANIFEST_WRITE_LOCK_THRESHOLD
+            || work_elapsed > SLOW_MANIFEST_WRITE_LOCK_THRESHOLD
+        {
+            warn!(
+                "slow state.write() in apply_uploaded_state: acquire={:?}, work={:?}, batch_size={}",
+                acquire_elapsed,
+                work_elapsed,
+                staged_batch.len(),
+            );
+        }
         self.db.status_manager.report_manifest(manifest.into());
         Ok(())
     }

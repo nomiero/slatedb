@@ -1,3 +1,4 @@
+use log::warn;
 use parking_lot::RwLockWriteGuard;
 
 use crate::db::DbInner;
@@ -8,10 +9,24 @@ use crate::wal_replay::ReplayedMemtable;
 
 pub(crate) const MAX_WAL_FLUSHES_BEFORE_L0_FLUSH: u64 = 4096;
 
+/// Threshold above which `state.write()` acquisition + held-time gets
+/// logged. Set on the high side (1 ms) since this is per-batch and we
+/// don't want chatter; the dips we're hunting are tens of ms.
+const SLOW_STATE_WRITE_LOCK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(1);
+
 impl DbInner {
     pub(crate) fn maybe_freeze_current_memtable(&self) -> Result<(), SlateDBError> {
         let wal_id = self.wal_buffer.recent_flushed_wal_id();
+        // Slow-path tracing: time both the lock acquire and the work
+        // done while holding it. Per-batch on the writer task; if held
+        // long, every concurrent reader pays for it via state.read()
+        // contention.
+        #[allow(clippy::disallowed_methods)]
+        let acquire_start = tokio::time::Instant::now();
         let mut guard = self.state.write();
+        let acquire_elapsed = acquire_start.elapsed();
+        #[allow(clippy::disallowed_methods)]
+        let work_start = tokio::time::Instant::now();
         let meta = guard.memtable().metadata();
 
         let last_freeze_wal_id = guard
@@ -29,13 +44,23 @@ impl DbInner {
             .checked_sub(last_freeze_wal_id)
             .ok_or_else(|| SlateDBError::InvalidDBState)?;
 
-        if wal_id_gap < MAX_WAL_FLUSHES_BEFORE_L0_FLUSH
+        let result = if wal_id_gap < MAX_WAL_FLUSHES_BEFORE_L0_FLUSH
             && l0_sst_size_est < self.settings.l0_sst_size_bytes
         {
             Ok(())
         } else {
             self.freeze_memtable(&mut guard, wal_id)
+        };
+        let work_elapsed = work_start.elapsed();
+        if acquire_elapsed > SLOW_STATE_WRITE_LOCK_THRESHOLD
+            || work_elapsed > SLOW_STATE_WRITE_LOCK_THRESHOLD
+        {
+            warn!(
+                "slow state.write() in maybe_freeze_current_memtable: acquire={:?}, work={:?}, l0_size_est={}",
+                acquire_elapsed, work_elapsed, l0_sst_size_est,
+            );
         }
+        result
     }
 
     pub(crate) fn freeze_current_memtable(&self) -> Result<(), SlateDBError> {

@@ -281,7 +281,25 @@ impl DbInner {
         options: &ScanOptions,
     ) -> Result<RecencyPrefixIterator, SlateDBError> {
         self.check_closed()?;
+        // Slow-path tracing: time the `state.read()` acquisition. If a
+        // background writer is holding `state.write()` (e.g.
+        // memtable_flusher publishing a flushed L0, compactor writing
+        // a new manifest, or the writer task running
+        // maybe_freeze_current_memtable), readers block here. Logging
+        // any slow acquire pinpoints reader-side stalls during
+        // foreground reads.
+        const SLOW_READER_LOCK_THRESHOLD: std::time::Duration =
+            std::time::Duration::from_millis(1);
+        #[allow(clippy::disallowed_methods)]
+        let lock_start = tokio::time::Instant::now();
         let db_state = self.state.read().view();
+        let lock_elapsed = lock_start.elapsed();
+        if lock_elapsed > SLOW_READER_LOCK_THRESHOLD {
+            warn!(
+                "slow read path: state.read() acquisition for scan_prefix_by_recency took {:?}",
+                lock_elapsed
+            );
+        }
         self.reader
             .scan_prefix_by_recency(prefix, options, &db_state, None, None)
             .await
