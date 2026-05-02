@@ -17,6 +17,7 @@ use log::{debug, info};
 use crate::compactions_store::{CompactionsStore, FenceableCompactions, StoredCompactions};
 use crate::compactor_state::{CompactionStatus, CompactorState, VersionedCompactions};
 use crate::config::{CheckpointOptions, CompactorOptions};
+use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
 use crate::manifest::store::{FenceableManifest, ManifestStore, StoredManifest};
 use crate::manifest::VersionedManifest;
@@ -112,6 +113,12 @@ pub(crate) struct CompactorStateWriter {
     compactions: FenceableCompactions,
     /// RNG for checkpoint ids.
     rand: Arc<DbRand>,
+    /// Optional handle to slatedb's DbStats. When present, every
+    /// `manifest.update()` here records into the same
+    /// manifest_update_count / manifest_update_micros_total counters
+    /// the memtable-flusher path uses, so the bencher chart sees
+    /// total manifest commit time across both writers.
+    db_stats: Option<DbStats>,
 }
 
 impl CompactorStateWriter {
@@ -132,6 +139,7 @@ impl CompactorStateWriter {
         system_clock: Arc<dyn SystemClock>,
         options: &CompactorOptions,
         rand: Arc<DbRand>,
+        db_stats: Option<DbStats>,
     ) -> Result<Self, SlateDBError> {
         let stored_manifest =
             StoredManifest::load(manifest_store.clone(), system_clock.clone()).await?;
@@ -161,6 +169,7 @@ impl CompactorStateWriter {
             manifest,
             compactions,
             rand,
+            db_stats,
         })
     }
 
@@ -256,7 +265,15 @@ impl CompactorStateWriter {
         self.state
             .merge_remote_manifest(self.manifest.prepare_dirty()?);
         let dirty = self.state.manifest().clone();
-        self.manifest.update(dirty).await
+        #[allow(clippy::disallowed_methods)]
+        let start = tokio::time::Instant::now();
+        let result = self.manifest.update(dirty).await;
+        let micros = start.elapsed().as_micros() as u64;
+        if let Some(stats) = self.db_stats.as_ref() {
+            stats.manifest_update_count.increment(1);
+            stats.manifest_update_micros_total.increment(micros);
+        }
+        result
     }
 
     /// Writes the manifest, retrying on version conflicts by reloading and retrying.
@@ -373,6 +390,7 @@ mod tests {
             system_clock.clone(),
             &options,
             Arc::clone(&rand),
+            None,
         )
         .await
         .unwrap();
@@ -383,6 +401,7 @@ mod tests {
             system_clock,
             &options,
             rand,
+            None,
         )
         .await
         .unwrap();
@@ -481,6 +500,7 @@ mod tests {
             system_clock,
             &options,
             rand,
+            None,
         )
         .await
         .unwrap();
@@ -552,6 +572,7 @@ mod tests {
             system_clock,
             &options,
             rand,
+            None,
         )
         .await
         .unwrap();
@@ -637,6 +658,7 @@ mod tests {
             system_clock,
             &options,
             rand,
+            None,
         )
         .await
         .unwrap();
@@ -680,6 +702,7 @@ mod tests {
             system_clock,
             &options,
             rand,
+            None,
         )
         .await
         .unwrap();
@@ -735,6 +758,7 @@ mod tests {
             system_clock,
             &options,
             rand,
+            None,
         )
         .await
         .unwrap();
@@ -803,6 +827,7 @@ mod tests {
             system_clock,
             &options,
             rand,
+            None,
         )
         .await
         .unwrap();

@@ -533,6 +533,12 @@ impl ManifestWriterHandler {
 
         let work_elapsed = work_start.elapsed();
         drop(guard);
+        let total_elapsed = acquire_elapsed + work_elapsed;
+        self.db.db_stats.state_write_acquisitions.increment(1);
+        self.db
+            .db_stats
+            .state_write_held_micros_total
+            .increment(total_elapsed.as_micros() as u64);
         if acquire_elapsed > SLOW_MANIFEST_WRITE_LOCK_THRESHOLD
             || work_elapsed > SLOW_MANIFEST_WRITE_LOCK_THRESHOLD
         {
@@ -574,7 +580,12 @@ impl ManifestWriterHandler {
             dirty.value.core.checkpoints.push(checkpoint);
             checkpoint_results.push(CheckpointCreateResult { id, manifest_id });
         }
+        #[allow(clippy::disallowed_methods)]
+        let start = tokio::time::Instant::now();
         self.manifest.update(dirty).await?;
+        let micros = start.elapsed().as_micros() as u64;
+        self.db.db_stats.manifest_update_count.increment(1);
+        self.db.db_stats.manifest_update_micros_total.increment(micros);
         Ok(checkpoint_results)
     }
 
@@ -591,7 +602,12 @@ impl ManifestWriterHandler {
 
     async fn write_current_manifest(&mut self) -> Result<(), SlateDBError> {
         let dirty = self.clone_local_manifest_for_write();
+        #[allow(clippy::disallowed_methods)]
+        let start = tokio::time::Instant::now();
         self.manifest.update(dirty.clone()).await?;
+        let micros = start.elapsed().as_micros() as u64;
+        self.db.db_stats.manifest_update_count.increment(1);
+        self.db.db_stats.manifest_update_micros_total.increment(micros);
         self.db.status_manager.report_manifest(dirty.into());
         Ok(())
     }

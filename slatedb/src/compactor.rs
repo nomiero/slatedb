@@ -279,6 +279,10 @@ pub struct Compactor {
     compactor_runtime: Handle,
     rand: Arc<DbRand>,
     stats: Arc<CompactionStats>,
+    /// Handle to the shared slatedb.db.* counters so the compactor's
+    /// manifest commits feed the same `manifest_update_*` metrics as
+    /// memtable flushes.
+    db_stats: crate::db_stats::DbStats,
     system_clock: Arc<dyn SystemClock>,
     merge_operator: Option<MergeOperatorType>,
     #[cfg(feature = "compaction_filters")]
@@ -304,6 +308,14 @@ impl Compactor {
         >,
     ) -> Self {
         let stats = Arc::new(CompactionStats::new(recorder));
+        // Register a handle to the slatedb.db.* counters so the
+        // compactor can record into the shared `manifest_update_*`
+        // metrics (same names registered by `DbInner::db_stats`).
+        // The recorder dedupes by name+labels, so both
+        // registrations point at the same underlying counter and the
+        // bencher chart sees total manifest commit time across the
+        // memtable-flusher and compactor paths.
+        let db_stats = crate::db_stats::DbStats::new(recorder);
         let task_executor = Arc::new(MessageHandlerExecutor::new(
             closed_result,
             system_clock.clone(),
@@ -318,6 +330,7 @@ impl Compactor {
             compactor_runtime,
             rand,
             stats,
+            db_stats,
             system_clock,
             merge_operator,
             #[cfg(feature = "compaction_filters")]
@@ -359,6 +372,7 @@ impl Compactor {
             executor,
             self.rand.clone(),
             self.stats.clone(),
+            self.db_stats.clone(),
             self.system_clock.clone(),
         )
         .await?;
@@ -512,6 +526,7 @@ impl CompactorEventHandler {
         executor: Arc<dyn CompactionExecutor + Send + Sync>,
         rand: Arc<DbRand>,
         stats: Arc<CompactionStats>,
+        db_stats: crate::db_stats::DbStats,
         system_clock: Arc<dyn SystemClock>,
     ) -> Result<Self, SlateDBError> {
         let state_writer = CompactorStateWriter::new(
@@ -520,6 +535,7 @@ impl CompactorEventHandler {
             system_clock.clone(),
             options.as_ref(),
             rand.clone(),
+            Some(db_stats),
         )
         .await?;
         let compactor_epoch = state_writer.state.manifest().value.compactor_epoch;
@@ -3106,6 +3122,7 @@ mod tests {
                 slatedb_common::metrics::MetricLevel::default(),
             );
             let compactor_stats = Arc::new(CompactionStats::new(&recorder));
+            let compactor_db_stats = crate::db_stats::DbStats::new(&recorder);
             let real_executor = Arc::new(TokioCompactionExecutor::new(
                 TokioCompactionExecutorOptions {
                     handle: Handle::current(),
@@ -3129,6 +3146,7 @@ mod tests {
                 executor.clone(),
                 rand.clone(),
                 compactor_stats.clone(),
+                compactor_db_stats,
                 Arc::new(DefaultSystemClock::new()),
             )
             .await
@@ -3670,6 +3688,7 @@ mod tests {
         let rand = Arc::new(DbRand::default());
         let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
         let compactor_stats = Arc::new(CompactionStats::new(&recorder));
+        let compactor_db_stats = crate::db_stats::DbStats::new(&recorder);
         let mut handler = CompactorEventHandler::new(
             manifest_store,
             compactions_store.clone(),
@@ -3678,6 +3697,7 @@ mod tests {
             executor.clone(),
             rand,
             compactor_stats,
+            compactor_db_stats,
             system_clock,
         )
         .await

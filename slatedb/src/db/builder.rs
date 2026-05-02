@@ -1172,6 +1172,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         let (tx, rx) = async_channel::unbounded();
         let scheduler = Arc::from(scheduler_supplier.compaction_scheduler(&options));
         let stats = Arc::new(CompactionStats::new(&self.recorder));
+        let db_stats = crate::db_stats::DbStats::new(&self.recorder);
         let executor = Arc::new(TokioCompactionExecutor::new(
             TokioCompactionExecutorOptions {
                 handle,
@@ -1195,6 +1196,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             executor,
             self.rand,
             stats,
+            db_stats,
             self.system_clock,
         )
         .await?;
