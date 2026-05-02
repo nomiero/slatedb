@@ -355,15 +355,56 @@ impl DbInner {
             done: tx,
         };
 
+        // Slow-path tracing: log any phase of the write that takes
+        // longer than `SLOW_WRITE_PHASE_THRESHOLD`. Wraps each phase in
+        // a discrete timer so we can attribute tail latency precisely
+        // (caller-side backpressure vs writer-task vs durable wait).
+        // Timing instrumentation deliberately uses `tokio::time::Instant`
+        // directly. The `SystemClock` abstraction (mockable for tests)
+        // would route every elapsed-time computation through chrono
+        // `DateTime<Utc>` arithmetic; this is debug-only diagnostics
+        // that fires only on the slow path, so the disallowed-methods
+        // lint is suppressed locally.
+        const SLOW_WRITE_PHASE_THRESHOLD: std::time::Duration =
+            std::time::Duration::from_millis(50);
+
+        #[allow(clippy::disallowed_methods)]
+        let phase_start = tokio::time::Instant::now();
         self.maybe_apply_backpressure().await?;
+        let backpressure_elapsed = phase_start.elapsed();
+        if backpressure_elapsed > SLOW_WRITE_PHASE_THRESHOLD {
+            warn!(
+                "slow write phase: maybe_apply_backpressure took {:?}",
+                backpressure_elapsed
+            );
+        }
+
         self.write_notifier.send(batch_msg)?;
 
         // TODO: this can be modified as awaiting the last_durable_seq watermark & fatal error.
 
+        #[allow(clippy::disallowed_methods)]
+        let phase_start = tokio::time::Instant::now();
         let (write_handle, mut durable_watcher) = rx.await??;
+        let writer_task_elapsed = phase_start.elapsed();
+        if writer_task_elapsed > SLOW_WRITE_PHASE_THRESHOLD {
+            warn!(
+                "slow write phase: writer-task round-trip (channel send -> oneshot recv) took {:?}",
+                writer_task_elapsed
+            );
+        }
 
         if options.await_durable {
+            #[allow(clippy::disallowed_methods)]
+            let phase_start = tokio::time::Instant::now();
             durable_watcher.await_value().await?;
+            let durable_elapsed = phase_start.elapsed();
+            if durable_elapsed > SLOW_WRITE_PHASE_THRESHOLD {
+                warn!(
+                    "slow write phase: durable_watcher took {:?}",
+                    durable_elapsed
+                );
+            }
         }
 
         Ok(write_handle)

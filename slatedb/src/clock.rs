@@ -18,7 +18,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use crate::error::SlateDBError;
-use log::debug;
+use log::warn;
 use slatedb_common::clock::SystemClock;
 use std::{
     cmp,
@@ -64,7 +64,12 @@ impl MonotonicClock {
                 next_tick: _,
             }) => {
                 let sync_millis = cmp::min(10_000, 2 * (last_tick - tick).unsigned_abs());
-                debug!(
+                // Promoted from debug! to warn! while diagnosing tail
+                // latency: this sleep is on the synchronous write path
+                // (called from `write_batch`), so even occasional firings
+                // contribute to fat-tail behavior. Revert if it gets
+                // too noisy in production.
+                warn!(
                     "Clock tick {} is lagging behind the last known tick {}. \
                     Sleeping {}ms to potentially resolve skew before returning InvalidClockTick.",
                     tick, last_tick, sync_millis
