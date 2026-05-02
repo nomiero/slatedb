@@ -34,6 +34,24 @@ struct IteratorSources {
     sr_iters: VecDeque<Box<dyn RowEntryIterator + 'static>>,
 }
 
+/// Controls how on-disk source iterators (L0 SSTs, sorted-run sub-SSTs)
+/// are constructed for a scan.
+#[derive(Clone, Copy, Debug)]
+enum IteratorBuildMode {
+    /// Initialize each iterator concurrently during construction. The
+    /// filter is checked, the index is loaded, and a block is
+    /// pre-fetched up front. Appropriate for range scans where every
+    /// source will be merged and consumed.
+    Eager,
+    /// Construct iterators without initializing them. Filter checks
+    /// and index/block reads happen lazily, only when the consumer
+    /// first iterates over each source. Appropriate for recency-based
+    /// scans that walk sources newest-first and stop at the first hit;
+    /// eager init would pay for I/O on sources the consumer never
+    /// reaches.
+    Lazy,
+}
+
 /// Context for [`Reader::scan_with_options`].
 ///
 /// Groups the state each scan needs from its caller.
@@ -139,6 +157,7 @@ impl Reader {
         write_batch_iter: Option<WriteBatchIterator>,
         sst_iter_options: &SstIteratorOptions,
         point_lookup_stats: Option<DbStats>,
+        mode: IteratorBuildMode,
     ) -> Result<IteratorSources, SlateDBError> {
         let mut memtables = VecDeque::new();
         memtables.push_back(db_state.memtable());
@@ -160,6 +179,9 @@ impl Reader {
         );
 
         let (l0_iters, sr_iters) = if let Some(point_key) = range.as_point() {
+            // Point-style construction is already lazy: filters are
+            // evaluated and inner iterators init'd only when each
+            // source is first iterated. Mode is irrelevant here.
             let l0 = self.build_point_l0_iters(
                 range,
                 db_state,
@@ -175,12 +197,24 @@ impl Reader {
             )?;
             (l0, sr)
         } else {
-            let l0_future =
-                self.build_range_l0_iters(range, db_state, sst_iter_options, max_parallel);
-            let sr_future =
-                self.build_range_sr_iters(range, db_state, sst_iter_options, max_parallel);
-            let (l0_res, sr_res) = join(l0_future, sr_future).await;
-            (l0_res?, sr_res?)
+            match mode {
+                IteratorBuildMode::Eager => {
+                    let l0_future = self
+                        .build_range_l0_iters(range, db_state, sst_iter_options, max_parallel);
+                    let sr_future = self
+                        .build_range_sr_iters(range, db_state, sst_iter_options, max_parallel);
+                    let (l0_res, sr_res) = join(l0_future, sr_future).await;
+                    (l0_res?, sr_res?)
+                }
+                IteratorBuildMode::Lazy => {
+                    let l0 =
+                        self.build_lazy_range_l0_iters(range, db_state, sst_iter_options)?;
+                    let sr = self
+                        .build_lazy_range_sr_iters(range, db_state, sst_iter_options)
+                        .await?;
+                    (l0, sr)
+                }
+            }
         };
 
         Ok(IteratorSources {
@@ -309,6 +343,67 @@ impl Reader {
         .await
     }
 
+    /// Lazy counterpart to [`Self::build_range_l0_iters`]. Constructs
+    /// each L0's `SstIterator` without initializing it - filter checks
+    /// and the first block fetch happen only when the consumer pulls
+    /// from the iterator. Used by the recency-based prefix scan, which
+    /// stops at the first source that yields a row and so should not
+    /// pay for I/O on later sources up front.
+    fn build_lazy_range_l0_iters<'a>(
+        &self,
+        range: &BytesRange,
+        db_state: &(dyn DbStateReader + Sync),
+        sst_iter_options: &SstIteratorOptions,
+    ) -> Result<VecDeque<Box<dyn RowEntryIterator + 'a>>, SlateDBError> {
+        let mut iters = VecDeque::new();
+        for sst in db_state.core().tree.l0.iter().cloned() {
+            let iterator = SstIterator::new_owned_with_stats(
+                range.clone(),
+                sst,
+                self.table_store.clone(),
+                sst_iter_options.clone(),
+                Some(self.db_stats.clone()),
+            )?;
+            if let Some(iterator) = iterator {
+                iters.push_back(Box::new(iterator) as Box<dyn RowEntryIterator + 'a>);
+            }
+        }
+        Ok(iters)
+    }
+
+    /// Lazy counterpart to [`Self::build_range_sr_iters`]. The
+    /// underlying `SortedRunIterator::new_owned` constructs the run's
+    /// first sub-SST iterator but does not init it; init (and
+    /// therefore the filter check / index load / block fetch) happens
+    /// only when the consumer first calls into the iterator.
+    async fn build_lazy_range_sr_iters<'a>(
+        &self,
+        range: &BytesRange,
+        db_state: &(dyn DbStateReader + Sync),
+        sst_iter_options: &SstIteratorOptions,
+    ) -> Result<VecDeque<Box<dyn RowEntryIterator + 'a>>, SlateDBError> {
+        let mut iters = VecDeque::new();
+        for sr in db_state
+            .core()
+            .tree
+            .compacted
+            .iter()
+            .filter(|sr| sr.overlaps_range(range))
+            .cloned()
+        {
+            let iter = SortedRunIterator::new_owned(
+                range.clone(),
+                sr,
+                self.table_store.clone(),
+                sst_iter_options.clone(),
+                Some(self.db_stats.clone()),
+            )
+            .await?;
+            iters.push_back(Box::new(iter) as Box<dyn RowEntryIterator + 'a>);
+        }
+        Ok(iters)
+    }
+
     /// Get the full row entry for the given key.
     ///
     /// Returns `Ok(Some(entry))` if a non-expired, non-tombstone entry exists
@@ -360,6 +455,10 @@ impl Reader {
                 write_batch_iter,
                 &sst_iter_options,
                 Some(self.db_stats.clone()),
+                // Point reads always go through the lazy point-style
+                // build path (see `range.as_point()` branch); this
+                // mode is just a placeholder for the range path.
+                IteratorBuildMode::Lazy,
             )
             .await?;
 
@@ -434,6 +533,10 @@ impl Reader {
                 ctx.write_batch_iter,
                 &sst_iter_options,
                 None,
+                // Range scans merge across every source, so eager init
+                // (parallel filter-check + first-block prefetch) is the
+                // right tradeoff: every source will be consumed.
+                IteratorBuildMode::Eager,
             )
             .await?;
 
@@ -500,6 +603,14 @@ impl Reader {
                 write_batch_iter,
                 &sst_iter_options,
                 None,
+                // Recency-based scans walk sources newest-first and
+                // stop at the first hit. Eager init would pre-fetch a
+                // data block on every filter-positive source even when
+                // only the first one is consumed - the dominant cause
+                // of I/Os-per-scan inflation as the LSM grows. Lazy
+                // construction defers the filter check + first-block
+                // fetch until the recency walk reaches each source.
+                IteratorBuildMode::Lazy,
             )
             .await?;
 
