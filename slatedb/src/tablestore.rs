@@ -890,12 +890,23 @@ impl EncodedSsTableWriter<'_> {
                 version: None,
             };
             let attrs = object_store::Attributes::new();
+            #[allow(clippy::disallowed_methods)]
+            let commit_start = tokio::time::Instant::now();
             if let Err(e) = tee.commit(&head_meta, &attrs).await {
                 warn!(
                     "cache pre-warm tee commit failed [path={}, error={:?}]",
                     self.sst_path, e
                 );
             }
+            // Trace the moment the tee finishes writing to disk. Pair with
+            // the `publishing l0 SST` / compactor manifest-write events to
+            // detect any window where a new SST is reader-visible before
+            // its cache files are renamed into place.
+            log::info!(
+                "table_writer close: tee committed [path={}, took={:?}]",
+                self.sst_path,
+                commit_start.elapsed(),
+            );
         }
 
         // Pre-warm the meta cache before returning the handle. Compaction

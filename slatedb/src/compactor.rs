@@ -980,9 +980,26 @@ impl CompactorEventHandler {
         id: Ulid,
         output_sr: SortedRun,
     ) -> Result<(), SlateDBError> {
+        // Trace the moment a finished compaction is about to be applied
+        // to compactor state and persisted. The output SST IDs are
+        // logged so we can correlate with `cache fall-through` warns
+        // for the same path.
+        let output_ids: Vec<_> = output_sr
+            .sst_views
+            .iter()
+            .map(|v| v.sst.id)
+            .collect();
+        info!(
+            "finish_compaction: applying [id={}, outputs={:?}]",
+            id, output_ids
+        );
         self.state_mut().finish_compaction(id, output_sr);
         self.log_compaction_state();
         self.state_writer.write_state_safely().await?;
+        info!(
+            "finish_compaction: manifest persisted [id={}, outputs={:?}]",
+            id, output_ids
+        );
         self.maybe_schedule_compactions().await?;
         self.maybe_start_compactions().await?;
         self.stats
