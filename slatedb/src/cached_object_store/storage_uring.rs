@@ -134,6 +134,10 @@ enum InFlight {
         requested_offset_in_buf: usize,
         requested_len: usize,
         sender: oneshot::Sender<object_store::Result<Bytes>>,
+        // Worker-side timestamp at SQE submission. Used to record
+        // observed read latency into the adaptive pacing controller
+        // when the CQE arrives.
+        submitted_at: std::time::Instant,
     },
     Write {
         // Bytes the kernel reads from. Either a Bytes payload (buffered) or
@@ -177,7 +181,6 @@ struct PacedWrite {
     bytes: Bytes,
     total_len: usize,
     chunk_bytes: usize,
-    pause: std::time::Duration,
     /// Offset of the next chunk to submit. When `next_offset_to_submit
     /// == total_len`, all chunks are submitted; we still need the last
     /// CQE before finalizing.
@@ -186,6 +189,78 @@ struct PacedWrite {
     /// successful rename, Err on any chunk failure.
     sender: oneshot::Sender<object_store::Result<()>>,
     failed: Option<object_store::Error>,
+}
+
+/// Adaptive pacing controller. Tracks recent read latencies and
+/// scales the inter-chunk pause around the configured base value so
+/// writes back off when foreground reads tail-spike and speed up
+/// when the device is idle. Roughly mirrors RocksDB's `auto_tuned`
+/// rate limiter, but driven by observed read p99 instead of write
+/// throughput.
+struct PacingController {
+    /// Base pause between chunks; the multiplier scales around this.
+    base_pause: std::time::Duration,
+    /// Target foreground read p99 in microseconds. Pause scales up
+    /// when measured p99 exceeds this, down when below.
+    target_read_p99_us: u64,
+    /// Sliding window of recent read completions: `(completion_time,
+    /// latency_us)`. Trimmed on insert to drop entries older than
+    /// `window`.
+    read_window: std::collections::VecDeque<(std::time::Instant, u64)>,
+    window: std::time::Duration,
+}
+
+impl PacingController {
+    fn new(base_pause: std::time::Duration, target_read_p99_us: u64) -> Self {
+        Self {
+            base_pause,
+            target_read_p99_us,
+            read_window: std::collections::VecDeque::with_capacity(2048),
+            window: std::time::Duration::from_secs(1),
+        }
+    }
+
+    fn record_read(&mut self, latency_us: u64) {
+        let now = std::time::Instant::now();
+        self.read_window.push_back((now, latency_us));
+        let cutoff = now.checked_sub(self.window);
+        if let Some(cutoff) = cutoff {
+            while let Some((t, _)) = self.read_window.front() {
+                if *t < cutoff {
+                    self.read_window.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn current_p99_us(&self) -> u64 {
+        if self.read_window.is_empty() {
+            return 0;
+        }
+        let mut latencies: Vec<u64> = self.read_window.iter().map(|(_, l)| *l).collect();
+        latencies.sort_unstable();
+        let idx = ((latencies.len() * 99) / 100).min(latencies.len() - 1);
+        latencies[idx]
+    }
+
+    /// How long to wait before the next chunk. Multiplier is clamped
+    /// to `[0.25, 4.0]` so the rate can't run away in either direction.
+    /// Without enough samples (< 32) we fall back to the base.
+    fn next_pause(&self) -> std::time::Duration {
+        if self.read_window.len() < 32 || self.target_read_p99_us == 0 {
+            return self.base_pause;
+        }
+        let p99 = self.current_p99_us();
+        if p99 == 0 {
+            return self.base_pause;
+        }
+        let ratio = p99 as f64 / self.target_read_p99_us as f64;
+        let multiplier = ratio.clamp(0.25, 4.0);
+        let micros = (self.base_pause.as_micros() as f64 * multiplier) as u64;
+        std::time::Duration::from_micros(micros)
+    }
 }
 
 // The held buffer is never read on the Rust side, but the kernel reads from
@@ -314,10 +389,21 @@ fn run_worker(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let pacing_enabled = chunk_bytes > 0 && pause_us > 0;
+    // Adaptive: target foreground read p99 in microseconds. The pause
+    // scales around `pause_us` based on observed p99: faster when reads
+    // are quick, slower when they tail-spike. 0 disables adaptation.
+    let target_read_p99_us: u64 = std::env::var("SLATEDB_CACHE_TARGET_READ_P99_US")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5_000);
+    let mut pacing_controller = PacingController::new(
+        std::time::Duration::from_micros(pause_us),
+        target_read_p99_us,
+    );
     if pacing_enabled && worker_idx == 0 {
         info!(
-            "io_uring write pacing enabled [chunk_bytes={}, pause_us={}]",
-            chunk_bytes, pause_us
+            "io_uring write pacing enabled [chunk_bytes={}, base_pause_us={}, target_read_p99_us={}]",
+            chunk_bytes, pause_us, target_read_p99_us
         );
     }
 
@@ -424,6 +510,7 @@ fn run_worker(
                                 requested_offset_in_buf: head_pad,
                                 requested_len: len,
                                 sender,
+                                submitted_at: std::time::Instant::now(),
                             },
                         );
                     } else {
@@ -450,6 +537,7 @@ fn run_worker(
                                 requested_offset_in_buf: 0,
                                 requested_len: len,
                                 sender,
+                                submitted_at: std::time::Instant::now(),
                             },
                         );
                     }
@@ -503,7 +591,6 @@ fn run_worker(
                                 total_len: bytes.len(),
                                 bytes,
                                 chunk_bytes,
-                                pause: std::time::Duration::from_micros(pause_us),
                                 next_offset_to_submit: 0,
                                 sender,
                                 failed: None,
@@ -676,6 +763,7 @@ fn run_worker(
                         result,
                         &mut paced_writes,
                         &mut delayed_chunks,
+                        &pacing_controller,
                     );
                     continue;
                 }
@@ -698,7 +786,14 @@ fn run_worker(
                     requested_offset_in_buf,
                     requested_len,
                     sender,
+                    submitted_at,
                 }) => {
+                    // Feed observed read latency into the adaptive
+                    // pacing controller before doing anything else with
+                    // the buffer; pacing wants prompt signal even if
+                    // the result is an error.
+                    let lat_us = submitted_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                    pacing_controller.record_read(lat_us);
                     if result < 0 {
                         let _ = sender.send(Err(wrap_io_err(std::io::Error::from_raw_os_error(
                             -result,
@@ -794,14 +889,16 @@ fn run_worker(
 
 /// Handle a CQE for one chunk of a paced write. Updates the matching
 /// `PacedWrite` state and either schedules the next chunk after the
-/// configured pause or finalizes the write (close + rename + signal
-/// the user oneshot). On error, finalizes early with the error.
+/// adaptive pause (from the controller) or finalizes the write (close
+/// + rename + signal the user oneshot). On error, finalizes early
+/// with the error.
 fn handle_paced_chunk_completion(
     paced_write_id: u64,
     chunk_len: usize,
     cqe_result: i32,
     paced_writes: &mut HashMap<u64, PacedWrite>,
     delayed_chunks: &mut Vec<(std::time::Instant, u64)>,
+    pacing_controller: &PacingController,
 ) {
     let Some(pw) = paced_writes.get_mut(&paced_write_id) else {
         return;
@@ -819,9 +916,10 @@ fn handle_paced_chunk_completion(
     }
 
     // Still have more chunks to submit and no failure: schedule next chunk
-    // after the pause.
+    // after the adaptive pause. Recomputed each chunk so transient read
+    // p99 spikes immediately throttle subsequent chunks.
     if pw.failed.is_none() && pw.next_offset_to_submit < pw.total_len {
-        let deadline = std::time::Instant::now() + pw.pause;
+        let deadline = std::time::Instant::now() + pacing_controller.next_pause();
         delayed_chunks.push((deadline, paced_write_id));
         return;
     }
