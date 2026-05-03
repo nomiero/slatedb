@@ -17,47 +17,70 @@ const SLOW_STATE_WRITE_LOCK_THRESHOLD: std::time::Duration = std::time::Duration
 impl DbInner {
     pub(crate) fn maybe_freeze_current_memtable(&self) -> Result<(), SlateDBError> {
         let wal_id = self.wal_buffer.recent_flushed_wal_id();
-        // Slow-path tracing: time both the lock acquire and the work
-        // done while holding it. Per-batch on the writer task; if held
-        // long, every concurrent reader pays for it via state.read()
-        // contention.
+
+        // Double-check pattern: take `state.read()` first to evaluate
+        // the freeze condition, escalate to `state.write()` only when
+        // we actually need to freeze. parking_lot::RwLock is *fair*,
+        // so a writer acquisition queues all incoming readers behind
+        // it (writer-preference is what prevents writer starvation).
+        // This function used to take `state.write()` unconditionally
+        // on every `write_batch` call (50+/sec at typical workloads),
+        // and even though the work inside the lock is cheap, the
+        // queuing it caused was visible as multi-millisecond stalls
+        // in `scan_prefix_by_recency`'s `state.read()` acquisition.
+        //
+        // The check itself is read-only: estimating encoded SST size
+        // and looking at imm_memtable / replay_after_wal_id needs no
+        // mutation. `freeze_memtable` is idempotent (returns early on
+        // empty memtable), so even if another writer races ahead and
+        // freezes the same memtable between our read-check and our
+        // subsequent write, the second freeze is a no-op.
+        let needs_freeze = {
+            let guard = self.state.read();
+            let meta = guard.memtable().metadata();
+            let last_freeze_wal_id = guard
+                .state()
+                .imm_memtable
+                .front()
+                .map(|imm| imm.recent_flushed_wal_id())
+                .unwrap_or(guard.state().core().replay_after_wal_id);
+            let l0_sst_size_est = self
+                .table_store
+                .estimate_encoded_size_compacted(meta.entry_num, meta.entries_size_in_bytes);
+            let wal_id_gap = wal_id
+                .checked_sub(last_freeze_wal_id)
+                .ok_or_else(|| SlateDBError::InvalidDBState)?;
+            wal_id_gap >= MAX_WAL_FLUSHES_BEFORE_L0_FLUSH
+                || l0_sst_size_est >= self.settings.l0_sst_size_bytes
+        };
+
+        if !needs_freeze {
+            return Ok(());
+        }
+
+        // Slow path: actually freeze. Time the write acquisition +
+        // work so the existing slow-state-write trace still surfaces
+        // pathological cases (e.g. the freeze itself blocking on a
+        // saturated flush queue).
         #[allow(clippy::disallowed_methods)]
         let acquire_start = tokio::time::Instant::now();
         let mut guard = self.state.write();
         let acquire_elapsed = acquire_start.elapsed();
         #[allow(clippy::disallowed_methods)]
         let work_start = tokio::time::Instant::now();
-        let meta = guard.memtable().metadata();
-
-        let last_freeze_wal_id = guard
-            .state()
-            .imm_memtable
-            .front()
-            .map(|imm| imm.recent_flushed_wal_id())
-            .unwrap_or(guard.state().core().replay_after_wal_id);
-
-        let l0_sst_size_est = self
-            .table_store
-            .estimate_encoded_size_compacted(meta.entry_num, meta.entries_size_in_bytes);
-
-        let wal_id_gap = wal_id
-            .checked_sub(last_freeze_wal_id)
-            .ok_or_else(|| SlateDBError::InvalidDBState)?;
-
-        let result = if wal_id_gap < MAX_WAL_FLUSHES_BEFORE_L0_FLUSH
-            && l0_sst_size_est < self.settings.l0_sst_size_bytes
-        {
-            Ok(())
-        } else {
-            self.freeze_memtable(&mut guard, wal_id)
-        };
+        let result = self.freeze_memtable(&mut guard, wal_id);
         let work_elapsed = work_start.elapsed();
+        let total_micros = (acquire_elapsed + work_elapsed).as_micros() as u64;
+        self.db_stats.state_write_acquisitions.increment(1);
+        self.db_stats
+            .state_write_held_micros_total
+            .increment(total_micros);
         if acquire_elapsed > SLOW_STATE_WRITE_LOCK_THRESHOLD
             || work_elapsed > SLOW_STATE_WRITE_LOCK_THRESHOLD
         {
             warn!(
-                "slow state.write() in maybe_freeze_current_memtable: acquire={:?}, work={:?}, l0_size_est={}",
-                acquire_elapsed, work_elapsed, l0_sst_size_est,
+                "slow state.write() in maybe_freeze_current_memtable: acquire={:?}, work={:?}",
+                acquire_elapsed, work_elapsed,
             );
         }
         result
