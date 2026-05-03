@@ -394,45 +394,59 @@ impl CachedObjectStore {
 
         // Then, save to local cache if admission policy allows it
         let Some(cache_location) = self.cache_location_for(location) else {
+            warn!(
+                "cached_put_opts: cache_location_for returned None, skipping cache write [location={}]",
+                location
+            );
             return Ok(result);
         };
         let entry = self
             .cache_storage
             .entry(&cache_location, self.part_size_bytes);
-        if self.admission_picker.pick(entry.as_ref()).admitted() {
-            // Save the head metadata (size, location, etag from the
-            // PUT result) so the next reader's `cached_head` lookup
-            // hits the local cache. Without this, the FIRST reader to
-            // touch a freshly-flushed L0 SST falls through to an S3
-            // HEAD request - and S3 HEAD has a multi-second tail
-            // latency that has been observed stalling reader
-            // throughput for 6+ seconds at compaction start. The
-            // head is tiny (a few hundred bytes); writing it is
-            // negligible cost.
-            //
-            // last_modified is a stub (chrono::Utc::now()): the
-            // cache doesn't use this field for invalidation, only
-            // echoes it back from cached_head(). The upstream
-            // object's real last_modified is filled in lazily the
-            // next time a HEAD goes upstream.
-            let head_meta = ObjectMeta {
-                location: location.clone(),
-                last_modified: chrono::DateTime::<chrono::Utc>::MIN_UTC,
-                size: payload_size,
-                e_tag: result.e_tag.clone(),
-                version: result.version.clone(),
-            };
-            let head_attrs = object_store::Attributes::new();
-            entry
-                .save_head((&head_meta, &head_attrs))
-                .await
-                .ok();
+        if !self.admission_picker.pick(entry.as_ref()).admitted() {
+            warn!(
+                "cached_put_opts: admission_picker rejected, skipping cache write [location={}]",
+                location
+            );
+            return Ok(result);
+        }
 
-            // Convert PutPayload to stream and save parts to cache.
-            let stream = stream::iter(payload.into_iter()).map(Ok::<Bytes, object_store::Error>);
+        // Save the head metadata (size, location, etag from the
+        // PUT result) so the next reader's `cached_head` lookup
+        // hits the local cache. Without this, the FIRST reader to
+        // touch a freshly-flushed L0 SST falls through to an S3
+        // HEAD request - and S3 HEAD has a multi-second tail
+        // latency that has been observed stalling reader
+        // throughput for 6+ seconds at compaction start. The
+        // head is tiny (a few hundred bytes); writing it is
+        // negligible cost.
+        //
+        // last_modified is a stub: the cache doesn't use this
+        // field for invalidation, only echoes it back from
+        // cached_head(). The upstream object's real last_modified
+        // is filled in lazily the next time a HEAD goes upstream.
+        let head_meta = ObjectMeta {
+            location: location.clone(),
+            last_modified: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+            size: payload_size,
+            e_tag: result.e_tag.clone(),
+            version: result.version.clone(),
+        };
+        let head_attrs = object_store::Attributes::new();
+        if let Err(e) = entry.save_head((&head_meta, &head_attrs)).await {
+            warn!(
+                "cached_put_opts: save_head failed [location={}, error={:?}]",
+                location, e
+            );
+        }
 
-            // Save parts only, ignoring errors (cache failures shouldn't fail the PUT operation)
-            self.save_parts_stream(entry, stream, 0).await.ok();
+        // Convert PutPayload to stream and save parts to cache.
+        let stream = stream::iter(payload.into_iter()).map(Ok::<Bytes, object_store::Error>);
+        if let Err(e) = self.save_parts_stream(entry, stream, 0).await {
+            warn!(
+                "cached_put_opts: save_parts_stream failed [location={}, error={:?}]",
+                location, e
+            );
         }
 
         Ok(result)

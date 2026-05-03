@@ -214,7 +214,14 @@ impl TableStore {
         // would churn the cache.
         let cache_tee = match (&self.cached_object_store, &id) {
             (Some(cached), SsTableId::Compacted(_)) if self.prewarm_compacted_on_write => {
-                cached.begin_tee(&path)
+                let tee = cached.begin_tee(&path);
+                if tee.is_none() {
+                    warn!(
+                        "table_writer: begin_tee returned None for compacted SST, no cache pre-warm [id={:?}, path={}]",
+                        id, path
+                    );
+                }
+                tee
             }
             _ => None,
         };
