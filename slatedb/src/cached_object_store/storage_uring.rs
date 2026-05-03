@@ -149,6 +149,43 @@ enum InFlight {
         final_path: std::path::PathBuf,
         sender: oneshot::Sender<object_store::Result<()>>,
     },
+    /// One chunk of a paced write. The actual byte buffer + open file +
+    /// sender live in the [`PacedWrite`] entry keyed by `paced_write_id`
+    /// in the worker's `paced_writes` map. This variant is just a
+    /// bookmark: when the chunk's CQE arrives the worker looks up the
+    /// paced write, marks the chunk completed, and either schedules
+    /// the next chunk after `pause` or finalizes the write.
+    PacedChunk {
+        paced_write_id: u64,
+        chunk_len: usize,
+    },
+}
+
+/// State for a paced write that is interleaved with normal worker ops
+/// instead of blocking the worker for its full duration. At any time
+/// there's at most one chunk in flight per paced write — submission
+/// pauses for `pause` between chunk completions. The worker keeps
+/// these alive in `paced_writes: HashMap<u64, PacedWrite>` and uses
+/// `delayed_chunks` to dispatch the next chunk at the right time.
+struct PacedWrite {
+    file: Option<File>,
+    raw_fd: RawFd,
+    tmp_path: std::path::PathBuf,
+    final_path: std::path::PathBuf,
+    /// Owns the bytes for the kernel for the entire write. Per-chunk
+    /// raw pointer offsets reference into this buffer.
+    bytes: Bytes,
+    total_len: usize,
+    chunk_bytes: usize,
+    pause: std::time::Duration,
+    /// Offset of the next chunk to submit. When `next_offset_to_submit
+    /// == total_len`, all chunks are submitted; we still need the last
+    /// CQE before finalizing.
+    next_offset_to_submit: usize,
+    /// Sender for the user's awaited `Result<()>`. Filled with Ok on
+    /// successful rename, Err on any chunk failure.
+    sender: oneshot::Sender<object_store::Result<()>>,
+    failed: Option<object_store::Error>,
 }
 
 // The held buffer is never read on the Rust side, but the kernel reads from
@@ -242,6 +279,16 @@ fn run_worker(
     let mut pending: HashMap<u64, InFlight> = HashMap::new();
     let mut next_user_data: u64 = 1;
 
+    // Paced write state. Each paced write owns its file + bytes here.
+    // `pending` carries one `InFlight::PacedChunk` per in-flight chunk
+    // pointing back to this map. `delayed_chunks` is a small set of
+    // (ready_at, paced_write_id) pairs the worker checks each loop
+    // iteration before submitting; this lets paced writes share the
+    // worker with reads instead of blocking it.
+    let mut paced_writes: HashMap<u64, PacedWrite> = HashMap::new();
+    let mut next_paced_id: u64 = 1;
+    let mut delayed_chunks: Vec<(std::time::Instant, u64)> = Vec::new();
+
     // Optional pin of this thread to a specific core. Single integer
     // pins all workers there; a comma list (e.g. "0,1,2,3") pins worker
     // `i` to `list[i % list.len()]`. Unset / invalid → OS scheduler.
@@ -253,14 +300,41 @@ fn run_worker(
         }
     }
 
+    // Cache-write pacing. Reads env once at worker start. When set, big
+    // AtomicWrite ops get split into `chunk_bytes`-sized SQEs with
+    // `pause` between each chunk's completion and the next chunk's
+    // submission. Per-chunk submission is interleaved with normal
+    // worker ops so foreground reads aren't held up.
+    let chunk_bytes: usize = std::env::var("SLATEDB_CACHE_WRITE_CHUNK_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let pause_us: u64 = std::env::var("SLATEDB_CACHE_WRITE_PAUSE_US")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let pacing_enabled = chunk_bytes > 0 && pause_us > 0;
+    if pacing_enabled && worker_idx == 0 {
+        info!(
+            "io_uring write pacing enabled [chunk_bytes={}, pause_us={}]",
+            chunk_bytes, pause_us
+        );
+    }
+
     loop {
-        // Drain channel into SQ. Block when both channel + in-flight empty.
+        // Drain channel into SQ. Block-recv only when there's truly
+        // nothing to do — including no paced writes between chunks.
+        // CRITICAL: include paced_writes in the guard. If paced writes
+        // exist but pending is empty (between chunks during the
+        // inter-chunk pause), blocking recv would sleep until a new op
+        // arrives and miss the chunk's deadline. The idle-bridge sleep
+        // below handles waiting in that case.
         let mut batched = 0usize;
         loop {
             if batched >= SUBMIT_BATCH_SIZE {
                 break;
             }
-            let op = if pending.is_empty() && batched == 0 {
+            let op = if pending.is_empty() && batched == 0 && paced_writes.is_empty() {
                 match rx.recv() {
                     Ok(op) => op,
                     Err(_) => return Ok(()), // sender closed
@@ -387,6 +461,60 @@ fn run_worker(
                     bytes,
                     sender,
                 } => {
+                    // Cooperative paced fast-path: when pacing is enabled
+                    // and the payload is bigger than chunk_bytes, register
+                    // a `PacedWrite` and queue its first chunk for
+                    // immediate submission. Subsequent chunks are
+                    // scheduled in `delayed_chunks` after each completion.
+                    // The worker's main loop continues to drain the read
+                    // channel between chunks so foreground reads aren't
+                    // held up.
+                    //
+                    // Paced path uses buffered writes always: O_DIRECT
+                    // requires alignment we can't satisfy on the tail
+                    // short chunk if `bytes.len()` isn't a multiple of
+                    // O_DIRECT_ALIGN.
+                    if pacing_enabled && bytes.len() > chunk_bytes {
+                        if let Some(parent) = tmp_path.parent() {
+                            if let Err(e) = std::fs::create_dir_all(parent) {
+                                let _ = sender.send(Err(wrap_io_err(e)));
+                                continue;
+                            }
+                        }
+                        let mut open = OpenOptions::new();
+                        open.create(true).truncate(true).write(true);
+                        let file = match open.open(&tmp_path) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                let _ = sender.send(Err(wrap_io_err(e)));
+                                continue;
+                            }
+                        };
+                        let raw_fd = file.as_raw_fd();
+                        let id = next_paced_id;
+                        next_paced_id = next_paced_id.wrapping_add(1);
+                        paced_writes.insert(
+                            id,
+                            PacedWrite {
+                                file: Some(file),
+                                raw_fd,
+                                tmp_path,
+                                final_path,
+                                total_len: bytes.len(),
+                                bytes,
+                                chunk_bytes,
+                                pause: std::time::Duration::from_micros(pause_us),
+                                next_offset_to_submit: 0,
+                                sender,
+                                failed: None,
+                            },
+                        );
+                        // First chunk: submit immediately on the next
+                        // delayed_chunks pass below.
+                        delayed_chunks.push((std::time::Instant::now(), id));
+                        continue;
+                    }
+
                     // Open the tmp file synchronously (creates parent dirs
                     // first). Opens are infrequent; the win from io_uring is
                     // on the actual write itself.
@@ -464,6 +592,64 @@ fn run_worker(
             }
         }
 
+        // Submit any paced-write chunks whose pause has expired. We do
+        // this after draining the channel and before submit_and_wait
+        // so the same submit() call carries them along with whatever
+        // foreground reads we just queued.
+        let now = std::time::Instant::now();
+        let mut still_delayed = Vec::with_capacity(delayed_chunks.len());
+        for (deadline, id) in delayed_chunks.drain(..) {
+            if deadline > now {
+                still_delayed.push((deadline, id));
+                continue;
+            }
+            let pw = match paced_writes.get_mut(&id) {
+                Some(p) => p,
+                None => continue, // already finalized / canceled
+            };
+            // If a previous chunk failed, finalize without submitting more.
+            if pw.failed.is_some() {
+                continue;
+            }
+            let chunk_start = pw.next_offset_to_submit;
+            let chunk_end = (chunk_start + pw.chunk_bytes).min(pw.total_len);
+            let chunk_len = chunk_end - chunk_start;
+            // SAFETY: `pw.bytes` is held in `paced_writes` until the
+            // chunk's CQE arrives (we don't remove the PacedWrite
+            // before then), so this raw pointer + len is valid for the
+            // kernel's exclusive read.
+            let chunk_ptr = unsafe { pw.bytes.as_ptr().add(chunk_start) };
+            let chunk_user_data = next_user_data;
+            next_user_data = next_user_data.wrapping_add(1);
+            let entry = opcode::Write::new(
+                types::Fd(pw.raw_fd),
+                chunk_ptr,
+                chunk_len as u32,
+            )
+            .offset(chunk_start as u64)
+            .build()
+            .user_data(chunk_user_data);
+            // SAFETY: see comment above re. buffer lifetime.
+            unsafe {
+                if ring.submission().push(&entry).is_err() {
+                    // Defer; try again next tick.
+                    still_delayed.push((deadline, id));
+                    next_user_data = next_user_data.wrapping_sub(1);
+                    continue;
+                }
+            }
+            pw.next_offset_to_submit = chunk_end;
+            pending.insert(
+                chunk_user_data,
+                InFlight::PacedChunk {
+                    paced_write_id: id,
+                    chunk_len,
+                },
+            );
+            batched += 1;
+        }
+        delayed_chunks = still_delayed;
+
         // Submit + wait for at least one completion if anything is in flight.
         if batched > 0 || !pending.is_empty() {
             let want = if pending.is_empty() { 0 } else { 1 };
@@ -476,6 +662,35 @@ fn run_worker(
         for cqe in cq.by_ref() {
             let user_data = cqe.user_data();
             let result = cqe.result();
+            // Paced chunks need bespoke handling: schedule the next
+            // chunk after `pause` on success, or finalize the whole
+            // write on the last chunk / on error.
+            match pending.remove(&user_data) {
+                Some(InFlight::PacedChunk {
+                    paced_write_id,
+                    chunk_len,
+                }) => {
+                    handle_paced_chunk_completion(
+                        paced_write_id,
+                        chunk_len,
+                        result,
+                        &mut paced_writes,
+                        &mut delayed_chunks,
+                    );
+                    continue;
+                }
+                Some(other) => {
+                    // Reinsert and dispatch through the usual match below.
+                    pending.insert(user_data, other);
+                }
+                None => {
+                    warn!(
+                        "slatedb-uring: completion for unknown user_data={}",
+                        user_data
+                    );
+                    continue;
+                }
+            }
             match pending.remove(&user_data) {
                 Some(InFlight::Read {
                     buf,
@@ -530,6 +745,15 @@ fn run_worker(
                     };
                     let _ = sender.send(send_result);
                 }
+                Some(InFlight::PacedChunk { paced_write_id, .. }) => {
+                    // Should be unreachable: the dispatch above handles
+                    // PacedChunk and `continue`s before we reach this
+                    // match again. Guard anyway in case of refactor.
+                    warn!(
+                        "slatedb-uring: PacedChunk reached secondary dispatch (id={})",
+                        paced_write_id
+                    );
+                }
                 None => {
                     // Lost cqe? Should not happen.
                     warn!(
@@ -539,7 +763,84 @@ fn run_worker(
                 }
             }
         }
+
+        // Idle bridge: when the only outstanding work is a paced write
+        // currently in its inter-chunk pause (pending empty,
+        // paced_writes non-empty), sleep until the next chunk's
+        // deadline so we don't busy-loop. Wake early if a foreground
+        // op arrives. CRITICAL: peek with `rx.len()` — never
+        // `try_recv`, which would consume the op and strand its
+        // sender.
+        if !paced_writes.is_empty() && pending.is_empty() {
+            let next_deadline = delayed_chunks
+                .iter()
+                .map(|(d, _)| *d)
+                .min()
+                .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_millis(1));
+            let now = std::time::Instant::now();
+            if next_deadline > now {
+                let sleep_total = (next_deadline - now).min(std::time::Duration::from_millis(50));
+                let sleep_deadline = now + sleep_total;
+                while std::time::Instant::now() < sleep_deadline {
+                    if rx.len() > 0 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(500));
+                }
+            }
+        }
     }
+}
+
+/// Handle a CQE for one chunk of a paced write. Updates the matching
+/// `PacedWrite` state and either schedules the next chunk after the
+/// configured pause or finalizes the write (close + rename + signal
+/// the user oneshot). On error, finalizes early with the error.
+fn handle_paced_chunk_completion(
+    paced_write_id: u64,
+    chunk_len: usize,
+    cqe_result: i32,
+    paced_writes: &mut HashMap<u64, PacedWrite>,
+    delayed_chunks: &mut Vec<(std::time::Instant, u64)>,
+) {
+    let Some(pw) = paced_writes.get_mut(&paced_write_id) else {
+        return;
+    };
+    if cqe_result < 0 {
+        pw.failed = Some(wrap_io_err(std::io::Error::from_raw_os_error(-cqe_result)));
+    } else {
+        let written = cqe_result as usize;
+        if written != chunk_len {
+            pw.failed = Some(wrap_io_err(std::io::Error::other(format!(
+                "uring short write: {} of {}",
+                written, chunk_len
+            ))));
+        }
+    }
+
+    // Still have more chunks to submit and no failure: schedule next chunk
+    // after the pause.
+    if pw.failed.is_none() && pw.next_offset_to_submit < pw.total_len {
+        let deadline = std::time::Instant::now() + pw.pause;
+        delayed_chunks.push((deadline, paced_write_id));
+        return;
+    }
+
+    // Finalize: either we just completed the last chunk, or we hit an
+    // error and want to bail out. Either way drop the file + rename +
+    // signal sender.
+    let mut pw = paced_writes.remove(&paced_write_id).expect("just had it");
+    drop(pw.file.take()); // close fd before rename
+    let result = if let Some(err) = pw.failed.take() {
+        let _ = std::fs::remove_file(&pw.tmp_path);
+        Err(err)
+    } else if pw.tmp_path == pw.final_path {
+        // Tee path: rename happens later in commit().
+        Ok(())
+    } else {
+        std::fs::rename(&pw.tmp_path, &pw.final_path).map_err(wrap_io_err)
+    };
+    let _ = pw.sender.send(result);
 }
 
 fn advise_dontneed(fd: RawFd) {
