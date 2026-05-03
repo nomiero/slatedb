@@ -497,9 +497,47 @@ impl<'a> InternalSstIterator<'a> {
     }
 
     async fn advance_block(&mut self) -> Result<(), SlateDBError> {
+        // Sub-phase tracing for the SST iterator's data-path init:
+        //   ensure_metadata_loaded -> read index from meta cache,
+        //     compute block range, optionally spawn prefetches.
+        //   next_iter(true) -> awaits first prefetch JoinHandle which
+        //     internally goes through cached_object_store.get_opts ->
+        //     read_part (page cache or NVMe).
+        // When the parent FilterIterator::init reports a slow inner.init,
+        // these two sub-warnings tell us whether it's the metadata
+        // path (meta-cache miss) or the data-block fetch path (S3
+        // fall-through, blocking-pool starvation, etc.) that's slow.
+        const SLOW_PHASE_THRESHOLD: std::time::Duration =
+            std::time::Duration::from_millis(50);
+        #[allow(clippy::disallowed_methods)]
+        let metadata_start = tokio::time::Instant::now();
+        let metadata_pre_initialized = self.index.is_some();
         self.ensure_metadata_loaded().await?;
+        let metadata_elapsed = metadata_start.elapsed();
+        if !metadata_pre_initialized && metadata_elapsed > SLOW_PHASE_THRESHOLD {
+            log::warn!(
+                "slow advance_block: ensure_metadata_loaded took {:?} (sst={:?})",
+                metadata_elapsed,
+                self.view.table_as_ref().sst.id,
+            );
+        }
         if !self.state.is_finished() {
-            if let Some(mut iter) = self.next_iter(true).await? {
+            #[allow(clippy::disallowed_methods)]
+            let next_iter_start = tokio::time::Instant::now();
+            let next_iter_was_initialized = self.state.is_initialized();
+            let next_iter_result = self.next_iter(true).await?;
+            let next_iter_elapsed = next_iter_start.elapsed();
+            // Only warn on the FIRST advance_block call (uninitialized
+            // state). Subsequent calls are normal block-to-block
+            // movement and aren't part of the init path we care about.
+            if !next_iter_was_initialized && next_iter_elapsed > SLOW_PHASE_THRESHOLD {
+                log::warn!(
+                    "slow advance_block: next_iter (jh.await on first prefetch) took {:?} (sst={:?})",
+                    next_iter_elapsed,
+                    self.view.table_as_ref().sst.id,
+                );
+            }
+            if let Some(mut iter) = next_iter_result {
                 // Only seek on the first block to position at the range boundary.
                 // For subsequent blocks, iterate through the entire block in the specified order.
                 if !self.state.is_initialized() {
@@ -792,6 +830,16 @@ impl<'a> FilterIterator<'a> {
 impl RowEntryIterator for FilterIterator<'_> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         if !self.initialized {
+            // Sub-phase tracing: when the outer recency-iter trace
+            // logs a slow init, we want to know whether it's the
+            // filter probe (meta cache + decompression) or the
+            // inner iterator init (which fetches the index and
+            // first prefetch block). Each gets its own slow-path
+            // warning at a 50 ms threshold.
+            const SLOW_PHASE_THRESHOLD: std::time::Duration =
+                std::time::Duration::from_millis(50);
+            #[allow(clippy::disallowed_methods)]
+            let read_filters_start = tokio::time::Instant::now();
             let filters = self
                 .inner
                 .table_store()
@@ -800,6 +848,14 @@ impl RowEntryIterator for FilterIterator<'_> {
                     self.inner.options.cache_blocks,
                 )
                 .await?;
+            let read_filters_elapsed = read_filters_start.elapsed();
+            if read_filters_elapsed > SLOW_PHASE_THRESHOLD {
+                log::warn!(
+                    "slow FilterIterator::init: read_filters took {:?} (sst={:?})",
+                    read_filters_elapsed,
+                    self.inner.view().table_as_ref().sst.id,
+                );
+            }
             self.filter.evaluate(&filters).await;
 
             if self.is_filtered_out() {
@@ -808,7 +864,17 @@ impl RowEntryIterator for FilterIterator<'_> {
 
             // make sure initializing the inner iterator only happens after
             // the filter is evaluated to avoid unnecessary work
+            #[allow(clippy::disallowed_methods)]
+            let inner_init_start = tokio::time::Instant::now();
             self.inner.init().await?;
+            let inner_init_elapsed = inner_init_start.elapsed();
+            if inner_init_elapsed > SLOW_PHASE_THRESHOLD {
+                log::warn!(
+                    "slow FilterIterator::init: inner.init took {:?} (sst={:?})",
+                    inner_init_elapsed,
+                    self.inner.view().table_as_ref().sst.id,
+                );
+            }
             self.initialized = true;
         }
 
