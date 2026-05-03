@@ -487,6 +487,15 @@ impl ManifestWriterHandler {
                     .pop_back()
                     .expect("expected imm memtable");
                 assert!(Arc::ptr_eq(&popped, &uploaded.imm_memtable));
+                // Trace exact moment a freshly-uploaded SST becomes visible
+                // to foreground readers. Pair with the matching
+                // `cached_put_opts done [...]` line to detect any window
+                // where the SST is in `state.l0` but the local cache write
+                // hasn't completed yet.
+                tracing::info!(
+                    "publishing l0 SST [sst_id={:?}]",
+                    uploaded.sst_handle.id
+                );
                 modifier
                     .state
                     .manifest

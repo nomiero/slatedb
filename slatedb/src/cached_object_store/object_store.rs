@@ -15,7 +15,7 @@ use tokio::sync::OnceCell;
 use crate::cached_object_store::admission::AdmissionPicker;
 use crate::cached_object_store::storage::{LocalCacheStorage, PartID};
 use crate::error::SlateDBError;
-use log::warn;
+use log::{info, warn};
 
 use crate::utils::build_concurrent;
 use slatedb_common::metrics::MetricsRecorderHelper;
@@ -387,10 +387,13 @@ impl CachedObjectStore {
             .sum();
 
         // First, write to the upstream object store (cloning payload is cheap since it's just a Arc internally)
+        #[allow(clippy::disallowed_methods)]
+        let put_start = tokio::time::Instant::now();
         let result = self
             .object_store
             .put_opts(location, payload.clone(), opts)
             .await?;
+        let upstream_elapsed = put_start.elapsed();
 
         // Then, save to local cache if admission policy allows it
         let Some(cache_location) = self.cache_location_for(location) else {
@@ -433,14 +436,19 @@ impl CachedObjectStore {
             version: result.version.clone(),
         };
         let head_attrs = object_store::Attributes::new();
+        #[allow(clippy::disallowed_methods)]
+        let head_start = tokio::time::Instant::now();
         if let Err(e) = entry.save_head((&head_meta, &head_attrs)).await {
             warn!(
                 "cached_put_opts: save_head failed [location={}, error={:?}]",
                 location, e
             );
         }
+        let head_elapsed = head_start.elapsed();
 
         // Convert PutPayload to stream and save parts to cache.
+        #[allow(clippy::disallowed_methods)]
+        let parts_start = tokio::time::Instant::now();
         let stream = stream::iter(payload.into_iter()).map(Ok::<Bytes, object_store::Error>);
         if let Err(e) = self.save_parts_stream(entry, stream, 0).await {
             warn!(
@@ -448,6 +456,16 @@ impl CachedObjectStore {
                 location, e
             );
         }
+        let parts_elapsed = parts_start.elapsed();
+
+        // Trace timing of every cached_put_opts so we can correlate with cache
+        // fall-through warns: if a fall-through warn for `location` arrives at
+        // a time before this log line for the same `location`, the manifest
+        // made the SST visible to readers before the cache write completed.
+        info!(
+            "cached_put_opts done [location={}, size={}, upstream={:?}, head={:?}, parts={:?}]",
+            location, payload_size, upstream_elapsed, head_elapsed, parts_elapsed,
+        );
 
         Ok(result)
     }
