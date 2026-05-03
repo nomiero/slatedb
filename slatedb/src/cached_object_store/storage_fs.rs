@@ -406,16 +406,22 @@ impl FsCacheEntry {
     async fn atomic_write(&self, path: std::path::PathBuf, buf: Bytes) -> object_store::Result<()> {
         let tmp_path = path.with_extension(format!("_tmp{}", self.make_rand_suffix()));
 
-        // try triggering evict before writing
+        // Notify the evictor of this cache entry. The evictor's mpsc
+        // channel is shared with the much-higher-frequency read-access
+        // tracking (every `read_part` call); under load the channel
+        // can fill, in which case `track_entry_accessed` returns
+        // false. Previously this silently skipped the file write,
+        // which manifested as readers falling through to S3 because
+        // a fraction of head/part files were never written despite
+        // the SST being published in the manifest.
+        //
+        // The fix: tracking failure must NOT skip the write. Eviction
+        // accounting can be slightly off (the evictor will pick it up
+        // on the next periodic scan); a missing cache file cannot.
         if let Some(evictor) = &self.evictor {
-            // If the evictor is backpressured, skip this cache write to avoid
-            // stalling foreground PUTs. Cache writes are best-effort.
-            if !evictor
+            evictor
                 .track_entry_accessed(path.clone(), buf.len(), true)
-                .await
-            {
-                return Ok(());
-            }
+                .await;
         }
 
         // Spawn a blocking task and do synchronous I/O rather than use the tokio async apis.
