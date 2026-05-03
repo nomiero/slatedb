@@ -457,32 +457,56 @@ impl CachedObjectStore {
         location: &Path,
         mut opts: GetOptions,
     ) -> object_store::Result<(ObjectMeta, Attributes)> {
+        let mut head_miss_reason: Option<&'static str> = None;
         if let Some(cache_location) = self.cache_location_for(location) {
             let entry = self
                 .cache_storage
                 .entry(&cache_location, self.part_size_bytes);
             match entry.read_head().await {
                 Ok(Some((meta, attrs))) => return Ok((meta, attrs)),
-                Ok(None) => {}
+                Ok(None) => {
+                    head_miss_reason = Some("not_present");
+                }
                 Err(e) => {
+                    head_miss_reason = Some("read_error");
                     warn!(
                         "failed to read head from disk cache, will fallback to object store [location={}, error={:?}]",
                         location, e,
                     );
                 }
             }
+        } else {
+            head_miss_reason = Some("root_unresolved");
         }
 
         if let Some(range) = &opts.range {
             opts.range = Some(self.align_get_range(range));
         }
 
+        // Diagnostic: log the S3 fall-through with the location and
+        // the reason the local head was missing. The 5+ second
+        // reader stalls we've seen at compaction events come from
+        // this exact path. Knowing the reason narrows the fix:
+        // - "not_present" -> tee.commit() / cached_put_opts didn't
+        //   save the head. Look at the write path for that location.
+        // - "root_unresolved" -> first GET of the run happened
+        //   before any HEAD. Should only happen at startup.
+        // - "read_error" -> disk failure or stale fd; warn already
+        //   logged above.
+        let reason = head_miss_reason.unwrap_or("unknown");
+        #[allow(clippy::disallowed_methods)]
+        let s3_start = tokio::time::Instant::now();
         let get_result = self.object_store.get_opts(location, opts).await?;
+        let s3_elapsed = s3_start.elapsed();
+        warn!(
+            "cache fall-through to upstream get_opts [location={}, reason={}, took={:?}]",
+            location, reason, s3_elapsed,
+        );
+
         let result_meta = get_result.meta.clone();
         let result_attrs = get_result.attributes.clone();
         // swallow the error on saving to disk here (the disk might be already full), just fallback
         // to the object store.
-        // TODO: add a warning log here.
         if self.resolve_root(location, &result_meta.location) {
             self.save_get_result(get_result).await.ok();
         }
