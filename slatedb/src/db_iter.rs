@@ -11,6 +11,7 @@ use crate::types::{KeyValue, RowEntry, ValueDeletable};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use log::warn;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ops::RangeBounds;
@@ -446,20 +447,63 @@ impl RecencyPrefixIterator {
             return Err(error.clone().into());
         }
 
+        // Slow-path tracing: log a WARN whenever a single source's
+        // `init` or `next` await blocks for more than this threshold.
+        // Tight bound (50 ms) because the read path expects sub-ms per
+        // source: filter probes are in-memory meta-cache lookups,
+        // data-block fetches go to disk-cache (page-cache hot, NVMe
+        // worst-case ~150 µs). Anything in the multi-millisecond
+        // range is anomalous and worth surfacing - especially for
+        // diagnosing reader stalls during compaction events when the
+        // overall metrics (state.write held, NVMe util, iowait) are
+        // all quiet.
+        const SLOW_PHASE_THRESHOLD: std::time::Duration =
+            std::time::Duration::from_millis(50);
+
+        // Track which source we're on (0-indexed in the original iter
+        // list). Source order is fixed by `Reader::scan_prefix_by_recency`:
+        // 0 = write_batch_iter, then memtable iters, then L0 SSTs
+        // (newest first), then sorted runs. Reporting the index in
+        // the warn log lets a human map back to which kind of source
+        // is slow without needing the trait to expose a label.
+        let initial_iters = self.iters.len();
+        let mut source_idx = 0usize;
+
         loop {
             let Some(iter) = self.iters.front_mut() else {
                 return Ok(None);
             };
 
             if !self.current_initialized {
-                if let Err(e) = iter.init().await {
+                #[allow(clippy::disallowed_methods)]
+                let init_start = tokio::time::Instant::now();
+                let init_result = iter.init().await;
+                let init_elapsed = init_start.elapsed();
+                if init_elapsed > SLOW_PHASE_THRESHOLD {
+                    warn!(
+                        "slow recency-iter source init: source_idx={} of {} took {:?}",
+                        source_idx, initial_iters, init_elapsed
+                    );
+                }
+                if let Err(e) = init_result {
                     self.invalidated_error = Some(e.clone());
                     return Err(e.into());
                 }
                 self.current_initialized = true;
             }
 
-            match iter.next().await {
+            #[allow(clippy::disallowed_methods)]
+            let next_start = tokio::time::Instant::now();
+            let next_result = iter.next().await;
+            let next_elapsed = next_start.elapsed();
+            if next_elapsed > SLOW_PHASE_THRESHOLD {
+                warn!(
+                    "slow recency-iter source next: source_idx={} of {} took {:?}",
+                    source_idx, initial_iters, next_elapsed
+                );
+            }
+
+            match next_result {
                 Ok(Some(entry)) => {
                     return Ok(Some(entry));
                 }
@@ -473,6 +517,7 @@ impl RecencyPrefixIterator {
                     // [`DbStats`].
                     self.iters.pop_front();
                     self.current_initialized = false;
+                    source_idx += 1;
                 }
                 Err(e) => {
                     self.invalidated_error = Some(e.clone());
