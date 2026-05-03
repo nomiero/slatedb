@@ -88,6 +88,15 @@ pub trait LocalCacheStorage: Send + Sync + std::fmt::Debug + Display + 'static {
     /// cleaned. Implementations that don't support tee writes may return
     /// `None`; callers fall back to lazy cache population via reads.
     fn begin_tee(&self, location: &Path, part_size: usize) -> Option<Box<dyn LocalCacheTee>>;
+
+    /// Hint to the operating system that the cached data for `location` is
+    /// no longer needed in the page cache, so its pages may be dropped.
+    /// On Linux this calls `posix_fadvise(POSIX_FADV_DONTNEED)` on every
+    /// part file backing `location`. Best-effort: failures are ignored
+    /// silently. Used by callers (e.g. the compactor after consuming an
+    /// input SST that's about to become unreachable) to free page-cache
+    /// memory that no future reader will use.
+    async fn advise_dontneed(&self, location: &Path);
 }
 
 /// A streaming, transactional cache writer. The producer (e.g. an SST writer)

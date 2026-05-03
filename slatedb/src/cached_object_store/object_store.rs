@@ -89,6 +89,20 @@ impl CachedObjectStore {
         }
     }
 
+    /// Tell the kernel the page-cache pages backing `location` are no
+    /// longer needed (`posix_fadvise(POSIX_FADV_DONTNEED)`). The cache
+    /// entry stays on disk - this only affects in-memory caching of
+    /// the file's contents. Best-effort, never fails. Used by callers
+    /// (the compactor) that have just finished consuming an SST and
+    /// want to free its pages from page cache before the next reader
+    /// touches the new sorted run.
+    pub(crate) async fn advise_dontneed(&self, location: &Path) {
+        let Some(cache_location) = self.cache_location_for(location) else {
+            return;
+        };
+        self.cache_storage.advise_dontneed(&cache_location).await;
+    }
+
     /// Build a `CachedObjectStore` from `ObjectStoreCacheOptions`, returning `None`
     /// if caching is not configured (i.e. `root_folder` is `None`). When `Some` is
     /// returned the evictor has already been started.

@@ -369,6 +369,21 @@ impl TableStore {
         Ok(())
     }
 
+    /// Tell the OS page cache that the SST's bytes are no longer needed.
+    /// The on-disk cache entry is preserved; only kernel page-cache
+    /// pages backing the file are advised for release. Used by the
+    /// compactor after it finishes consuming an input SST: those bytes
+    /// won't be read again (the SR replaces them), so leaving them in
+    /// page cache just delays eviction of pages a current reader
+    /// actually wants. Best-effort, no-op when no on-disk cache is
+    /// configured.
+    pub(crate) async fn advise_dontneed(&self, id: &SsTableId) {
+        let path = self.path(id);
+        if let Some(cached) = &self.cached_object_store {
+            cached.advise_dontneed(&path).await;
+        }
+    }
+
     /// Reads metadata for a specific SST object (WAL or compacted).
     ///
     /// ## Arguments

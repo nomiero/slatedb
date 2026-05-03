@@ -176,6 +176,24 @@ impl FileHandleCache {
     }
 }
 
+/// Hint to the kernel that this file's pages are no longer needed in
+/// the page cache. On Linux, calls `posix_fadvise(POSIX_FADV_DONTNEED)`
+/// over the whole file. On macOS, the equivalent is `fcntl(F_PUNCHHOLE)`
+/// or `mincore`-driven manual eviction, neither of which has a direct
+/// "evict pages" semantics, so we no-op there. Best-effort.
+#[cfg(target_os = "linux")]
+fn advise_dontneed(file: &std::fs::File) {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: posix_fadvise only inspects the fd; it does not transfer
+    // ownership and is safe to call on any open file.
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_dontneed(_file: &std::fs::File) {}
+
 /// Cross-platform positional read. Reads exactly `buf.len()` bytes at `offset`
 /// without altering the file cursor, allowing concurrent readers on the same fd.
 fn read_exact_at_offset(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
@@ -274,6 +292,41 @@ impl LocalCacheStorage for FsCacheStorage {
             self.rand.clone(),
             self.file_handle_cache.clone(),
         )))
+    }
+
+    async fn advise_dontneed(&self, location: &Path) {
+        // Walk the cache directory for this location, opening each part
+        // file and calling `posix_fadvise(POSIX_FADV_DONTNEED)`. The fd
+        // is dropped immediately after the syscall - we don't need it
+        // for anything else. Best-effort: any I/O error here just means
+        // the kernel keeps the pages a little longer, which is fine.
+        let dir = self.root_folder.join(location.to_string());
+        if !dir.exists() {
+            return;
+        }
+        tokio::task::spawn_blocking(move || {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                // Match `_partXXXmb-NNNNNNNNN` and `_head`. The head is
+                // tiny, but DONTNEED is cheap so we hit it too rather
+                // than special-casing.
+                if !name.starts_with("_part") && name != "_head" {
+                    continue;
+                }
+                if let Ok(file) = std::fs::File::open(&path) {
+                    advise_dontneed(&file);
+                }
+            }
+        })
+        .await
+        .ok();
     }
 
     async fn remove(&self, location: &Path) -> object_store::Result<()> {
