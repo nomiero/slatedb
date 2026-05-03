@@ -647,6 +647,14 @@ impl ManifestWriterHandler {
         &self,
         remote_dirty: slatedb_txn_obj::DirtyObject<crate::manifest::Manifest>,
     ) {
+        // Time the state.write() acquisition so the manifest-poller
+        // path is captured by the same `state_write_held_micros_total`
+        // counter as the apply_uploaded_state path. Compaction
+        // results land here (via the manifest poller), so this is the
+        // suspected cause of the post-compaction read-throughput
+        // dips.
+        #[allow(clippy::disallowed_methods)]
+        let start = tokio::time::Instant::now();
         let dirty_manifest = {
             let mut wguard_state = self.db.state.write();
             wguard_state.merge_remote_manifest(remote_dirty);
@@ -657,6 +665,12 @@ impl ManifestWriterHandler {
                 .set(cow.core().tree.l0.len() as i64);
             cow.manifest.clone()
         };
+        let elapsed = start.elapsed();
+        self.db.db_stats.state_write_acquisitions.increment(1);
+        self.db
+            .db_stats
+            .state_write_held_micros_total
+            .increment(elapsed.as_micros() as u64);
         self.db
             .status_manager
             .report_manifest(dirty_manifest.into());
