@@ -371,6 +371,15 @@ impl CachedObjectStore {
             return self.object_store.put_opts(location, payload, opts).await;
         }
 
+        // Compute the payload size before consuming `payload` for the
+        // upstream PUT - we need it to build the ObjectMeta we save
+        // alongside the parts so subsequent reads don't have to do an
+        // S3 HEAD round-trip.
+        let payload_size: u64 = payload
+            .iter()
+            .map(|b| b.len() as u64)
+            .sum();
+
         // First, write to the upstream object store (cloning payload is cheap since it's just a Arc internally)
         let result = self
             .object_store
@@ -385,8 +394,35 @@ impl CachedObjectStore {
             .cache_storage
             .entry(&cache_location, self.part_size_bytes);
         if self.admission_picker.pick(entry.as_ref()).admitted() {
+            // Save the head metadata (size, location, etag from the
+            // PUT result) so the next reader's `cached_head` lookup
+            // hits the local cache. Without this, the FIRST reader to
+            // touch a freshly-flushed L0 SST falls through to an S3
+            // HEAD request - and S3 HEAD has a multi-second tail
+            // latency that has been observed stalling reader
+            // throughput for 6+ seconds at compaction start. The
+            // head is tiny (a few hundred bytes); writing it is
+            // negligible cost.
+            //
+            // last_modified is a stub (chrono::Utc::now()): the
+            // cache doesn't use this field for invalidation, only
+            // echoes it back from cached_head(). The upstream
+            // object's real last_modified is filled in lazily the
+            // next time a HEAD goes upstream.
+            let head_meta = ObjectMeta {
+                location: location.clone(),
+                last_modified: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+                size: payload_size,
+                e_tag: result.e_tag.clone(),
+                version: result.version.clone(),
+            };
+            let head_attrs = object_store::Attributes::new();
+            entry
+                .save_head((&head_meta, &head_attrs))
+                .await
+                .ok();
+
             // Convert PutPayload to stream and save parts to cache.
-            // Note: cached_head() already saved the head, so we only need to save parts
             let stream = stream::iter(payload.into_iter()).map(Ok::<Bytes, object_store::Error>);
 
             // Save parts only, ignoring errors (cache failures shouldn't fail the PUT operation)
