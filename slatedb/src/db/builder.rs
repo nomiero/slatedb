@@ -609,7 +609,9 @@ impl<P: Into<Path>> DbBuilder<P> {
             write_rx,
             &tokio_handle,
         )?;
-        // Not to pollute the cache during compaction or GC
+        // The GC reads SSTs only to enumerate them; sending those reads
+        // through the disk cache would just churn it. So we keep an
+        // uncached store for GC's use.
         let uncached_table_store = Arc::new(TableStore::new_with_fp_registry(
             ObjectStores::new(
                 retrying_main_object_store.clone(),
@@ -638,9 +640,15 @@ impl<P: Into<Path>> DbBuilder<P> {
                 builder = builder.with_merge_operator(operator);
             }
 
+            // Give the compactor the *cached* table_store so its
+            // outputs flow through the prewarm tee. Without this, every
+            // freshly-compacted SST is reader-visible in the manifest
+            // but absent from the local cache, so the first foreground
+            // read of each output goes to S3 - the multi-second dips
+            // we saw at every compaction event.
             let (handler, rx) = builder
                 .build_handler(
-                    uncached_table_store.clone(),
+                    table_store.clone(),
                     manifest_store.clone(),
                     compactions_store.clone(),
                 )
