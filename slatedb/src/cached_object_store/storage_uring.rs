@@ -202,13 +202,16 @@ struct WorkerHandle {
 }
 
 impl WorkerHandle {
-    fn spawn(direct_io: bool) -> std::io::Result<Self> {
+    fn spawn(direct_io: bool, worker_idx: usize) -> std::io::Result<Self> {
         let (tx, rx) = crossbeam_channel::unbounded::<WorkerOp>();
         let join = std::thread::Builder::new()
-            .name("slatedb-uring".to_string())
+            .name(format!("slatedb-uring-{}", worker_idx))
             .spawn(move || {
-                if let Err(e) = run_worker(rx, direct_io) {
-                    warn!("slatedb-uring worker exited with error: {:?}", e);
+                if let Err(e) = run_worker(rx, direct_io, worker_idx) {
+                    warn!(
+                        "slatedb-uring worker {} exited with error: {:?}",
+                        worker_idx, e
+                    );
                 }
             })?;
         Ok(Self {
@@ -229,21 +232,25 @@ impl Drop for WorkerHandle {
 
 /// Worker thread main loop. Owns the io_uring, the file-handle cache, and
 /// the in-flight map.
-fn run_worker(rx: CbReceiver<WorkerOp>, direct_io: bool) -> std::io::Result<()> {
+fn run_worker(
+    rx: CbReceiver<WorkerOp>,
+    direct_io: bool,
+    worker_idx: usize,
+) -> std::io::Result<()> {
     let mut ring = IoUring::new(URING_SQ_ENTRIES)?;
     let mut fd_cache: HashMap<std::path::PathBuf, Arc<File>> = HashMap::new();
     let mut pending: HashMap<u64, InFlight> = HashMap::new();
     let mut next_user_data: u64 = 1;
 
-    // Optional pin of this thread to a specific core. If env var unset or
-    // invalid, leave to the OS scheduler. Useful when the user has already
-    // pinned tokio runtime workers via core_affinity and wants the I/O
-    // worker on a non-overlapping core.
-    if let Some(cpu) = std::env::var("SLATEDB_URING_CPU")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        let _ = core_affinity::set_for_current(core_affinity::CoreId { id: cpu });
+    // Optional pin of this thread to a specific core. Single integer
+    // pins all workers there; a comma list (e.g. "0,1,2,3") pins worker
+    // `i` to `list[i % list.len()]`. Unset / invalid → OS scheduler.
+    if let Ok(s) = std::env::var("SLATEDB_URING_CPU") {
+        let cpus: Vec<usize> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if !cpus.is_empty() {
+            let cpu = cpus[worker_idx % cpus.len()];
+            let _ = core_affinity::set_for_current(core_affinity::CoreId { id: cpu });
+        }
     }
 
     loop {
@@ -577,15 +584,19 @@ fn is_handle_valid(file: &File) -> bool {
 // Public types implementing the LocalCacheStorage / Entry / Tee traits.
 // -----------------------------------------------------------------------------
 
-/// io_uring-backed `LocalCacheStorage`. Constructed via
-/// [`IoUringCacheStorage::new`] which spawns the dedicated worker thread on
-/// success. Falls back to a panic if `IoUring::new` fails — callers should
-/// instead probe via `try_new` and substitute `FsCacheStorage` on err.
+/// io_uring-backed `LocalCacheStorage`. Owns a fixed-size pool of
+/// dedicated I/O worker threads (each owning its own `IoUring` + fd
+/// cache + pending map). Operations are sharded across workers by
+/// hashing the location path: every operation for a given SST always
+/// lands on the same worker so its fd cache stays consistent and
+/// per-file ordering (e.g. tee chunk submission) is preserved without
+/// cross-worker locking. Pool size from `SLATEDB_URING_WORKERS`
+/// (default 1).
 #[derive(Debug)]
 pub(crate) struct IoUringCacheStorage {
     root_folder: std::path::PathBuf,
     direct_io: bool,
-    worker: Arc<WorkerHandle>,
+    workers: Vec<Arc<WorkerHandle>>,
     /// Monotonically increasing tee id, used to namespace temp filenames.
     tee_seq: AtomicU64,
 }
@@ -594,9 +605,10 @@ impl std::fmt::Display for IoUringCacheStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "IoUringCacheStorage(root={}, direct_io={})",
+            "IoUringCacheStorage(root={}, direct_io={}, workers={})",
             self.root_folder.display(),
-            self.direct_io
+            self.direct_io,
+            self.workers.len(),
         )
     }
 }
@@ -608,25 +620,41 @@ impl IoUringCacheStorage {
         root_folder: std::path::PathBuf,
         direct_io: bool,
     ) -> std::io::Result<Self> {
-        let worker = WorkerHandle::spawn(direct_io)?;
+        let n = std::env::var("SLATEDB_URING_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1);
+        let mut workers = Vec::with_capacity(n);
+        for i in 0..n {
+            workers.push(Arc::new(WorkerHandle::spawn(direct_io, i)?));
+        }
         info!(
-            "using io_uring cache storage [root={}, direct_io={}]",
+            "using io_uring cache storage [root={}, direct_io={}, workers={}]",
             root_folder.display(),
-            direct_io
+            direct_io,
+            n
         );
         Ok(Self {
             root_folder,
             direct_io,
-            worker: Arc::new(worker),
+            workers,
             tee_seq: AtomicU64::new(0),
         })
     }
 
-    fn send_op(&self, op: WorkerOp) -> object_store::Result<()> {
-        self.worker
-            .tx
-            .send(op)
-            .map_err(|_| wrap_io_err(std::io::Error::other("uring worker channel closed")))
+    /// Pick the worker that owns `location`. Same location always maps
+    /// to the same worker for the lifetime of the storage so the fd
+    /// cache stays consistent and per-file ordering is preserved.
+    fn worker_for_location(&self, location: &Path) -> Arc<WorkerHandle> {
+        if self.workers.len() == 1 {
+            return self.workers[0].clone();
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        location.to_string().hash(&mut h);
+        let idx = (h.finish() as usize) % self.workers.len();
+        self.workers[idx].clone()
     }
 }
 
@@ -635,9 +663,9 @@ impl LocalCacheStorage for IoUringCacheStorage {
     fn entry(&self, location: &Path, part_size: usize) -> Box<dyn LocalCacheEntry> {
         Box::new(IoUringCacheEntry {
             root_folder: self.root_folder.clone(),
+            worker: self.worker_for_location(location),
             location: location.clone(),
             part_size,
-            worker: self.worker.clone(),
         })
     }
 
@@ -651,8 +679,12 @@ impl LocalCacheStorage for IoUringCacheStorage {
 
     async fn remove(&self, location: &Path) -> object_store::Result<()> {
         let dir = self.root_folder.join(location.to_string());
+        let worker = self.worker_for_location(location);
         let (sender, recv) = oneshot::channel();
-        self.send_op(WorkerOp::RemoveDir { dir, sender })?;
+        worker
+            .tx
+            .send(WorkerOp::RemoveDir { dir, sender })
+            .map_err(|_| wrap_io_err(std::io::Error::other("uring worker channel closed")))?;
         recv.await
             .map_err(|e| wrap_io_err(std::io::Error::other(format!("oneshot recv: {e}"))))?
     }
@@ -661,9 +693,9 @@ impl LocalCacheStorage for IoUringCacheStorage {
         let tee_id = self.tee_seq.fetch_add(1, Ordering::Relaxed);
         Some(Box::new(IoUringCacheTee {
             root_folder: self.root_folder.clone(),
+            worker: self.worker_for_location(location),
             location: location.clone(),
             part_size,
-            worker: self.worker.clone(),
             tee_id,
             part_buf: bytes::BytesMut::new(),
             next_part_number: 0,
@@ -674,7 +706,10 @@ impl LocalCacheStorage for IoUringCacheStorage {
 
     async fn advise_dontneed(&self, location: &Path) {
         let dir = self.root_folder.join(location.to_string());
-        let _ = self.send_op(WorkerOp::AdviseDontneed { dir });
+        let _ = self
+            .worker_for_location(location)
+            .tx
+            .send(WorkerOp::AdviseDontneed { dir });
     }
 }
 
