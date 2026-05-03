@@ -289,15 +289,21 @@ impl CachedObjectStore {
     }
 
     pub(crate) async fn cached_head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+        self.stats.object_store_cache_head_access.increment(1);
         if let Some(cache_location) = self.cache_location_for(location) {
             let entry = self
                 .cache_storage
                 .entry(&cache_location, self.part_size_bytes);
             if let Ok(Some((meta, _))) = entry.read_head().await {
+                self.stats.object_store_cache_head_hits.increment(1);
                 return Ok(meta);
             }
         }
 
+        // Cache miss: fall through to S3 HEAD. This path has
+        // multi-second tail latency on AWS; the (access - hit) gap
+        // tracked here is the most useful early-warning signal for
+        // reader stalls during compaction events.
         let result = self
             .object_store
             .get_opts(
