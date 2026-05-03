@@ -1364,6 +1364,24 @@ pub struct ObjectStoreCacheOptions {
     /// or aborted compaction never leaves a half-written SST visible in the
     /// cache. Has no effect when `root_folder` is `None`. Default is true.
     pub prewarm_cache_on_compaction: bool,
+
+    /// Use an `io_uring`-backed cache storage backend instead of the default
+    /// `spawn_blocking` + `pread` path. The io_uring backend pins all cache
+    /// I/O onto a dedicated worker thread so cache reads do not contend with
+    /// other `spawn_blocking` consumers (e.g. compaction). Only honored on
+    /// Linux; on other platforms it silently falls back to the standard
+    /// backend. Default is false.
+    pub use_io_uring: bool,
+
+    /// When `use_io_uring` is true, open part files with `O_DIRECT` so reads
+    /// and writes bypass the kernel page cache. Useful when the working set
+    /// dwarfs RAM and page-cache churn from one tenant evicts another's hot
+    /// pages. **Warning:** on workloads where the working set fits in RAM
+    /// this hurts read latency, since every read becomes an NVMe round trip
+    /// instead of a page-cache hit. Ignored if `use_io_uring` is false.
+    /// Head metadata files stay buffered always (their <1KB sizes can't
+    /// satisfy O_DIRECT alignment). Default is false.
+    pub io_uring_direct_io: bool,
 }
 
 impl Default for ObjectStoreCacheOptions {
@@ -1380,6 +1398,8 @@ impl Default for ObjectStoreCacheOptions {
             scan_interval: Some(Duration::from_secs(3600)),
             max_open_file_handles: 1000,
             prewarm_cache_on_compaction: true,
+            use_io_uring: false,
+            io_uring_direct_io: false,
         }
     }
 }
