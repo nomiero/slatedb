@@ -79,45 +79,6 @@ impl Drop for AlignedBuf {
     }
 }
 
-/// Write a `Bytes` payload to `file`, optionally pacing the write so a single
-/// large SST part doesn't saturate the device. Reads from foreground requests
-/// can otherwise queue behind a sustained 100MB+ write at compaction time and
-/// inflate `r_await`.
-///
-/// Pacing is controlled via env vars and only kicks in when both are set:
-/// - `SLATEDB_CACHE_WRITE_CHUNK_BYTES`: chunk size (e.g. 8388608 = 8MB).
-/// - `SLATEDB_CACHE_WRITE_PAUSE_US`: microseconds to sleep between chunks.
-///
-/// Unset / zero on either side preserves the original `write_all` semantics
-/// (one syscall, no pause). Reading the env on every call is cheap relative
-/// to a 100MB+ disk write and lets the bencher tune without a rebuild.
-fn write_all_paced(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
-    let chunk_bytes = std::env::var("SLATEDB_CACHE_WRITE_CHUNK_BYTES")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
-    let pause_us = std::env::var("SLATEDB_CACHE_WRITE_PAUSE_US")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-
-    if chunk_bytes == 0 || pause_us == 0 || bytes.len() <= chunk_bytes {
-        return file.write_all(bytes);
-    }
-
-    let pause = Duration::from_micros(pause_us);
-    let mut offset = 0;
-    while offset < bytes.len() {
-        let end = (offset + chunk_bytes).min(bytes.len());
-        file.write_all(&bytes[offset..end])?;
-        offset = end;
-        if offset < bytes.len() {
-            std::thread::sleep(pause);
-        }
-    }
-    Ok(())
-}
-
 /// A cached file handle node. Callers that obtain an `Arc<CachedFileHandle>`
 /// keep the underlying fd alive even after the entry is evicted from the cache.
 #[derive(Debug)]
@@ -592,7 +553,7 @@ impl FsCacheEntry {
                 file.write_all(&aligned.as_slice()[..buf.len()])
                     .map_err(wrap_io_err)?;
             } else {
-                write_all_paced(&mut file, &buf).map_err(wrap_io_err)?;
+                file.write_all(&buf).map_err(wrap_io_err)?;
             }
             // No fsync. The cache is reconstructable from the upstream
             // object store; a power loss may leave torn or zero-length
@@ -991,7 +952,7 @@ impl FsCacheTee {
                 .create(true)
                 .truncate(true)
                 .open(&tmp_path)?;
-            write_all_paced(&mut file, &bytes)?;
+            file.write_all(&bytes)?;
             // No fsync. The tee is best-effort: on a crash before the
             // rename-into-place barrier the orphan tmp files are swept by
             // scan_entries on next start. On a crash after rename, a torn
