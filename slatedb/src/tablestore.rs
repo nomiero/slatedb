@@ -2031,6 +2031,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         ));
         let cached =
             CachedObjectStore::new(upstream.clone(), cache_storage.clone(), 1024, false, stats)

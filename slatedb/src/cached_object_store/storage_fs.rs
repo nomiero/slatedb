@@ -131,13 +131,19 @@ impl CachedFileHandle {
     }
 }
 
-/// A cache of open file descriptors, keyed by filesystem path.
+/// A bounded LRU cache of open file descriptors, keyed by filesystem
+/// path.
 ///
-/// Backed by `scc::HashMap`, which provides lock-free reads via per-bucket
-/// atomic state. Steady-state lookups never block another reader. Inserts
-/// (cold-miss path) take a brief per-bucket lock. There is no eviction;
-/// under the intended config (preload all SSTs + evictor disabled) the fd
-/// set is write-once-read-many and unbounded growth is a non-issue.
+/// Backed by `lru::LruCache` under a `parking_lot::Mutex`. The mutex
+/// is held only long enough to bump the recency entry / evict / insert,
+/// not across the actual file open or any I/O. Once a caller has the
+/// `Arc<CachedFileHandle>` it can read concurrently with other holders.
+///
+/// Eviction matters under O_DIRECT: every cached part keeps an open
+/// fd, and over a long run with a large keyspace the unbounded
+/// scc-backed version exceeded `RLIMIT_NOFILE`. The cap here is the
+/// hard ceiling on simultaneously held fds; tune via
+/// `ObjectStoreCacheOptions::max_open_file_handles`.
 ///
 /// Individual file reads use positional I/O (`pread` / `read_exact_at`)
 /// which does not touch the file cursor, so multiple threads can read from
@@ -145,31 +151,28 @@ impl CachedFileHandle {
 /// locking.
 #[derive(Clone)]
 pub(crate) struct FileHandleCache {
-    inner: Arc<scc::HashMap<std::path::PathBuf, Arc<CachedFileHandle>>>,
-    /// When set, file handles for reads are opened with `O_DIRECT |
-    /// O_NOATIME` so reads bypass the page cache. Reads then need
-    /// 4KB-aligned offsets, lengths, and buffers; the read paths
-    /// handle this by reading aligned ranges and slicing.
-    direct_io: bool,
+    inner: Arc<parking_lot::Mutex<lru::LruCache<std::path::PathBuf, Arc<CachedFileHandle>>>>,
+    /// Capacity reported in Debug; the LruCache also stores it but
+    /// surfacing it without locking is convenient.
+    capacity: usize,
 }
 
 impl std::fmt::Debug for FileHandleCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileHandleCache")
-            .field("len", &self.inner.len())
-            .field("direct_io", &self.direct_io)
+            .field("len", &self.inner.lock().len())
+            .field("capacity", &self.capacity)
             .finish()
     }
 }
 
 impl FileHandleCache {
-    fn new(_max_handles: usize, direct_io: bool) -> Self {
-        // max_handles is accepted for API compatibility but ignored: the
-        // scc-backed map is unbounded by design. Callers that pass a small
-        // cap should be aware that the cache will not enforce it.
+    fn new(max_handles: usize) -> Self {
+        let capacity = max_handles.max(1);
+        let cap = std::num::NonZeroUsize::new(capacity).expect("capacity is at least 1");
         Self {
-            inner: Arc::new(scc::HashMap::new()),
-            direct_io,
+            inner: Arc::new(parking_lot::Mutex::new(lru::LruCache::new(cap))),
+            capacity,
         }
     }
 
@@ -185,14 +188,20 @@ impl FileHandleCache {
         path: &std::path::Path,
         direct_io: bool,
     ) -> Result<Option<Arc<CachedFileHandle>>, std::io::Error> {
-        // Hot path: lock-free lookup.
-        if let Some(entry) = self.inner.read(path, |_, v| v.clone()) {
-            if Self::is_valid(&entry, path) {
-                return Ok(Some(entry));
+        // Hot path: bump LRU recency and clone the Arc. Drop the lock
+        // before doing any I/O on the returned handle.
+        {
+            let mut guard = self.inner.lock();
+            if let Some(entry) = guard.get(path) {
+                let entry = entry.clone();
+                drop(guard);
+                if Self::is_valid(&entry, path) {
+                    return Ok(Some(entry));
+                }
+                // Stale (file replaced or unlinked). Remove and fall
+                // through to reopen.
+                self.inner.lock().pop(path);
             }
-            // Stale (file replaced or unlinked). Remove and fall through to
-            // reopen.
-            self.inner.remove(path);
         }
 
         let mut open = std::fs::OpenOptions::new();
@@ -217,20 +226,17 @@ impl FileHandleCache {
 
         let handle = Arc::new(CachedFileHandle { file });
 
-        // Race-tolerant insert: if another thread inserted concurrently, we
-        // discard our newly opened fd and use theirs. Either way we return a
-        // valid handle.
-        match self.inner.insert(path.to_path_buf(), handle.clone()) {
-            Ok(()) => Ok(Some(handle)),
-            Err((_path, _handle)) => {
-                // Lost the race. Try to pick up the winner; if a third
-                // thread (e.g. invalidate after a delete_sst) yanked the
-                // entry between insert and read, the map is empty for this
-                // path. In that case fall back to our freshly opened fd.
-                let winner = self.inner.read(path, |_, v| v.clone()).unwrap_or(handle);
-                Ok(Some(winner))
-            }
+        // Race-tolerant insert: if another thread inserted concurrently
+        // we use theirs and drop our freshly opened fd. The LRU's
+        // `put` returns the previous value when the key already
+        // exists, but for fd-cache semantics we want the first writer
+        // to win so concurrent readers all share the same Arc.
+        let mut guard = self.inner.lock();
+        if let Some(existing) = guard.get(path) {
+            return Ok(Some(existing.clone()));
         }
+        guard.put(path.to_path_buf(), handle.clone());
+        Ok(Some(handle))
     }
 
     /// Check whether a cached file descriptor still refers to a live file.
@@ -284,7 +290,7 @@ impl FileHandleCache {
     /// Remove a cached handle, e.g. after eviction or after a write replaces
     /// the file (since the cached fd would still reference the old inode).
     fn invalidate(&self, path: &std::path::Path) {
-        self.inner.remove(path);
+        self.inner.lock().pop(path);
     }
 }
 
@@ -357,7 +363,7 @@ impl FsCacheStorage {
         max_open_file_handles: usize,
         direct_io: bool,
     ) -> Self {
-        let file_handle_cache = FileHandleCache::new(max_open_file_handles, direct_io);
+        let file_handle_cache = FileHandleCache::new(max_open_file_handles);
         let evictor = max_cache_size_bytes.map(|max_cache_size_bytes| {
             Arc::new(FsCacheEvictor::new(
                 root_folder.clone(),
@@ -2184,6 +2190,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         );
         storage.start_evictor().await;
 
@@ -2264,6 +2271,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         );
         storage.start_evictor().await;
 
@@ -2322,6 +2330,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         );
         storage.start_evictor().await;
 
@@ -2402,6 +2411,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         );
         storage.start_evictor().await;
 
