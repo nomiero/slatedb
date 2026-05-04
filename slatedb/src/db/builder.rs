@@ -623,35 +623,35 @@ impl<P: Into<Path>> DbBuilder<P> {
             None,
         ));
 
-        // The compactor reads each input SST end-to-end. We deliberately
-        // route those reads through the *uncached* upstream object store
-        // (async network I/O via reqwest) rather than through the local
-        // disk cache (which would dispatch every block read through the
-        // shared `tokio::task::spawn_blocking` pool and contend with
-        // foreground reads). Outputs still go to upstream + the local
-        // disk cache via the prewarm tee, which is wired in by attaching
-        // `cached_object_store` and enabling `prewarm_compacted_on_write`
-        // below. Net effect: foreground readers keep an uncontested
-        // blocking pool while compaction outputs stay locally cached
-        // for the next reader.
-        let compactor_table_store = Arc::new(
-            TableStore::new_with_fp_registry(
-                ObjectStores::new(
-                    retrying_main_object_store.clone(),
-                    retrying_wal_object_store.clone(),
-                ),
-                sst_format,
-                path_resolver.clone(),
-                self.fp_registry.clone(),
-                None,
-            )
-            .with_cached_object_store(cached_object_store.clone())
-            .with_prewarm_compacted_on_write(
-                self.settings
-                    .object_store_cache_options
-                    .prewarm_cache_on_compaction,
+        // The compactor reads each input SST end-to-end. We route those
+        // reads through the uncached upstream object store so they don't
+        // pollute the (now thin) prefetch tier. Compaction *outputs*,
+        // however, get the same `db_cache` wrapper as the main table
+        // store: the streaming `EncodedSsTableWriter::close` warms the
+        // db_cache (foyer block + meta) with the new SST's blocks,
+        // index, and filter as they're written, so the first read after
+        // a manifest commit hits foyer instead of falling through to S3.
+        //
+        // We deliberately do NOT attach `with_cached_object_store(...)`
+        // here: the prefetch tier is sized for read-side fills, not
+        // tee'd writes, and `cache_puts=false` on the prefetch options
+        // would no-op the tee anyway.
+        let compactor_table_store = Arc::new(TableStore::new_with_fp_registry(
+            ObjectStores::new(
+                retrying_main_object_store.clone(),
+                retrying_wal_object_store.clone(),
             ),
-        );
+            sst_format,
+            path_resolver.clone(),
+            self.fp_registry.clone(),
+            self.db_cache.as_ref().map(|c| {
+                Arc::new(DbCacheWrapper::new(
+                    c.clone(),
+                    &recorder,
+                    system_clock.clone(),
+                )) as Arc<dyn DbCache>
+            }),
+        ));
 
         let compactor_builder = self.compactor_builder.or_else(|| {
             self.settings.compactor_options.as_ref().map(|opts| {

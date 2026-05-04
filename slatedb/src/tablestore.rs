@@ -319,6 +319,23 @@ impl TableStore {
             .await;
     }
 
+    /// Insert a freshly-encoded SST block into the db_cache (block tier).
+    /// Used by the streaming writer (`EncodedSsTableWriter::drain_blocks` /
+    /// `close`) to warm a primary block cache (e.g. foyer hybrid) with
+    /// compaction outputs as they're produced. Key shape matches the
+    /// reader path: `(sst_id, block_offset)`.
+    async fn cache_block(&self, sst: SsTableId, offset: u64, block: Block) {
+        let Some(ref cache) = self.cache else {
+            return;
+        };
+        cache
+            .insert(
+                (sst, offset).into(),
+                CachedEntry::with_block(Arc::new(block)),
+            )
+            .await;
+    }
+
     /// Decodes an `EncodedCachedFilter` slice into a fully-decoded
     /// `Arc<[NamedFilter]>` and overwrites the cache entry under `cache_key`
     /// with the decoded form so subsequent hits bypass the decode step.
@@ -365,6 +382,20 @@ impl TableStore {
         let object_store = self.object_stores.store_for(id);
         let path = self.path(id);
         debug!("deleting SST [path={}]", path);
+
+        // Evict any cached blocks / index / filters / stats for this
+        // SST from the db_cache *before* deleting upstream. The eviction
+        // path needs to read the index to enumerate block offsets, and
+        // that read fails if the upstream object has already been
+        // removed. Best-effort: failure to read the index is logged
+        // and we proceed with the delete. Foyer LRU will reclaim any
+        // stragglers under capacity pressure.
+        if self.cache.is_some() {
+            if let Ok(handle) = self.open_sst(id).await {
+                self.evict_sst_from_cache(&handle).await;
+            }
+        }
+
         object_store
             .delete(&path)
             .await
@@ -857,6 +888,11 @@ impl EncodedSsTableWriter<'_> {
             if let Some(tee) = self.cache_tee.as_mut() {
                 let _ = tee.extend(bytes).await;
             }
+            // Warm the block cache so the first reader after the
+            // manifest commit doesn't have to fetch from upstream.
+            self.table_store
+                .cache_block(self.id, block.offset, block.block)
+                .await;
         }
 
         let footer = encoded_sst.footer.as_ref();
@@ -934,6 +970,13 @@ impl EncodedSsTableWriter<'_> {
             if let Some(tee) = self.cache_tee.as_mut() {
                 let _ = tee.extend(bytes).await;
             }
+            // Warm the block cache for the new SST as we go, so that
+            // readers hitting the manifest entry post-commit find the
+            // blocks resident in `db_cache` (e.g. foyer hybrid) without
+            // needing to re-fetch from upstream.
+            self.table_store
+                .cache_block(self.id, block.offset, block.block)
+                .await;
             #[cfg(test)]
             {
                 self.blocks_written += 1;
