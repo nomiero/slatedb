@@ -9,5 +9,3 @@ pub mod stats;
 mod object_store;
 mod storage;
 mod storage_fs;
-#[cfg(target_os = "linux")]
-mod storage_uring;

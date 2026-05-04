@@ -1365,24 +1365,16 @@ pub struct ObjectStoreCacheOptions {
     /// cache. Has no effect when `root_folder` is `None`. Default is true.
     pub prewarm_cache_on_compaction: bool,
 
-    /// Use an `io_uring`-backed cache storage backend instead of the default
-    /// `spawn_blocking` + `pread` path. The io_uring backend pins all cache
-    /// I/O onto a dedicated worker thread so cache reads do not contend with
-    /// other `spawn_blocking` consumers (e.g. compaction). Only honored on
-    /// Linux; on other platforms it silently falls back to the standard
-    /// backend. Default is false.
-    pub use_io_uring: bool,
-
     /// Open part files with `O_DIRECT` so reads and writes bypass the
     /// kernel page cache. Useful when the working set dwarfs RAM and
     /// page-cache churn evicts hot pages, or when predictable per-read
-    /// latency matters more than peak throughput. Applies to both the
-    /// FsCacheStorage (`spawn_blocking` + `pread`) and IoUringCacheStorage
-    /// backends. **Warning:** on workloads where the working set fits in
-    /// RAM this hurts read latency since every read becomes an NVMe
-    /// round trip instead of a page-cache hit. Head metadata files
-    /// (<1KB) stay buffered — they can't satisfy O_DIRECT alignment.
-    /// Tail short writes also fall back to buffered I/O. Default false.
+    /// latency matters more than peak throughput. Only the FsCacheStorage
+    /// (`spawn_blocking` + `pread`) backend honors this. **Warning:** on
+    /// workloads where the working set fits in RAM this hurts read
+    /// latency since every read becomes an NVMe round trip instead of a
+    /// page-cache hit. Head metadata files (<1KB) stay buffered — they
+    /// can't satisfy O_DIRECT alignment. Tail short writes also fall
+    /// back to buffered I/O. Default false.
     pub direct_io: bool,
 }
 
@@ -1400,7 +1392,6 @@ impl Default for ObjectStoreCacheOptions {
             scan_interval: Some(Duration::from_secs(3600)),
             max_open_file_handles: 1000,
             prewarm_cache_on_compaction: true,
-            use_io_uring: false,
             direct_io: false,
         }
     }
