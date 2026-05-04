@@ -78,6 +78,18 @@ pub(crate) enum SlateDBError {
     #[error("invalid compaction")]
     InvalidCompaction,
 
+    /// Returned by [`crate::Db::bulk_load_sorted_run`] when the
+    /// database already has data (any L0 SSTs or compacted sorted
+    /// runs). Bulk load only supports seeding an empty database.
+    #[error("bulk load requires an empty database (no L0 SSTs, no compacted sorted runs)")]
+    BulkLoadDatabaseNotEmpty,
+
+    /// Returned by [`crate::Db::bulk_load_sorted_run`] when the
+    /// caller-supplied iterator yields entries whose keys are not in
+    /// strictly ascending order.
+    #[error("bulk load entries must be in strictly ascending key order")]
+    BulkLoadKeysOutOfOrder,
+
     #[error("compaction executor failed")]
     CompactionExecutorFailed,
 
@@ -525,6 +537,8 @@ impl From<SlateDBError> for Error {
             SlateDBError::IdenticalClonePaths { .. } => Error::invalid(msg),
             SlateDBError::WalDisabled => Error::invalid(msg),
             SlateDBError::InvalidCompaction => Error::invalid(msg),
+            SlateDBError::BulkLoadDatabaseNotEmpty => Error::invalid(msg),
+            SlateDBError::BulkLoadKeysOutOfOrder => Error::invalid(msg),
             SlateDBError::InvalidClockTick { .. } => Error::invalid(msg),
             SlateDBError::InvalidDeletion => Error::invalid(msg),
             SlateDBError::MergeOperatorError(err) => Error::invalid(msg).with_source(Box::new(err)),

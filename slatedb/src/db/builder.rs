@@ -585,6 +585,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                 self.fp_registry.clone(),
                 self.merge_operator.clone(),
                 status_manager.clone(),
+                manifest_store.clone(),
             )
             .await?,
         );

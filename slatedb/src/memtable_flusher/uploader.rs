@@ -286,7 +286,7 @@ mod tests {
             Arc::clone(&object_store),
         ));
         let stored_manifest = crate::manifest::store::StoredManifest::create_new_db(
-            manifest_store,
+            Arc::clone(&manifest_store),
             ManifestCore::new_with_wal_object_store(None),
             Arc::clone(&system_clock),
         )
@@ -317,6 +317,7 @@ mod tests {
                 fp_registry,
                 None,
                 status_manager,
+                manifest_store,
             )
             .await
             .unwrap(),

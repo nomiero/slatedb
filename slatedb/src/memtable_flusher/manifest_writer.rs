@@ -1027,6 +1027,7 @@ mod tests {
                 fp_registry,
                 None,
                 status_manager,
+                Arc::clone(&manifest_store),
             )
             .await
             .unwrap(),

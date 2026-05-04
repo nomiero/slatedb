@@ -91,7 +91,7 @@ impl SsTableView {
     /// Create a view using a deterministic id derived from the SST's own identity.
     /// Use this only for ephemeral views (e.g. WAL iteration) or legacy migration
     /// where no `DbRand` is available and the id is not stored in the manifest.
-    pub(crate) fn identity(sst: SsTableHandle) -> Self {
+    pub fn identity(sst: SsTableHandle) -> Self {
         let id = match &sst.id {
             SsTableId::Compacted(ulid) => *ulid,
             SsTableId::Wal(wal_id) => Ulid::from_parts(*wal_id, 0),

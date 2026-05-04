@@ -29,7 +29,10 @@ pub struct RowEntry {
 }
 
 impl RowEntry {
-    pub(crate) fn new(
+    /// Construct a row entry directly. Used by callers that build SST
+    /// content outside the normal write path (e.g.
+    /// [`Db::bulk_load_sorted_run`]).
+    pub fn new(
         key: Bytes,
         value: ValueDeletable,
         seq: u64,
