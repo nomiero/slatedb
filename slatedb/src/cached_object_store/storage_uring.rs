@@ -392,14 +392,10 @@ fn run_worker(
     // Adaptive: target foreground read p99 in microseconds. The pause
     // scales around `pause_us` based on observed p99: faster when reads
     // are quick, slower when they tail-spike. 0 disables adaptation.
-    // Default 1ms — buffered reads served from page cache are <µs;
-    // O_DIRECT reads land on NVMe at ~100µs each. Even a couple of
-    // hundred µs already signals device queue contention worth
-    // backing off.
     let target_read_p99_us: u64 = std::env::var("SLATEDB_CACHE_TARGET_READ_P99_US")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1_000);
+        .unwrap_or(5_000);
     let mut pacing_controller = PacingController::new(
         std::time::Duration::from_micros(pause_us),
         target_read_p99_us,
