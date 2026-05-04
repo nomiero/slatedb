@@ -656,30 +656,69 @@ impl ManifestWriterHandler {
         &self,
         remote_dirty: slatedb_txn_obj::DirtyObject<crate::manifest::Manifest>,
     ) {
-        // Time the state.write() acquisition so the manifest-poller
-        // path is captured by the same `state_write_held_micros_total`
-        // counter as the apply_uploaded_state path. Compaction
-        // results land here (via the manifest poller), so this is the
-        // suspected cause of the post-compaction read-throughput
-        // dips.
+        // Time the state.write() acquisition + work so the
+        // manifest-poller path is captured by the same
+        // `state_write_held_micros_total` counter as the
+        // apply_uploaded_state path. Compaction results land here
+        // (via the manifest poller), so this is the suspected cause
+        // of the post-compaction read-throughput dips. Split the
+        // measurement into `acquire` (waiting for current readers /
+        // writers to release) and `work` (held while merging) so we
+        // can tell whether the cost lives in the merge itself
+        // (e.g. cloning a large `sequence_tracker`) or in queuing
+        // behind active readers.
+        const SLOW_MERGE_LOCK_THRESHOLD: std::time::Duration =
+            std::time::Duration::from_millis(1);
+
+        // Capture a coarse remote-side size before we take the lock
+        // so the warn log can attribute large merges to the right
+        // shape (e.g. "compactor handed us a tree with N L0 + M SR
+        // views").
+        let remote_l0_len = remote_dirty.value.core.tree.l0.len();
+        let remote_compacted_runs = remote_dirty.value.core.tree.compacted.len();
+        let remote_compacted_views: usize = remote_dirty
+            .value
+            .core
+            .tree
+            .compacted
+            .iter()
+            .map(|sr| sr.sst_views.len())
+            .sum();
+
         #[allow(clippy::disallowed_methods)]
-        let start = tokio::time::Instant::now();
-        let dirty_manifest = {
-            let mut wguard_state = self.db.state.write();
-            wguard_state.merge_remote_manifest(remote_dirty);
-            let cow = wguard_state.state();
-            self.db
-                .db_stats
-                .l0_sst_count
-                .set(cow.core().tree.l0.len() as i64);
-            cow.manifest.clone()
-        };
-        let elapsed = start.elapsed();
+        let acquire_start = tokio::time::Instant::now();
+        let mut wguard_state = self.db.state.write();
+        let acquire_elapsed = acquire_start.elapsed();
+        #[allow(clippy::disallowed_methods)]
+        let work_start = tokio::time::Instant::now();
+        wguard_state.merge_remote_manifest(remote_dirty);
+        let cow = wguard_state.state();
+        self.db
+            .db_stats
+            .l0_sst_count
+            .set(cow.core().tree.l0.len() as i64);
+        let dirty_manifest = cow.manifest.clone();
+        let work_elapsed = work_start.elapsed();
+        drop(wguard_state);
+        let total_elapsed = acquire_elapsed + work_elapsed;
         self.db.db_stats.state_write_acquisitions.increment(1);
         self.db
             .db_stats
             .state_write_held_micros_total
-            .increment(elapsed.as_micros() as u64);
+            .increment(total_elapsed.as_micros() as u64);
+        if acquire_elapsed > SLOW_MERGE_LOCK_THRESHOLD
+            || work_elapsed > SLOW_MERGE_LOCK_THRESHOLD
+        {
+            warn!(
+                "slow state.write() in merge_remote_manifest: acquire={:?}, work={:?}, \
+                 remote_l0={}, remote_compacted_runs={}, remote_compacted_views={}",
+                acquire_elapsed,
+                work_elapsed,
+                remote_l0_len,
+                remote_compacted_runs,
+                remote_compacted_views,
+            );
+        }
         self.db
             .status_manager
             .report_manifest(dirty_manifest.into());
