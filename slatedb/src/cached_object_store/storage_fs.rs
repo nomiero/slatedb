@@ -28,6 +28,57 @@ use crate::utils::format_bytes_si;
 /// any final rename.
 const TEE_TMP_INFIX: &str = ".tmp-";
 
+/// `O_DIRECT` requires offset, length, and buffer to be aligned. ext4
+/// and xfs both demand 4KB on common Linux installs.
+const O_DIRECT_ALIGN: usize = 4096;
+
+/// Heap allocation aligned to [`O_DIRECT_ALIGN`]. Used for both the
+/// read path (round range to alignment, slice on completion) and the
+/// write path (copy aligned-length payloads in before pwriting).
+struct AlignedBuf {
+    ptr: *mut u8,
+    capacity: usize,
+    layout: std::alloc::Layout,
+}
+
+unsafe impl Send for AlignedBuf {}
+unsafe impl Sync for AlignedBuf {}
+
+impl AlignedBuf {
+    fn new(capacity: usize) -> std::io::Result<Self> {
+        let aligned_cap = capacity.div_ceil(O_DIRECT_ALIGN) * O_DIRECT_ALIGN;
+        let layout = std::alloc::Layout::from_size_align(aligned_cap, O_DIRECT_ALIGN)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        // SAFETY: aligned_cap >= O_DIRECT_ALIGN > 0
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            return Err(std::io::Error::other("aligned alloc failed"));
+        }
+        Ok(Self {
+            ptr,
+            capacity: aligned_cap,
+            layout,
+        })
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: ptr was alloc'd with `capacity` bytes.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.capacity) }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: ptr was alloc'd with `capacity` bytes.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.capacity) }
+    }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        // SAFETY: ptr came from `alloc_zeroed` with this exact layout.
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) }
+    }
+}
+
 /// Write a `Bytes` payload to `file`, optionally pacing the write so a single
 /// large SST part doesn't saturate the device. Reads from foreground requests
 /// can otherwise queue behind a sustained 100MB+ write at compaction time and
@@ -95,31 +146,44 @@ impl CachedFileHandle {
 #[derive(Clone)]
 pub(crate) struct FileHandleCache {
     inner: Arc<scc::HashMap<std::path::PathBuf, Arc<CachedFileHandle>>>,
+    /// When set, file handles for reads are opened with `O_DIRECT |
+    /// O_NOATIME` so reads bypass the page cache. Reads then need
+    /// 4KB-aligned offsets, lengths, and buffers; the read paths
+    /// handle this by reading aligned ranges and slicing.
+    direct_io: bool,
 }
 
 impl std::fmt::Debug for FileHandleCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileHandleCache")
             .field("len", &self.inner.len())
+            .field("direct_io", &self.direct_io)
             .finish()
     }
 }
 
 impl FileHandleCache {
-    fn new(_max_handles: usize) -> Self {
+    fn new(_max_handles: usize, direct_io: bool) -> Self {
         // max_handles is accepted for API compatibility but ignored: the
         // scc-backed map is unbounded by design. Callers that pass a small
         // cap should be aware that the cache will not enforce it.
         Self {
             inner: Arc::new(scc::HashMap::new()),
+            direct_io,
         }
     }
 
     /// Look up a cached file handle, or open the file and cache it.
     /// Returns `Ok(None)` if the file does not exist on disk.
+    ///
+    /// When `direct_io` is true the file is opened with `O_DIRECT |
+    /// O_NOATIME`. Callers that read non-aligned files (e.g. heads) must
+    /// pass `direct_io = false` even when the storage is configured with
+    /// `O_DIRECT` overall.
     fn get_or_open(
         &self,
         path: &std::path::Path,
+        direct_io: bool,
     ) -> Result<Option<Arc<CachedFileHandle>>, std::io::Error> {
         // Hot path: lock-free lookup.
         if let Some(entry) = self.inner.read(path, |_, v| v.clone()) {
@@ -131,7 +195,14 @@ impl FileHandleCache {
             self.inner.remove(path);
         }
 
-        let file = match std::fs::File::open(path) {
+        let mut open = std::fs::OpenOptions::new();
+        open.read(true);
+        #[cfg(target_os = "linux")]
+        if direct_io {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.custom_flags(libc::O_DIRECT | libc::O_NOATIME);
+        }
+        let file = match open.open(path) {
             Ok(f) => f,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
@@ -139,7 +210,9 @@ impl FileHandleCache {
 
         // Hint the kernel that we will read randomly inside this file. SST
         // reads pull small block ranges out of large parts; the default
-        // readahead is wasted I/O. Best-effort: ignore failures.
+        // readahead is wasted I/O. Best-effort: ignore failures. With
+        // O_DIRECT this is a no-op on the page-cache side, but the hint
+        // still applies to readahead semantics on some kernels.
         Self::set_random_advise(&file);
 
         let handle = Arc::new(CachedFileHandle { file });
@@ -265,9 +338,15 @@ pub struct FsCacheStorage {
     evictor: Option<Arc<FsCacheEvictor>>,
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
+    /// When set, opens write tmp files with `O_DIRECT` (only when the
+    /// payload is 4KB-aligned) and read fds via `FileHandleCache` are
+    /// opened with `O_DIRECT | O_NOATIME`. Heads + tail short writes
+    /// fall back to buffered.
+    direct_io: bool,
 }
 
 impl FsCacheStorage {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         root_folder: std::path::PathBuf,
         max_cache_size_bytes: Option<usize>,
@@ -276,8 +355,9 @@ impl FsCacheStorage {
         system_clock: Arc<dyn SystemClock>,
         rand: Arc<DbRand>,
         max_open_file_handles: usize,
+        direct_io: bool,
     ) -> Self {
-        let file_handle_cache = FileHandleCache::new(max_open_file_handles);
+        let file_handle_cache = FileHandleCache::new(max_open_file_handles, direct_io);
         let evictor = max_cache_size_bytes.map(|max_cache_size_bytes| {
             Arc::new(FsCacheEvictor::new(
                 root_folder.clone(),
@@ -295,6 +375,7 @@ impl FsCacheStorage {
             evictor,
             rand,
             file_handle_cache,
+            direct_io,
         }
     }
 }
@@ -313,6 +394,7 @@ impl LocalCacheStorage for FsCacheStorage {
             part_size,
             rand: self.rand.clone(),
             file_handle_cache: self.file_handle_cache.clone(),
+            direct_io: self.direct_io,
         })
     }
 
@@ -439,6 +521,10 @@ pub(crate) struct FsCacheEntry {
     evictor: Option<Arc<FsCacheEvictor>>,
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
+    /// Inherited from the storage. When true, atomic_write opens with
+    /// `O_DIRECT` and copies into an aligned buffer (only when payload
+    /// is 4KB-aligned), and reads use aligned buffers + range slicing.
+    direct_io: bool,
 }
 
 impl FsCacheEntry {
@@ -470,6 +556,7 @@ impl FsCacheEntry {
         // blocking task.
         // see https://github.com/slatedb/slatedb/pull/1342
         let invalidate_path = path.clone();
+        let direct_io = self.direct_io;
         #[allow(clippy::disallowed_methods)]
         tokio::task::spawn_blocking(move || {
             let tmp_path = tmp_path.as_path();
@@ -478,13 +565,29 @@ impl FsCacheEntry {
                 std::fs::create_dir_all(folder_path).map_err(wrap_io_err)?;
             }
 
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(tmp_path)
-                .map_err(wrap_io_err)?;
-            write_all_paced(&mut file, &buf).map_err(wrap_io_err)?;
+            // Apply O_DIRECT only when the payload length is 4KB-
+            // aligned. Heads (~287 bytes) and any tail-end short
+            // writes don't satisfy the alignment constraint and stay
+            // buffered. The aligned-payload path also needs a
+            // 4KB-aligned source buffer; we copy the bytes into an
+            // AlignedBuf before writing.
+            let aligned_payload = direct_io && !buf.is_empty() && buf.len() % O_DIRECT_ALIGN == 0;
+            let mut open = std::fs::OpenOptions::new();
+            open.write(true).create(true).truncate(true);
+            #[cfg(target_os = "linux")]
+            if aligned_payload {
+                use std::os::unix::fs::OpenOptionsExt;
+                open.custom_flags(libc::O_DIRECT);
+            }
+            let mut file = open.open(tmp_path).map_err(wrap_io_err)?;
+            if aligned_payload {
+                let mut aligned = AlignedBuf::new(buf.len()).map_err(wrap_io_err)?;
+                aligned.as_mut_slice()[..buf.len()].copy_from_slice(&buf);
+                file.write_all(&aligned.as_slice()[..buf.len()])
+                    .map_err(wrap_io_err)?;
+            } else {
+                write_all_paced(&mut file, &buf).map_err(wrap_io_err)?;
+            }
             // No fsync. The cache is reconstructable from the upstream
             // object store; a power loss may leave torn or zero-length
             // files, which the read path treats as a miss and refetches.
@@ -571,15 +674,38 @@ impl LocalCacheEntry for FsCacheEntry {
         // see https://github.com/slatedb/slatedb/pull/1342
         let file_cache = self.file_handle_cache.clone();
         let this_part_path = part_path.clone();
+        let direct_io = self.direct_io;
         #[allow(clippy::disallowed_methods)]
         let result = tokio::task::spawn_blocking(move || {
-            let file = match file_cache.get_or_open(&this_part_path) {
+            let file = match file_cache.get_or_open(&this_part_path, direct_io) {
                 Ok(Some(f)) => f,
                 Ok(None) => return Ok(None),
                 Err(err) => return Err(wrap_io_err(err)),
             };
 
-            // Use positional I/O (pread) — no seek required, and safe for
+            if direct_io {
+                // O_DIRECT path: round the requested range out to 4KB
+                // boundaries, read aligned bytes into an aligned buf,
+                // then slice the result back to the caller's range.
+                let req_off = range_in_part.start as u64;
+                let req_len = range_in_part.len();
+                let aligned_off = (req_off / O_DIRECT_ALIGN as u64) * O_DIRECT_ALIGN as u64;
+                let head_pad = (req_off - aligned_off) as usize;
+                let aligned_len = (head_pad + req_len)
+                    .div_ceil(O_DIRECT_ALIGN)
+                    * O_DIRECT_ALIGN;
+                let mut aligned = AlignedBuf::new(aligned_len).map_err(wrap_io_err)?;
+                read_exact_at_offset(
+                    file.file(),
+                    &mut aligned.as_mut_slice()[..aligned_len],
+                    aligned_off,
+                )
+                .map_err(wrap_io_err)?;
+                let slice = &aligned.as_slice()[head_pad..head_pad + req_len];
+                return Ok(Some(Bytes::copy_from_slice(slice)));
+            }
+
+            // Buffered path: positional I/O (pread) — no seek required, and safe for
             // concurrent readers sharing the same Arc<File>.
             let mut buffer = vec![0; range_in_part.len()];
             read_exact_at_offset(file.file(), &mut buffer, range_in_part.start as u64)
@@ -691,7 +817,9 @@ impl LocalCacheEntry for FsCacheEntry {
         let this_head_path = head_path.clone();
         #[allow(clippy::disallowed_methods)]
         let result = tokio::task::spawn_blocking(move || {
-            let file = match file_cache.get_or_open(&this_head_path) {
+            // Heads are short JSON (~287 bytes), not 4KB-aligned, and
+            // are written buffered. Always open them buffered for read.
+            let file = match file_cache.get_or_open(&this_head_path, false) {
                 Ok(Some(f)) => f,
                 Ok(None) => return Ok(None),
                 Err(err) => return Err(wrap_io_err(err)),

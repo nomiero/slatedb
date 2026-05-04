@@ -124,7 +124,7 @@ impl CachedObjectStore {
                 {
                     match crate::cached_object_store::storage_uring::IoUringCacheStorage::try_new(
                         cache_root_folder.clone(),
-                        options.io_uring_direct_io,
+                        options.direct_io,
                     ) {
                         Ok(s) => Arc::new(s),
                         Err(e) => {
@@ -140,6 +140,7 @@ impl CachedObjectStore {
                                 clock.clone(),
                                 rand.clone(),
                                 options.max_open_file_handles,
+                                options.direct_io,
                             ))
                         }
                     }
@@ -155,6 +156,7 @@ impl CachedObjectStore {
                         clock.clone(),
                         rand.clone(),
                         options.max_open_file_handles,
+                        options.direct_io,
                     ))
                 }
             } else {
@@ -166,6 +168,7 @@ impl CachedObjectStore {
                     clock,
                     rand,
                     options.max_open_file_handles,
+                    options.direct_io,
                 ))
             };
         let cached = Self::new(
