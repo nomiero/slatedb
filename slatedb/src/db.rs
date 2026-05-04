@@ -1811,6 +1811,7 @@ impl Db {
         let mut output_handles: Vec<crate::db_state::SsTableHandle> = Vec::new();
         let mut writer = table_store.table_writer(SsTableId::Compacted(Ulid::new()));
         let mut bytes_in_current_sst: usize = 0;
+        let mut entries_in_current_sst: u64 = 0;
         let mut total_bytes: u64 = 0;
         let mut entries_written: u64 = 0;
         let mut max_seq: u64 = 0;
@@ -1837,23 +1838,24 @@ impl Db {
                 total_bytes = total_bytes.saturating_add(block_size as u64);
             }
             entries_written += 1;
+            entries_in_current_sst += 1;
 
             if bytes_in_current_sst > max_sst_size {
                 let handle = writer.close().await.map_err(crate::Error::from)?;
                 output_handles.push(handle);
                 bytes_in_current_sst = 0;
+                entries_in_current_sst = 0;
                 writer = table_store.table_writer(SsTableId::Compacted(Ulid::new()));
             }
         }
 
-        // Close the final writer iff it actually received any entries;
-        // closing an empty writer would produce a zero-block SST.
-        if entries_written > 0 && bytes_in_current_sst > 0 {
+        // Close the final writer iff it received any entries. The size
+        // gate above only counts *finished* blocks, so the writer can
+        // still hold buffered entries even when `bytes_in_current_sst`
+        // is zero. Use the entry count instead.
+        if entries_in_current_sst > 0 {
             let handle = writer.close().await.map_err(crate::Error::from)?;
             output_handles.push(handle);
-        } else if entries_written > 0 {
-            // The very last entry slotted into a fresh writer after a
-            // size-triggered close. That writer is empty; skip it.
         }
 
         if output_handles.is_empty() {
@@ -1902,6 +1904,19 @@ impl Db {
             })
             .await
             .map_err(crate::Error::from)?;
+
+        // Advance the oracle's in-memory sequence numbers so reads
+        // performed against this Db instance after `bulk_load_sorted_run`
+        // returns can actually see the loaded entries (otherwise the
+        // MVCC snapshot is `last_committed_seq=0` and every loaded row
+        // looks "in the future"). The manifest writer keeps writer-
+        // side `last_l0_seq` on merge, so simply calling
+        // `refresh_manifest` is not enough to bump these.
+        if max_seq > 0 {
+            self.inner.oracle.advance_last_seq(max_seq);
+            self.inner.oracle.advance_committed_seq(max_seq);
+            self.inner.oracle.advance_durable_seq(max_seq);
+        }
 
         Ok(BulkLoadStats {
             ssts_written,
@@ -8449,6 +8464,128 @@ mod tests {
             l0_count.is_some_and(|v| v > 0),
             "expected l0_sst_count > 0, got {:?}",
             l0_count
+        );
+        db.close().await.unwrap();
+    }
+
+    fn bulk_entry(key: &[u8], value: &[u8], seq: u64) -> RowEntry {
+        use crate::types::ValueDeletable;
+        RowEntry::new(
+            Bytes::copy_from_slice(key),
+            ValueDeletable::Value(Bytes::copy_from_slice(value)),
+            seq,
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_bulk_load_sorted_run_seeds_data_visible_after_refresh() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_bulk_load_basic";
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        let entries: Vec<RowEntry> = (0..1000u64)
+            .map(|i| {
+                let k = format!("key{:08}", i);
+                let v = format!("value{:08}", i);
+                bulk_entry(k.as_bytes(), v.as_bytes(), i + 1)
+            })
+            .collect();
+
+        let stats = db
+            .bulk_load_sorted_run(entries, 64 * 1024)
+            .await
+            .expect("bulk load");
+        assert!(stats.ssts_written >= 1);
+        assert_eq!(stats.entries_written, 1000);
+        assert_eq!(stats.max_seq, 1000);
+
+        // Before refresh the in-memory state is still empty.
+        assert_eq!(db.get(b"key00000042").await.unwrap(), None);
+
+        db.refresh_manifest().await.expect("refresh");
+
+        let manifest = db.manifest();
+        let compacted = manifest.compacted();
+        eprintln!(
+            "post-refresh manifest: id={}, compacted={} l0={} last_l0_seq={}",
+            manifest.id(),
+            compacted.len(),
+            manifest.l0().len(),
+            manifest.last_l0_seq(),
+        );
+        assert_eq!(compacted.len(), 1);
+        assert_eq!(compacted[0].id, 0);
+        assert!(!compacted[0].sst_views.is_empty());
+
+        let got = db.get(b"key00000042").await.unwrap();
+        assert_eq!(got, Some(Bytes::from_static(b"value00000042")));
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bulk_load_rejects_non_empty_database() {
+        use crate::config::{FlushOptions, FlushType};
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_bulk_load_not_empty";
+        let db = Db::builder(path, object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        // Write something through the regular put path first, then
+        // explicitly flush the memtable so it shows up in L0. (The
+        // default `flush()` flushes the WAL when WAL is enabled, but
+        // keeps the memtable in memory.)
+        db.put(b"existing", b"v").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        let entries = vec![bulk_entry(b"k", b"v", 1)];
+        let err = db
+            .bulk_load_sorted_run(entries, 64 * 1024)
+            .await
+            .expect_err("should reject");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("bulk load requires an empty database"),
+            "unexpected error: {msg}"
+        );
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bulk_load_rejects_unsorted_input() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_bulk_load_unsorted";
+        let db = Db::builder(path, object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        let entries = vec![
+            bulk_entry(b"b", b"v", 1),
+            bulk_entry(b"a", b"v", 2),
+        ];
+        let err = db
+            .bulk_load_sorted_run(entries, 64 * 1024)
+            .await
+            .expect_err("should reject");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("strictly ascending key order"),
+            "unexpected error: {msg}"
         );
         db.close().await.unwrap();
     }
