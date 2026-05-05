@@ -287,6 +287,21 @@ impl ImmutableMemtable {
         }
     }
 
+    /// Build an [`ImmutableMemtable`] from a shared [`Arc<KVTable>`]. Used by
+    /// the freeze path under `DbState::modify` where the writable memtable is
+    /// held inside a `COWDbState` clone — we don't want to move out of the
+    /// `Arc<WritableKVTable>` since concurrent puts may still hold the same
+    /// `Arc`.
+    pub(crate) fn from_arc(table: Arc<KVTable>, recent_flushed_wal_id: u64) -> Self {
+        let sequence_tracker = table.sequence_tracker_snapshot();
+        Self {
+            table,
+            recent_flushed_wal_id,
+            uploaded: WatchableOnceCell::new(),
+            sequence_tracker,
+        }
+    }
+
     pub(crate) fn table(&self) -> Arc<KVTable> {
         self.table.clone()
     }

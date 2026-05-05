@@ -619,14 +619,35 @@ impl SortedRun {
     }
 }
 
+/// SuperVersion-style holder for slatedb's mutable state. Readers do
+/// a lock-free `ArcSwap::load` to grab an immutable snapshot. Writers
+/// serialize via a writer-side mutex, build a new `COWDbState`, and
+/// publish it with a single atomic store.
+///
+/// This replaces the previous `Arc<RwLock<DbState>>` shape, where
+/// every reader took a read guard and every writer took a write
+/// guard. With 6+ concurrent readers at thousands of QPS, the rwlock
+/// became the dominant tail-latency source: `parking_lot::RwLock` is
+/// writer-fair, so a queued writer waited for all in-flight readers
+/// to drain. After this change, readers never block on writers and
+/// vice-versa; only writers contend with each other.
 pub(crate) struct DbState {
-    memtable: WritableKVTable,
-    state: Arc<COWDbState>,
+    state: arc_swap::ArcSwap<COWDbState>,
+    /// Serializes writer-side mutations so two concurrent writers
+    /// don't overwrite each other's swap. Held only across the
+    /// `load -> mutate -> store` sequence; never across awaits.
+    writer: parking_lot::Mutex<()>,
 }
 
 // represents the state that is mutated by creating a new copy with the mutations
 #[derive(Clone)]
 pub(crate) struct COWDbState {
+    /// Active writable memtable. Held inside `Arc` so the freeze
+    /// path can swap it atomically (along with the imm_memtable
+    /// push) via a single `ArcSwap::store`. Concurrent puts target
+    /// the inner `Arc<KVTable>` directly via the lock-free skip-list,
+    /// so no writer-side coordination is needed for puts.
+    pub(crate) memtable: Arc<WritableKVTable>,
     pub(crate) imm_memtable: VecDeque<Arc<ImmutableMemtable>>,
     pub(crate) manifest: DirtyObject<Manifest>,
 }
@@ -640,13 +661,12 @@ impl COWDbState {
 // represents a consistent view of the current db state
 #[derive(Clone)]
 pub(crate) struct DbStateView {
-    pub(crate) memtable: Arc<KVTable>,
     pub(crate) state: Arc<COWDbState>,
 }
 
 impl DbStateReader for DbStateView {
     fn memtable(&self) -> Arc<KVTable> {
-        Arc::clone(&self.memtable)
+        Arc::clone(self.state.memtable.table())
     }
 
     fn imm_memtable(&self) -> &VecDeque<Arc<ImmutableMemtable>> {
@@ -661,116 +681,120 @@ impl DbStateReader for DbStateView {
 impl DbState {
     pub(crate) fn new(manifest: DirtyObject<Manifest>) -> Self {
         Self {
-            memtable: WritableKVTable::new(),
-            state: Arc::new(COWDbState {
+            state: arc_swap::ArcSwap::from_pointee(COWDbState {
+                memtable: Arc::new(WritableKVTable::new()),
                 imm_memtable: VecDeque::new(),
                 manifest,
             }),
+            writer: parking_lot::Mutex::new(()),
         }
     }
 
+    /// Cheap atomic load — returns the current snapshot. No lock.
     pub(crate) fn state(&self) -> Arc<COWDbState> {
-        self.state.clone()
+        self.state.load_full()
     }
 
     pub(crate) fn view(&self) -> DbStateView {
         DbStateView {
-            memtable: self.memtable.table().clone(),
-            state: self.state.clone(),
+            state: self.state.load_full(),
         }
     }
 
-    pub(crate) fn memtable(&self) -> &WritableKVTable {
-        &self.memtable
+    pub(crate) fn memtable(&self) -> Arc<WritableKVTable> {
+        self.state.load_full().memtable.clone()
     }
 
-    pub(crate) fn freeze_memtable(&mut self, recent_flushed_wal_id: u64) {
-        let old_memtable = std::mem::replace(&mut self.memtable, WritableKVTable::new());
-        self.modify(|modifier| {
-            modifier
-                .state
-                .imm_memtable
-                .push_front(Arc::new(ImmutableMemtable::new(
-                    old_memtable,
+    pub(crate) fn freeze_memtable(&self, recent_flushed_wal_id: u64) {
+        self.modify(|cow| {
+            let old_memtable = std::mem::replace(
+                &mut cow.memtable,
+                Arc::new(WritableKVTable::new()),
+            );
+            cow.imm_memtable
+                .push_front(Arc::new(ImmutableMemtable::from_arc(
+                    old_memtable.table().clone(),
                     recent_flushed_wal_id,
-                )))
+                )));
         });
     }
 
-    pub(crate) fn replace_memtable(&mut self, memtable: WritableKVTable) {
-        assert!(self.memtable.is_empty());
-        let _ = std::mem::replace(&mut self.memtable, memtable);
+    pub(crate) fn replace_memtable(&self, memtable: WritableKVTable) {
+        self.modify(|cow| {
+            assert!(cow.memtable.is_empty());
+            cow.memtable = Arc::new(memtable);
+        });
     }
 
-    pub(crate) fn merge_remote_manifest(&mut self, remote_manifest: DirtyObject<Manifest>) {
-        self.modify(|modifier| modifier.merge_remote_manifest(remote_manifest));
+    pub(crate) fn merge_remote_manifest(&self, remote_manifest: DirtyObject<Manifest>) {
+        self.modify(|cow| {
+            apply_merge_remote_manifest(cow, remote_manifest);
+        });
     }
 
-    pub(crate) fn modify<F, R>(&mut self, fun: F) -> R
+    /// Apply a mutation to the COWDbState atomically. Acquires the
+    /// writer mutex (cheap, contended only with other writers),
+    /// snapshots the current state, runs the mutator on a clone, and
+    /// publishes the new state with an atomic store. Readers between
+    /// the load and the store see the old state; readers after the
+    /// store see the new state. There is no intermediate visible.
+    pub(crate) fn modify<F, R>(&self, fun: F) -> R
     where
-        F: FnOnce(&mut StateModifier<'_>) -> R,
+        F: FnOnce(&mut COWDbState) -> R,
     {
-        let mut modifier = StateModifier::new(self);
-        let result = fun(&mut modifier);
-        modifier.finish();
+        let _guard = self.writer.lock();
+        let mut new = (*self.state.load_full()).clone();
+        let result = fun(&mut new);
+        self.state.store(Arc::new(new));
         result
     }
 }
 
-pub(crate) struct StateModifier<'a> {
-    db_state: &'a mut DbState,
-    pub(crate) state: COWDbState,
-}
-
-impl<'a> StateModifier<'a> {
-    /// Create a new state modifier
-    fn new(db_state: &'a mut DbState) -> Self {
-        let state = db_state.state.as_ref().clone();
-        Self { db_state, state }
-    }
-
-    pub(crate) fn merge_remote_manifest(&mut self, mut remote_manifest: DirtyObject<Manifest>) {
-        let my_db_state = self.state.core();
-        let remote = &remote_manifest.value.core;
-        let tree = my_db_state.tree.merge_from_compactor(&remote.tree);
-        let segments =
-            crate::manifest::merge_segments_from_compactor(&my_db_state.segments, &remote.segments);
-        remote_manifest.value.core = ManifestCore {
-            initialized: my_db_state.initialized,
-            tree,
-            segments,
-            // Segment configuration is stable; the writer is the source of truth.
-            segment_extractor_name: my_db_state.segment_extractor_name.clone(),
-            next_wal_sst_id: my_db_state.next_wal_sst_id,
-            replay_after_wal_id: my_db_state.replay_after_wal_id,
-            last_l0_clock_tick: my_db_state.last_l0_clock_tick,
-            last_l0_seq: my_db_state.last_l0_seq,
-            recent_snapshot_min_seq: my_db_state.recent_snapshot_min_seq,
-            sequence_tracker: my_db_state.sequence_tracker.clone(),
-            checkpoints: remote_manifest.value.core.checkpoints,
-            wal_object_store_uri: my_db_state.wal_object_store_uri.clone(),
-        };
-        self.state.manifest = remote_manifest;
-    }
-
-    fn finish(self) {
-        self.db_state.state = Arc::new(self.state);
+impl Debug for DbState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbState").finish_non_exhaustive()
     }
 }
 
-impl WalIdStore for parking_lot::RwLock<DbState> {
+/// Compute the post-merge `ManifestCore` and install it on `cow`.
+/// Extracted so it can be invoked from outside `DbState::merge_remote_manifest`
+/// when a caller already holds the COWDbState reference (e.g. tests
+/// that drove `StateModifier::merge_remote_manifest` directly).
+fn apply_merge_remote_manifest(
+    cow: &mut COWDbState,
+    mut remote_manifest: DirtyObject<Manifest>,
+) {
+    let my_db_state = cow.core();
+    let remote = &remote_manifest.value.core;
+    let tree = my_db_state.tree.merge_from_compactor(&remote.tree);
+    let segments =
+        crate::manifest::merge_segments_from_compactor(&my_db_state.segments, &remote.segments);
+    remote_manifest.value.core = ManifestCore {
+        initialized: my_db_state.initialized,
+        tree,
+        segments,
+        // Segment configuration is stable; the writer is the source of truth.
+        segment_extractor_name: my_db_state.segment_extractor_name.clone(),
+        next_wal_sst_id: my_db_state.next_wal_sst_id,
+        replay_after_wal_id: my_db_state.replay_after_wal_id,
+        last_l0_clock_tick: my_db_state.last_l0_clock_tick,
+        last_l0_seq: my_db_state.last_l0_seq,
+        recent_snapshot_min_seq: my_db_state.recent_snapshot_min_seq,
+        sequence_tracker: my_db_state.sequence_tracker.clone(),
+        checkpoints: remote_manifest.value.core.checkpoints,
+        wal_object_store_uri: my_db_state.wal_object_store_uri.clone(),
+    };
+    cow.manifest = remote_manifest;
+}
+
+impl WalIdStore for DbState {
     /// increment the next wal id, and return the previous value.
     fn next_wal_id(&self) -> u64 {
-        let mut state = self.write();
-
-        // not sure why, but it doesn't compile without the return
-        // statement -- probably some generic inference bug
-        #[allow(clippy::needless_return)]
-        return state.modify(|modifier| {
-            let next_wal_id = modifier.state.manifest.value.core.next_wal_sst_id;
-            modifier.state.manifest.value.core.next_wal_sst_id += 1;
+        self.modify(|cow| {
+            let next_wal_id = cow.manifest.value.core.next_wal_sst_id;
+            cow.manifest.value.core.next_wal_sst_id += 1;
             next_wal_id
-        });
+        })
     }
 }
 

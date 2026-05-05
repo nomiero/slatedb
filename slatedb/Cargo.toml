@@ -9,6 +9,7 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
+arc-swap = "1"
 async-channel = { workspace = true }
 async-trait = { workspace = true }
 atomic = { workspace = true }
