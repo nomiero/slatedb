@@ -656,6 +656,14 @@ impl COWDbState {
     pub(crate) fn core(&self) -> &ManifestCore {
         &self.manifest.value.core
     }
+
+    /// Identity accessor used by call sites that came from the old
+    /// `RwLockReadGuard<'_, DbState>::state()` shape. Returns `&self`
+    /// so existing `guard.state().core()` chains keep working with no
+    /// edits beyond replacing the `state.read()` snapshot fetch.
+    pub(crate) fn state(&self) -> &Self {
+        self
+    }
 }
 
 // represents a consistent view of the current db state
@@ -716,13 +724,6 @@ impl DbState {
                     old_memtable.table().clone(),
                     recent_flushed_wal_id,
                 )));
-        });
-    }
-
-    pub(crate) fn replace_memtable(&self, memtable: WritableKVTable) {
-        self.modify(|cow| {
-            assert!(cow.memtable.is_empty());
-            cow.memtable = Arc::new(memtable);
         });
     }
 
@@ -822,10 +823,10 @@ mod tests {
     #[test]
     fn test_should_merge_db_state_with_new_checkpoints() {
         // given:
-        let mut db_state = DbState::new(new_dirty_manifest());
+        let db_state = DbState::new(new_dirty_manifest());
         // mimic an externally added checkpoint
         let mut updated_state = new_dirty_manifest();
-        updated_state.value.core = db_state.state.core().clone();
+        updated_state.value.core = db_state.state().core().clone();
         let checkpoint = Checkpoint {
             id: uuid::Uuid::new_v4(),
             manifest_id: 1,
@@ -843,17 +844,17 @@ mod tests {
         db_state.merge_remote_manifest(updated_state);
 
         // then:
-        assert_eq!(vec![checkpoint], db_state.state.core().checkpoints);
+        assert_eq!(vec![checkpoint], db_state.state().core().checkpoints);
     }
 
     #[test]
     fn test_should_merge_db_state_with_l0s_up_to_last_compacted() {
         // given:
-        let mut db_state = DbState::new(new_dirty_manifest());
-        add_l0s_to_dbstate(&mut db_state, 4);
+        let db_state = DbState::new(new_dirty_manifest());
+        add_l0s_to_dbstate(&db_state, 4);
         // mimic the compactor popping off l0s
         let mut compactor_state = new_dirty_manifest();
-        compactor_state.value.core = db_state.state.core().clone();
+        compactor_state.value.core = db_state.state().core().clone();
         let last_compacted = compactor_state.value.core.tree.l0.pop_back().unwrap();
         compactor_state
             .value
@@ -874,7 +875,7 @@ mod tests {
             .map(|l0| l0.sst.id)
             .collect();
         let merged: Vec<SsTableId> = db_state
-            .state
+            .state()
             .core()
             .tree
             .l0
@@ -887,9 +888,9 @@ mod tests {
     #[test]
     fn test_should_merge_db_state_with_all_l0s_if_none_compacted() {
         // given:
-        let mut db_state = DbState::new(new_dirty_manifest());
-        add_l0s_to_dbstate(&mut db_state, 4);
-        let l0s = db_state.state.core().tree.l0.clone();
+        let db_state = DbState::new(new_dirty_manifest());
+        add_l0s_to_dbstate(&db_state, 4);
+        let l0s = db_state.state().core().tree.l0.clone();
 
         // when:
         db_state.merge_remote_manifest(new_dirty_manifest());
@@ -897,7 +898,7 @@ mod tests {
         // then:
         let expected: Vec<SsTableId> = l0s.iter().map(|l0| l0.sst.id).collect();
         let merged: Vec<SsTableId> = db_state
-            .state
+            .state()
             .core()
             .tree
             .l0
@@ -920,9 +921,9 @@ mod tests {
         let v1 = view(1);
 
         // Local writer has a segment extractor configured and a populated segment.
-        let mut db_state = DbState::new(new_dirty_manifest());
+        let db_state = DbState::new(new_dirty_manifest());
         db_state.modify(|modifier| {
-            let core = &mut modifier.state.manifest.value.core;
+            let core = &mut modifier.manifest.value.core;
             core.segment_extractor_name = Some("hour-bucket".to_string());
             core.segments = vec![Segment {
                 prefix: Bytes::from_static(b"hour=12/"),
@@ -939,7 +940,7 @@ mod tests {
         // out segment configuration — simulating a regression where the
         // compactor failed to carry segments forward.
         let mut remote_state = new_dirty_manifest();
-        remote_state.value.core = db_state.state.core().clone();
+        remote_state.value.core = db_state.state().core().clone();
         remote_state.value.core.segments = vec![];
         remote_state.value.core.segment_extractor_name = None;
 
@@ -947,7 +948,8 @@ mod tests {
 
         // The writer is the source of truth for segment config and for L0,
         // so the local segment (with its L0) must survive the merge.
-        let merged = db_state.state.core();
+        let snap = db_state.state();
+        let merged = snap.core();
         assert_eq!(
             merged.segment_extractor_name.as_deref(),
             Some("hour-bucket")
@@ -974,9 +976,9 @@ mod tests {
         let v2 = view(2); // backfill, written after compactor's snapshot.
 
         // Local writer: v1 (already absorbed by compactor) and v2 (backfill).
-        let mut db_state = DbState::new(new_dirty_manifest());
+        let db_state = DbState::new(new_dirty_manifest());
         db_state.modify(|m| {
-            let core = &mut m.state.manifest.value.core;
+            let core = &mut m.manifest.value.core;
             core.segment_extractor_name = Some("hour".into());
             core.segments = vec![Segment {
                 prefix: Bytes::from_static(b"hour=12/"),
@@ -991,7 +993,7 @@ mod tests {
 
         // Remote compactor: watermark at v1, drained.
         let mut remote_state = new_dirty_manifest();
-        remote_state.value.core = db_state.state.core().clone();
+        remote_state.value.core = db_state.state().core().clone();
         remote_state.value.core.segments = vec![Segment {
             prefix: Bytes::from_static(b"hour=12/"),
             tree: LsmTreeState {
@@ -1004,7 +1006,8 @@ mod tests {
 
         db_state.merge_remote_manifest(remote_state);
 
-        let merged = db_state.state.core();
+        let snap = db_state.state();
+        let merged = snap.core();
         assert_eq!(merged.segments.len(), 1);
         let l0_ids: Vec<_> = merged.segments[0].tree.l0.iter().map(|v| v.id).collect();
         assert_eq!(l0_ids, vec![v2.id]);
@@ -1012,9 +1015,9 @@ mod tests {
 
     #[test]
     fn test_should_keep_local_sequence_tracker_on_merge() {
-        let mut db_state = DbState::new(new_dirty_manifest());
+        let db_state = DbState::new(new_dirty_manifest());
         db_state.modify(|modifier| {
-            let core = &mut modifier.state.manifest.value.core;
+            let core = &mut modifier.manifest.value.core;
             core.last_l0_seq = 3;
             let tracker = std::sync::Arc::make_mut(&mut core.sequence_tracker);
             tracker.insert(TrackedSeq {
@@ -1033,13 +1036,14 @@ mod tests {
 
         // Remote has a stale sequence tracker (e.g. missing recent entries).
         let mut remote_state = new_dirty_manifest();
-        remote_state.value.core = db_state.state.core().clone();
+        remote_state.value.core = db_state.state().core().clone();
         remote_state.value.core.sequence_tracker = std::sync::Arc::new(SequenceTracker::new());
 
         db_state.merge_remote_manifest(remote_state);
 
         // The local tracker should be preserved as-is.
-        let tracker = &db_state.state.core().sequence_tracker;
+        let snap = db_state.state();
+        let tracker = &snap.core().sequence_tracker;
         assert_eq!(
             tracker.find_ts(1, FindOption::RoundDown),
             Utc.timestamp_opt(60, 0).single()
@@ -1054,11 +1058,11 @@ mod tests {
         );
     }
 
-    fn add_l0s_to_dbstate(db_state: &mut DbState, n: u32) {
+    fn add_l0s_to_dbstate(db_state: &DbState, n: u32) {
         let dummy_info = create_sst_info(None);
         for i in 0..n {
             db_state.freeze_memtable(i as u64);
-            let imm = db_state.state.imm_memtable.back().unwrap().clone();
+            let imm = db_state.state().imm_memtable.back().unwrap().clone();
             let handle = SsTableHandle::new(
                 SsTableId::Compacted(ulid::Ulid::from_parts(i as u64, 0)),
                 SST_FORMAT_VERSION_LATEST,
@@ -1066,8 +1070,8 @@ mod tests {
             );
             let view: SsTableView = SsTableView::identity(handle);
             db_state.modify(|modifier| {
-                modifier.state.manifest.value.core.tree.l0.push_front(view);
-                modifier.state.manifest.value.core.replay_after_wal_id =
+                modifier.manifest.value.core.tree.l0.push_front(view);
+                modifier.manifest.value.core.replay_after_wal_id =
                     imm.recent_flushed_wal_id();
             });
         }

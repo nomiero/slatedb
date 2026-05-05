@@ -4169,12 +4169,11 @@ mod tests {
                 clock.as_ref().advance(Duration::from_millis(60000)).await;
             }
             let (empty_wal, empty_memtable, core_db_state) = {
-                let db_state = db.inner.state.read();
-                let cow_db_state = db_state.state();
+                let cow_db_state = db.inner.state.state();
                 (
                     db.inner.wal_buffer.is_empty(),
-                    db_state.memtable().is_empty() && cow_db_state.imm_memtable.is_empty(),
-                    db_state.state().core().clone(),
+                    cow_db_state.memtable.is_empty() && cow_db_state.imm_memtable.is_empty(),
+                    cow_db_state.core().clone(),
                 )
             };
 

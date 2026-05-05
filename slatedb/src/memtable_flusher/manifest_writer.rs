@@ -363,8 +363,8 @@ impl ManifestWriterHandler {
     fn take_next_ready_batch(&mut self) -> Option<Vec<UploadedMemtable>> {
         let durable_seq = self.db_status_rx.borrow().durable_seq;
         let imm_memtables: Vec<_> = {
-            let guard = self.db.state.read();
-            guard.state().imm_memtable.iter().rev().cloned().collect()
+            let cow = self.db.state.state();
+            cow.imm_memtable.iter().rev().cloned().collect()
         };
         let mut batch = Vec::new();
 
@@ -465,24 +465,19 @@ impl ManifestWriterHandler {
         .flatten()
         .min();
         // Slow-path tracing: when a batch of memtables finishes
-        // uploading, this function takes state.write() to install the
-        // new L0 SSTs into the manifest. Held while iterating
-        // `staged_batch` and rebuilding the manifest. Foreground
-        // readers blocked by this acquisition appear as a per-second
-        // dip aligned with flush completion.
-        const SLOW_MANIFEST_WRITE_LOCK_THRESHOLD: std::time::Duration =
+        // uploading, this function takes the writer-side mutex via
+        // `state.modify` to install the new L0 SSTs into the
+        // manifest. Held while iterating `staged_batch` and
+        // rebuilding the COWDbState; readers do not block on this
+        // (lock-free `ArcSwap` load), but other writers do.
+        const SLOW_MANIFEST_WRITE_THRESHOLD: std::time::Duration =
             std::time::Duration::from_millis(1);
         #[allow(clippy::disallowed_methods)]
-        let acquire_start = tokio::time::Instant::now();
-        let mut guard = self.db.state.write();
-        let acquire_elapsed = acquire_start.elapsed();
-        #[allow(clippy::disallowed_methods)]
-        let work_start = tokio::time::Instant::now();
-        let manifest = guard.modify(|modifier| {
+        let start = tokio::time::Instant::now();
+        let manifest = self.db.state.modify(|cow| {
             for uploaded in staged_batch {
                 let uploaded_tracker = uploaded.imm_memtable.sequence_tracker();
-                let popped = modifier
-                    .state
+                let popped = cow
                     .imm_memtable
                     .pop_back()
                     .expect("expected imm memtable");
@@ -496,9 +491,7 @@ impl ManifestWriterHandler {
                     "publishing l0 SST [sst_id={:?}]",
                     uploaded.sst_handle.id
                 );
-                modifier
-                    .state
-                    .manifest
+                cow.manifest
                     .value
                     .core
                     .tree
@@ -507,26 +500,26 @@ impl ManifestWriterHandler {
                         self.db.rand.rng().gen_ulid(self.db.system_clock.as_ref()),
                         uploaded.sst_handle.clone(),
                     ));
-                modifier.state.manifest.value.core.replay_after_wal_id =
+                cow.manifest.value.core.replay_after_wal_id =
                     uploaded.imm_memtable.recent_flushed_wal_id();
 
                 let memtable_tick = uploaded.imm_memtable.table().last_tick();
-                modifier.state.manifest.value.core.last_l0_clock_tick = cmp::max(
-                    modifier.state.manifest.value.core.last_l0_clock_tick,
+                cow.manifest.value.core.last_l0_clock_tick = cmp::max(
+                    cow.manifest.value.core.last_l0_clock_tick,
                     memtable_tick,
                 );
-                if modifier.state.manifest.value.core.last_l0_clock_tick != memtable_tick {
+                if cow.manifest.value.core.last_l0_clock_tick != memtable_tick {
                     return Err(SlateDBError::InvalidClockTick {
-                        last_tick: modifier.state.manifest.value.core.last_l0_clock_tick,
+                        last_tick: cow.manifest.value.core.last_l0_clock_tick,
                         next_tick: memtable_tick,
                     });
                 }
 
                 // The same sequence number can't span multiple L0' SSTs--only SSTs in SRs
                 // can do that. So assert `>` rather than `>=`.
-                assert!(uploaded.last_seq > modifier.state.manifest.value.core.last_l0_seq);
-                modifier.state.manifest.value.core.last_l0_seq = uploaded.last_seq;
-                modifier.state.manifest.value.core.recent_snapshot_min_seq =
+                assert!(uploaded.last_seq > cow.manifest.value.core.last_l0_seq);
+                cow.manifest.value.core.last_l0_seq = uploaded.last_seq;
+                cow.manifest.value.core.recent_snapshot_min_seq =
                     min_active_snapshot_seq.unwrap_or(uploaded.last_seq);
 
                 // Use `Arc::make_mut` to clone-on-write the tracker
@@ -537,28 +530,23 @@ impl ManifestWriterHandler {
                 // those snapshots are short-lived, so this is
                 // effectively an in-place mutation most of the time.
                 let tracker = std::sync::Arc::make_mut(
-                    &mut modifier.state.manifest.value.core.sequence_tracker,
+                    &mut cow.manifest.value.core.sequence_tracker,
                 );
                 tracker.extend_from(uploaded_tracker);
             }
-            Ok(modifier.state.manifest.clone())
+            Ok(cow.manifest.clone())
         })?;
 
-        let work_elapsed = work_start.elapsed();
-        drop(guard);
-        let total_elapsed = acquire_elapsed + work_elapsed;
+        let elapsed = start.elapsed();
         self.db.db_stats.state_write_acquisitions.increment(1);
         self.db
             .db_stats
             .state_write_held_micros_total
-            .increment(total_elapsed.as_micros() as u64);
-        if acquire_elapsed > SLOW_MANIFEST_WRITE_LOCK_THRESHOLD
-            || work_elapsed > SLOW_MANIFEST_WRITE_LOCK_THRESHOLD
-        {
+            .increment(elapsed.as_micros() as u64);
+        if elapsed > SLOW_MANIFEST_WRITE_THRESHOLD {
             warn!(
-                "slow state.write() in apply_uploaded_state: acquire={:?}, work={:?}, batch_size={}",
-                acquire_elapsed,
-                work_elapsed,
+                "slow state.modify() in apply_uploaded_state: total={:?}, batch_size={}",
+                elapsed,
                 staged_batch.len(),
             );
         }
@@ -628,11 +616,7 @@ impl ManifestWriterHandler {
     fn clone_local_manifest_for_write(
         &self,
     ) -> slatedb_txn_obj::DirtyObject<crate::manifest::Manifest> {
-        let dirty = {
-            let rguard_state = self.db.state.read();
-            rguard_state.state().manifest.clone()
-        };
-        dirty
+        self.db.state.state().manifest.clone()
     }
 
     async fn load_manifest(&mut self) -> Result<(), SlateDBError> {
@@ -660,21 +644,16 @@ impl ManifestWriterHandler {
         &self,
         remote_dirty: slatedb_txn_obj::DirtyObject<crate::manifest::Manifest>,
     ) {
-        // Time the state.write() acquisition + work so the
-        // manifest-poller path is captured by the same
-        // `state_write_held_micros_total` counter as the
-        // apply_uploaded_state path. Compaction results land here
-        // (via the manifest poller), so this is the suspected cause
-        // of the post-compaction read-throughput dips. Split the
-        // measurement into `acquire` (waiting for current readers /
-        // writers to release) and `work` (held while merging) so we
-        // can tell whether the cost lives in the merge itself
-        // (e.g. cloning a large `sequence_tracker`) or in queuing
-        // behind active readers.
-        const SLOW_MERGE_LOCK_THRESHOLD: std::time::Duration =
+        // Time the writer-side `modify` total so the manifest-poller
+        // path is captured by the same `state_write_held_micros_total`
+        // counter as the apply_uploaded_state path. Compaction results
+        // land here (via the manifest poller). With the ArcSwap
+        // design readers no longer block on the writer; only other
+        // writers serialize through the writer mutex.
+        const SLOW_MERGE_THRESHOLD: std::time::Duration =
             std::time::Duration::from_millis(1);
 
-        // Capture a coarse remote-side size before we take the lock
+        // Capture a coarse remote-side size before we take the mutex
         // so the warn log can attribute large merges to the right
         // shape (e.g. "compactor handed us a tree with N L0 + M SR
         // views").
@@ -690,34 +669,26 @@ impl ManifestWriterHandler {
             .sum();
 
         #[allow(clippy::disallowed_methods)]
-        let acquire_start = tokio::time::Instant::now();
-        let mut wguard_state = self.db.state.write();
-        let acquire_elapsed = acquire_start.elapsed();
-        #[allow(clippy::disallowed_methods)]
-        let work_start = tokio::time::Instant::now();
-        wguard_state.merge_remote_manifest(remote_dirty);
-        let cow = wguard_state.state();
+        let start = tokio::time::Instant::now();
+        self.db.state.merge_remote_manifest(remote_dirty);
+        let elapsed = start.elapsed();
+
+        let cow = self.db.state.state();
         self.db
             .db_stats
             .l0_sst_count
             .set(cow.core().tree.l0.len() as i64);
         let dirty_manifest = cow.manifest.clone();
-        let work_elapsed = work_start.elapsed();
-        drop(wguard_state);
-        let total_elapsed = acquire_elapsed + work_elapsed;
         self.db.db_stats.state_write_acquisitions.increment(1);
         self.db
             .db_stats
             .state_write_held_micros_total
-            .increment(total_elapsed.as_micros() as u64);
-        if acquire_elapsed > SLOW_MERGE_LOCK_THRESHOLD
-            || work_elapsed > SLOW_MERGE_LOCK_THRESHOLD
-        {
+            .increment(elapsed.as_micros() as u64);
+        if elapsed > SLOW_MERGE_THRESHOLD {
             warn!(
-                "slow state.write() in merge_remote_manifest: acquire={:?}, work={:?}, \
+                "slow state.modify() in merge_remote_manifest: total={:?}, \
                  remote_l0={}, remote_compacted_runs={}, remote_compacted_views={}",
-                acquire_elapsed,
-                work_elapsed,
+                elapsed,
                 remote_l0_len,
                 remote_compacted_runs,
                 remote_compacted_views,
@@ -1132,10 +1103,12 @@ mod tests {
         value: &[u8],
     ) -> Arc<crate::mem_table::ImmutableMemtable> {
         let seq = inner.oracle.next_seq();
-        let mut guard = inner.state.write();
-        guard.memtable().put(RowEntry::new_value(key, value, seq));
-        guard.freeze_memtable(0);
-        guard.state().imm_memtable.front().cloned().unwrap()
+        inner
+            .state
+            .memtable()
+            .put(RowEntry::new_value(key, value, seq));
+        inner.state.freeze_memtable(0);
+        inner.state.state().imm_memtable.front().cloned().unwrap()
     }
 
     /// Build an uploaded memtable without advancing the WAL durable sequence.

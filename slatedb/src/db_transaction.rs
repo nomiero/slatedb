@@ -150,7 +150,7 @@ impl DbTransaction {
             self.txn_manager.track_read_keys(&self.txn_id, read_keys);
         }
 
-        let db_state = self.db_inner.state.read().view();
+        let db_state = self.db_inner.state.view();
 
         // Build the write batch iterator synchronously while holding the read
         // guard, avoiding a clone of the full batch. The iterator materializes
@@ -282,7 +282,7 @@ impl DbTransaction {
         };
 
         self.db_inner.check_closed()?;
-        let db_state = self.db_inner.state.read().view();
+        let db_state = self.db_inner.state.view();
 
         // Build the write batch iterator synchronously while holding the read
         // guard, avoiding a clone of the full batch. The iterator materializes
