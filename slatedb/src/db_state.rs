@@ -992,15 +992,16 @@ mod tests {
         db_state.modify(|modifier| {
             let core = &mut modifier.state.manifest.value.core;
             core.last_l0_seq = 3;
-            core.sequence_tracker.insert(TrackedSeq {
+            let tracker = std::sync::Arc::make_mut(&mut core.sequence_tracker);
+            tracker.insert(TrackedSeq {
                 seq: 1,
                 ts: Utc.timestamp_opt(60, 0).single().unwrap(),
             });
-            core.sequence_tracker.insert(TrackedSeq {
+            tracker.insert(TrackedSeq {
                 seq: 2,
                 ts: Utc.timestamp_opt(120, 0).single().unwrap(),
             });
-            core.sequence_tracker.insert(TrackedSeq {
+            tracker.insert(TrackedSeq {
                 seq: 3,
                 ts: Utc.timestamp_opt(180, 0).single().unwrap(),
             });
@@ -1009,7 +1010,7 @@ mod tests {
         // Remote has a stale sequence tracker (e.g. missing recent entries).
         let mut remote_state = new_dirty_manifest();
         remote_state.value.core = db_state.state.core().clone();
-        remote_state.value.core.sequence_tracker = SequenceTracker::new();
+        remote_state.value.core.sequence_tracker = std::sync::Arc::new(SequenceTracker::new());
 
         db_state.merge_remote_manifest(remote_state);
 

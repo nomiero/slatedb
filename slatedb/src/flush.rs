@@ -98,7 +98,9 @@ impl DbInner {
             false,
             imm_table.last_tick(),
             self.system_clock.clone(),
-            Arc::new(state.core().sequence_tracker.clone()),
+            // sequence_tracker is Arc<SequenceTracker>; .clone() is
+            // a cheap Arc::clone, no deep copy.
+            state.core().sequence_tracker.clone(),
         )
         .await?;
         iter.init().await?;

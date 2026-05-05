@@ -529,13 +529,17 @@ impl ManifestWriterHandler {
                 modifier.state.manifest.value.core.recent_snapshot_min_seq =
                     min_active_snapshot_seq.unwrap_or(uploaded.last_seq);
 
-                modifier
-                    .state
-                    .manifest
-                    .value
-                    .core
-                    .sequence_tracker
-                    .extend_from(uploaded_tracker);
+                // Use `Arc::make_mut` to clone-on-write the tracker
+                // only when there are other holders. After the swap
+                // in `apply_uploaded_state`, the only references
+                // come from outstanding `manifest.clone()` snapshots
+                // taken on a previous tick; under steady-state load
+                // those snapshots are short-lived, so this is
+                // effectively an in-place mutation most of the time.
+                let tracker = std::sync::Arc::make_mut(
+                    &mut modifier.state.manifest.value.core.sequence_tracker,
+                );
+                tracker.extend_from(uploaded_tracker);
             }
             Ok(modifier.state.manifest.clone())
         })?;
