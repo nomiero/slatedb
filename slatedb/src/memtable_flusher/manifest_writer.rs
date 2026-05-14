@@ -486,8 +486,10 @@ impl ManifestWriterHandler {
                 // to foreground readers. Pair with the matching
                 // `cached_put_opts done [...]` line to detect any window
                 // where the SST is in `state.l0` but the local cache write
-                // hasn't completed yet.
-                tracing::info!(
+                // hasn't completed yet. Debug-level: fires once per L0
+                // publish and is too noisy for default output. Enable
+                // with `RUST_LOG=slatedb=debug` when investigating.
+                tracing::debug!(
                     "publishing l0 SST [sst_id={:?}]",
                     uploaded.sst_handle.id
                 );

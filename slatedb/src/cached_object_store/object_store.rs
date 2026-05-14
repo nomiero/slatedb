@@ -564,7 +564,9 @@ impl CachedObjectStore {
         // fall-through warns: if a fall-through warn for `location` arrives at
         // a time before this log line for the same `location`, the manifest
         // made the SST visible to readers before the cache write completed.
-        info!(
+        // Debug-level: fires on every L0 flush and is too noisy for default
+        // output. Enable with `RUST_LOG=slatedb=debug` when investigating.
+        log::debug!(
             "cached_put_opts done [location={}, size={}, upstream={:?}, head={:?}, parts={:?}]",
             location, payload_size, upstream_elapsed, head_elapsed, parts_elapsed,
         );

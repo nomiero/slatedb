@@ -911,8 +911,10 @@ impl EncodedSsTableWriter<'_> {
             // Trace the moment the tee finishes writing to disk. Pair with
             // the `publishing l0 SST` / compactor manifest-write events to
             // detect any window where a new SST is reader-visible before
-            // its cache files are renamed into place.
-            log::info!(
+            // its cache files are renamed into place. Debug-level: fires
+            // once per compacted SST and is too noisy for default output.
+            // Enable with `RUST_LOG=slatedb=debug` when investigating.
+            log::debug!(
                 "table_writer close: tee committed [path={}, took={:?}]",
                 self.sst_path,
                 commit_start.elapsed(),
