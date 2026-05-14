@@ -892,11 +892,21 @@ impl EncodedSsTableWriter<'_> {
             let attrs = object_store::Attributes::new();
             #[allow(clippy::disallowed_methods)]
             let commit_start = tokio::time::Instant::now();
-            if let Err(e) = tee.commit(&head_meta, &attrs).await {
+            let commit_result = tee.commit(&head_meta, &attrs).await;
+            if let Err(e) = &commit_result {
                 warn!(
                     "cache pre-warm tee commit failed [path={}, error={:?}]",
                     self.sst_path, e
                 );
+            }
+            // Pre-populate the in-memory head cache only when the tee
+            // commit succeeded. On failure we let the next reader pay
+            // the disk/S3 head cost rather than serve metadata that
+            // describes a cache state we never reached.
+            if commit_result.is_ok() {
+                if let Some(cached) = self.table_store.cached_object_store.as_ref() {
+                    cached.populate_head_cache(&self.sst_path, head_meta.clone(), attrs.clone());
+                }
             }
             // Trace the moment the tee finishes writing to disk. Pair with
             // the `publishing l0 SST` / compactor manifest-write events to

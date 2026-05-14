@@ -9,6 +9,7 @@ use object_store::{path::Path, GetOptions, GetResult, ObjectMeta, ObjectStore};
 use object_store::{Attributes, GetRange, GetResultPayload, PutMultipartOptions, PutResult};
 use object_store::{ListResult, MultipartUpload, PutOptions, PutPayload};
 use slatedb_common::clock::SystemClock;
+use std::collections::HashMap;
 use std::{ops::Range, sync::Arc};
 use tokio::sync::OnceCell;
 
@@ -30,6 +31,17 @@ pub(crate) struct CachedObjectStore {
     // Absolute path of the root folder relative to the bucket. See #1319.
     resolved_root: Arc<OnceCell<Path>>,
     stats: Arc<CachedObjectStoreStats>,
+    /// In-memory cache of head metadata, keyed by upstream location.
+    /// Populated only on write paths (L0 flush via `cached_put_opts`,
+    /// compaction via the tee commit). Reads never fill this map - that
+    /// keeps the cache coherent with the on-disk head files without an
+    /// invalidation protocol, and avoids amplifying read-side memory
+    /// pressure when reads stream over many short-lived objects.
+    ///
+    /// Hits here skip both the on-disk head read and any S3 HEAD round
+    /// trip. The per-entry payload is ~hundreds of bytes; an SST working
+    /// set in the thousands of entries fits comfortably in low MBs.
+    head_cache: Arc<parking_lot::Mutex<HashMap<Path, (ObjectMeta, Attributes)>>>,
 }
 
 impl CachedObjectStore {
@@ -52,7 +64,31 @@ impl CachedObjectStore {
             admission_picker: AdmissionPicker::default(),
             cache_puts,
             resolved_root: Arc::new(OnceCell::new()),
+            head_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }))
+    }
+
+    /// Insert (or overwrite) an entry in the in-memory head cache. Called
+    /// only from the write paths (`cached_put_opts` after the on-disk
+    /// save_head succeeds; the tee-commit path after a streaming write
+    /// finalizes). Reads must not call this - filling on reads would
+    /// require an invalidation hook the cache otherwise avoids.
+    pub(crate) fn populate_head_cache(
+        &self,
+        location: &Path,
+        meta: ObjectMeta,
+        attrs: Attributes,
+    ) {
+        self.head_cache
+            .lock()
+            .insert(location.clone(), (meta, attrs));
+    }
+
+    /// Drop an entry from the in-memory head cache. Used when the
+    /// underlying object is removed so the next reader doesn't see
+    /// stale metadata. Best-effort; absence of an entry is fine.
+    pub(crate) fn invalidate_head_cache(&self, location: &Path) {
+        self.head_cache.lock().remove(location);
     }
 
     pub(crate) async fn start_evictor(&self) {
@@ -78,6 +114,9 @@ impl CachedObjectStore {
     /// any object), this is a no-op since the cache cannot hold any entry
     /// for this location.
     pub(crate) async fn invalidate(&self, location: &Path) {
+        // Drop the in-memory head first so a concurrent reader can't
+        // pick up stale metadata while we tear down the disk entry.
+        self.invalidate_head_cache(location);
         let Some(cache_location) = self.cache_location_for(location) else {
             return;
         };
@@ -334,6 +373,12 @@ impl CachedObjectStore {
 
     pub(crate) async fn cached_head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
         self.stats.object_store_cache_head_access.increment(1);
+        // In-memory shortcut: populated only on write commits, so a hit
+        // here is authoritative without any disk I/O.
+        if let Some((meta, _)) = self.head_cache.lock().get(location).cloned() {
+            self.stats.object_store_cache_head_hits.increment(1);
+            return Ok(meta);
+        }
         if let Some(cache_location) = self.cache_location_for(location) {
             let entry = self
                 .cache_storage
@@ -482,6 +527,10 @@ impl CachedObjectStore {
         let head_attrs = object_store::Attributes::new();
         #[allow(clippy::disallowed_methods)]
         let head_start = tokio::time::Instant::now();
+        // Pre-populate the in-memory head cache: this entry is now the
+        // authoritative head for this location, and a foreground reader
+        // racing the manifest publish can skip the disk head read.
+        self.populate_head_cache(location, head_meta.clone(), head_attrs.clone());
         if let Err(e) = entry.save_head((&head_meta, &head_attrs)).await {
             warn!(
                 "cached_put_opts: save_head failed [location={}, error={:?}]",
@@ -533,13 +582,28 @@ impl CachedObjectStore {
         location: &Path,
         mut opts: GetOptions,
     ) -> object_store::Result<(ObjectMeta, Attributes)> {
+        // Mirror `cached_head`: every call to this function is a head
+        // lookup, so it must count toward head_access_count regardless
+        // of whether the cache root is resolved. Without this, the
+        // counter only reflects calls that came through `cached_head`
+        // directly, and `cached_get_opts` traffic is invisible.
+        self.stats.object_store_cache_head_access.increment(1);
+        // In-memory shortcut: populated only on write commits, so a hit
+        // here is authoritative without any disk I/O.
+        if let Some((meta, attrs)) = self.head_cache.lock().get(location).cloned() {
+            self.stats.object_store_cache_head_hits.increment(1);
+            return Ok((meta, attrs));
+        }
         let mut head_miss_reason: Option<&'static str> = None;
         if let Some(cache_location) = self.cache_location_for(location) {
             let entry = self
                 .cache_storage
                 .entry(&cache_location, self.part_size_bytes);
             match entry.read_head().await {
-                Ok(Some((meta, attrs))) => return Ok((meta, attrs)),
+                Ok(Some((meta, attrs))) => {
+                    self.stats.object_store_cache_head_hits.increment(1);
+                    return Ok((meta, attrs));
+                }
                 Ok(None) => {
                     head_miss_reason = Some("not_present");
                 }
@@ -891,6 +955,11 @@ impl ObjectStore for CachedObjectStore {
 
     async fn delete(&self, location: &Path) -> object_store::Result<()> {
         // TODO: handle cache eviction
+        // Drop the in-memory head so a subsequent reader doesn't see
+        // metadata describing an object the upstream no longer has.
+        // The on-disk cache eviction is still a TODO above; this is
+        // strictly an improvement over the previous behavior.
+        self.invalidate_head_cache(location);
         self.object_store.delete(location).await
     }
 
