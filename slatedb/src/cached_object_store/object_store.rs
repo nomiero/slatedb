@@ -385,11 +385,23 @@ impl CachedObjectStore {
     }
 
     pub(crate) async fn cached_head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        self.stats.object_store_cache_head_access.increment(1);
+        // Only count head accesses for paths the cache could actually
+        // serve: compacted SSTs. Manifest and WAL paths bypass the
+        // cache on the write side (`cached_put_opts` early-returns for
+        // them), so counting their reads against the same `access`
+        // metric would make the hit rate look perpetually below 100%.
+        // The numerator/denominator should describe cacheable traffic
+        // only.
+        let cacheable = Self::is_compacted_sst_path(location);
+        if cacheable {
+            self.stats.object_store_cache_head_access.increment(1);
+        }
         // In-memory shortcut: populated only on write commits, so a hit
         // here is authoritative without any disk I/O.
         if let Some((meta, _)) = self.head_cache.lock().get(location).cloned() {
-            self.stats.object_store_cache_head_hits.increment(1);
+            if cacheable {
+                self.stats.object_store_cache_head_hits.increment(1);
+            }
             return Ok(meta);
         }
         if let Some(cache_location) = self.cache_location_for(location) {
@@ -397,7 +409,9 @@ impl CachedObjectStore {
                 .cache_storage
                 .entry(&cache_location, self.part_size_bytes);
             if let Ok(Some((meta, _))) = entry.read_head().await {
-                self.stats.object_store_cache_head_hits.increment(1);
+                if cacheable {
+                    self.stats.object_store_cache_head_hits.increment(1);
+                }
                 return Ok(meta);
             }
         }
@@ -611,11 +625,20 @@ impl CachedObjectStore {
         // of whether the cache root is resolved. Without this, the
         // counter only reflects calls that came through `cached_head`
         // directly, and `cached_get_opts` traffic is invisible.
-        self.stats.object_store_cache_head_access.increment(1);
+        //
+        // Only count cacheable paths (compacted SSTs). Manifest / WAL
+        // reads bypass the cache by design; counting their misses
+        // against the same metric would distort the hit rate.
+        let cacheable = Self::is_compacted_sst_path(location);
+        if cacheable {
+            self.stats.object_store_cache_head_access.increment(1);
+        }
         // In-memory shortcut: populated only on write commits, so a hit
         // here is authoritative without any disk I/O.
         if let Some((meta, attrs)) = self.head_cache.lock().get(location).cloned() {
-            self.stats.object_store_cache_head_hits.increment(1);
+            if cacheable {
+                self.stats.object_store_cache_head_hits.increment(1);
+            }
             return Ok((meta, attrs));
         }
         let mut head_miss_reason: Option<&'static str> = None;
@@ -625,7 +648,9 @@ impl CachedObjectStore {
                 .entry(&cache_location, self.part_size_bytes);
             match entry.read_head().await {
                 Ok(Some((meta, attrs))) => {
-                    self.stats.object_store_cache_head_hits.increment(1);
+                    if cacheable {
+                        self.stats.object_store_cache_head_hits.increment(1);
+                    }
                     return Ok((meta, attrs));
                 }
                 Ok(None) => {

@@ -29,6 +29,12 @@ pub struct CachedObjectStoreStats {
     /// HEAD round-trips - distinct from the part-level data fetch
     /// fall-throughs, since heads and parts go through separate
     /// code paths.
+    ///
+    /// Both counters cover *cacheable* paths only (compacted SSTs).
+    /// Manifest and WAL reads bypass the cache on the write side and
+    /// are intentionally excluded from these counters: if they were
+    /// included, the metric would describe a hit rate the cache
+    /// cannot influence.
     pub(super) object_store_cache_head_hits: Arc<dyn CounterFn>,
     pub(super) object_store_cache_head_access: Arc<dyn CounterFn>,
     pub(super) object_store_cache_keys: Arc<dyn GaugeFn>,
