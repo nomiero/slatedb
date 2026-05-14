@@ -177,7 +177,8 @@ struct PacedWrite {
     tmp_path: std::path::PathBuf,
     final_path: std::path::PathBuf,
     /// Owns the bytes for the kernel for the entire write. Per-chunk
-    /// raw pointer offsets reference into this buffer.
+    /// raw pointer offsets reference into this buffer (buffered path
+    /// only; O_DIRECT pacing copies into `aligned_in_flight`).
     bytes: Bytes,
     total_len: usize,
     chunk_bytes: usize,
@@ -185,6 +186,21 @@ struct PacedWrite {
     /// == total_len`, all chunks are submitted; we still need the last
     /// CQE before finalizing.
     next_offset_to_submit: usize,
+    /// Whether this write was opened with `O_DIRECT`. Drives the per-chunk
+    /// aligned-buffer copy + ftruncate-on-finalize tail handling. When
+    /// `false`, chunks use raw pointers into `bytes` (buffered path).
+    direct_io: bool,
+    /// The currently-in-flight chunk's aligned buffer for the O_DIRECT
+    /// path. Kept here so it outlives submission and stays valid until
+    /// the CQE arrives. None on the buffered path (we use `bytes`
+    /// directly), and None between chunks. There is at most one chunk
+    /// in flight per paced write by design.
+    aligned_in_flight: Option<AlignedBuf>,
+    /// True when the last chunk was rounded up beyond `total_len` to
+    /// satisfy O_DIRECT alignment. After all chunks complete, we
+    /// `ftruncate` the file back down to `total_len` so reads see the
+    /// real size, not the zero-padded tail.
+    needs_truncate: bool,
     /// Sender for the user's awaited `Result<()>`. Filled with Ok on
     /// successful rename, Err on any chunk failure.
     sender: oneshot::Sender<object_store::Result<()>>,
@@ -562,10 +578,23 @@ fn run_worker(
                     // channel between chunks so foreground reads aren't
                     // held up.
                     //
-                    // Paced path uses buffered writes always: O_DIRECT
-                    // requires alignment we can't satisfy on the tail
-                    // short chunk if `bytes.len()` isn't a multiple of
-                    // O_DIRECT_ALIGN.
+                    // O_DIRECT-aware: when `direct_io` is set, open the
+                    // file with O_DIRECT, pre-allocate the full extent
+                    // with `fallocate`, and per chunk copy bytes into an
+                    // aligned buffer rounded up to the FS block size.
+                    // The tail chunk is the only one that may be padded;
+                    // we `ftruncate` to the real length after the last
+                    // chunk completes. `chunk_bytes` is required to be a
+                    // multiple of `O_DIRECT_ALIGN` (1 MiB satisfies this)
+                    // so non-tail chunks need no padding at all.
+                    //
+                    // Why all this matters: with O_DIRECT writes the
+                    // bytes never enter the page cache, so the
+                    // `POSIX_FADV_DONTNEED` calls the compactor issues
+                    // after a compaction become trivial no-ops — no
+                    // per-file open + scan + drop sweep on the io_uring
+                    // worker, which used to block foreground reads for
+                    // multi-second stretches at compaction completion.
                     if pacing_enabled && bytes.len() > chunk_bytes {
                         if let Some(parent) = tmp_path.parent() {
                             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -573,8 +602,25 @@ fn run_worker(
                                 continue;
                             }
                         }
+                        // O_DIRECT requires `chunk_bytes` to be a multiple
+                        // of the FS block size. The pacing knob is set by
+                        // the operator; reject misconfiguration loudly so
+                        // a future "chunk_bytes=1023" doesn't silently
+                        // corrupt or fail every write.
+                        let direct_io_paced =
+                            direct_io && chunk_bytes.is_multiple_of(O_DIRECT_ALIGN);
+                        if direct_io && !direct_io_paced {
+                            warn!(
+                                "io_uring paced write: chunk_bytes={} is not a multiple of \
+                                 O_DIRECT_ALIGN={}; falling back to buffered for this write",
+                                chunk_bytes, O_DIRECT_ALIGN
+                            );
+                        }
                         let mut open = OpenOptions::new();
                         open.create(true).truncate(true).write(true);
+                        if direct_io_paced {
+                            open.custom_flags(libc::O_DIRECT);
+                        }
                         let file = match open.open(&tmp_path) {
                             Ok(f) => f,
                             Err(e) => {
@@ -583,6 +629,34 @@ fn run_worker(
                             }
                         };
                         let raw_fd = file.as_raw_fd();
+                        // Preallocate the full extent in one shot. The
+                        // FS now knows the final size before any pwrites
+                        // arrive, so it allocates one contiguous extent
+                        // instead of growing the file chunk-by-chunk.
+                        // This keeps the on-disk layout sequential at
+                        // the LBA level, friendly to NVMe controllers.
+                        // Best-effort: on filesystems that don't support
+                        // fallocate, the writes still succeed - they'll
+                        // just allocate as they go.
+                        // SAFETY: raw_fd is valid; len is the total
+                        // payload size.
+                        let preallocated = unsafe {
+                            libc::fallocate(
+                                raw_fd,
+                                0,
+                                0,
+                                bytes.len() as libc::off_t,
+                            )
+                        };
+                        if preallocated != 0 {
+                            // Not fatal; log once and move on.
+                            log::debug!(
+                                "io_uring paced write: fallocate failed [path={}, errno={}]; \
+                                 writes will extend the file on demand",
+                                tmp_path.display(),
+                                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                            );
+                        }
                         let id = next_paced_id;
                         next_paced_id = next_paced_id.wrapping_add(1);
                         paced_writes.insert(
@@ -596,6 +670,9 @@ fn run_worker(
                                 bytes,
                                 chunk_bytes,
                                 next_offset_to_submit: 0,
+                                direct_io: direct_io_paced,
+                                aligned_in_flight: None,
+                                needs_truncate: false,
                                 sender,
                                 failed: None,
                             },
@@ -705,17 +782,63 @@ fn run_worker(
             let chunk_start = pw.next_offset_to_submit;
             let chunk_end = (chunk_start + pw.chunk_bytes).min(pw.total_len);
             let chunk_len = chunk_end - chunk_start;
-            // SAFETY: `pw.bytes` is held in `paced_writes` until the
-            // chunk's CQE arrives (we don't remove the PacedWrite
-            // before then), so this raw pointer + len is valid for the
-            // kernel's exclusive read.
-            let chunk_ptr = unsafe { pw.bytes.as_ptr().add(chunk_start) };
+            // Choose the source pointer + submitted length. Two paths:
+            //
+            // - Buffered (`direct_io == false`): point straight into
+            //   `pw.bytes` and submit `chunk_len`. The kernel can deal
+            //   with arbitrary lengths and offsets here.
+            //
+            // - O_DIRECT (`direct_io == true`): copy `chunk_len` bytes
+            //   into an aligned buffer of length `round_up(chunk_len,
+            //   O_DIRECT_ALIGN)`. AlignedBuf::new already rounds up and
+            //   zero-fills, so the tail bytes past `chunk_len` are
+            //   zero. We submit the rounded-up length; the FS records
+            //   the file size at `chunk_start + write_len`, which may
+            //   overshoot `pw.total_len` on the final chunk. The
+            //   finalize path runs `ftruncate(total_len)` to chop it.
             let chunk_user_data = next_user_data;
             next_user_data = next_user_data.wrapping_add(1);
+
+            let (chunk_ptr, submit_len) = if pw.direct_io {
+                let needs_pad = !chunk_len.is_multiple_of(O_DIRECT_ALIGN);
+                let aligned = match AlignedBuf::new(chunk_len) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        pw.failed = Some(wrap_io_err(e));
+                        // Drain by pretending the chunk submitted and
+                        // completed with error: jump to finalize on the
+                        // next pass.
+                        pw.next_offset_to_submit = pw.total_len;
+                        delayed_chunks.push((std::time::Instant::now(), id));
+                        next_user_data = next_user_data.wrapping_sub(1);
+                        continue;
+                    }
+                };
+                let mut aligned = aligned;
+                // Copy the real bytes; the rest of the aligned buffer
+                // is already zero from alloc_zeroed.
+                aligned.as_mut_slice()[..chunk_len]
+                    .copy_from_slice(&pw.bytes[chunk_start..chunk_end]);
+                let ptr = aligned.as_ref().as_ptr();
+                let submit_len = aligned.as_ref().len();
+                if needs_pad {
+                    pw.needs_truncate = true;
+                }
+                pw.aligned_in_flight = Some(aligned);
+                (ptr, submit_len)
+            } else {
+                // SAFETY: `pw.bytes` is held in `paced_writes` until
+                // the chunk's CQE arrives (we don't remove the
+                // PacedWrite before then), so this raw pointer + len is
+                // valid for the kernel's exclusive read.
+                let ptr = unsafe { pw.bytes.as_ptr().add(chunk_start) };
+                (ptr, chunk_len)
+            };
+
             let entry = opcode::Write::new(
                 types::Fd(pw.raw_fd),
                 chunk_ptr,
-                chunk_len as u32,
+                submit_len as u32,
             )
             .offset(chunk_start as u64)
             .build()
@@ -723,18 +846,26 @@ fn run_worker(
             // SAFETY: see comment above re. buffer lifetime.
             unsafe {
                 if ring.submission().push(&entry).is_err() {
-                    // Defer; try again next tick.
+                    // Defer; try again next tick. Release the aligned
+                    // buffer (if any) since the kernel never saw it -
+                    // we'll allocate fresh on the retry.
+                    pw.aligned_in_flight = None;
                     still_delayed.push((deadline, id));
                     next_user_data = next_user_data.wrapping_sub(1);
                     continue;
                 }
             }
             pw.next_offset_to_submit = chunk_end;
+            // `chunk_len` here is the *logical* length the CQE result
+            // should match (the kernel returns the number of bytes the
+            // write covered, which equals `submit_len` on success). We
+            // pass `submit_len` to the completion handler so the
+            // short-write check uses the same number the kernel sees.
             pending.insert(
                 chunk_user_data,
                 InFlight::PacedChunk {
                     paced_write_id: id,
-                    chunk_len,
+                    chunk_len: submit_len,
                 },
             );
             batched += 1;
@@ -907,6 +1038,9 @@ fn handle_paced_chunk_completion(
     let Some(pw) = paced_writes.get_mut(&paced_write_id) else {
         return;
     };
+    // The kernel is done with the just-completed chunk's buffer; release
+    // it now. Subsequent chunks allocate fresh in the submission path.
+    pw.aligned_in_flight = None;
     if cqe_result < 0 {
         pw.failed = Some(wrap_io_err(std::io::Error::from_raw_os_error(-cqe_result)));
     } else {
@@ -932,6 +1066,21 @@ fn handle_paced_chunk_completion(
     // error and want to bail out. Either way drop the file + rename +
     // signal sender.
     let mut pw = paced_writes.remove(&paced_write_id).expect("just had it");
+    // If the last O_DIRECT chunk was padded, the file's logical size
+    // overshoots `total_len`. Bring it back down before rename so
+    // readers see the right size (`cached_head` derives `size` from
+    // the disk file's metadata in some paths). Done while we still
+    // hold the fd to avoid an open/close round-trip.
+    if pw.needs_truncate && pw.failed.is_none() {
+        if let Some(file) = pw.file.as_ref() {
+            // SAFETY: file is owned and the fd is valid for the duration
+            // of this call.
+            let rc = unsafe { libc::ftruncate(file.as_raw_fd(), pw.total_len as libc::off_t) };
+            if rc != 0 {
+                pw.failed = Some(wrap_io_err(std::io::Error::last_os_error()));
+            }
+        }
+    }
     drop(pw.file.take()); // close fd before rename
     let result = if let Some(err) = pw.failed.take() {
         let _ = std::fs::remove_file(&pw.tmp_path);
