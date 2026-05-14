@@ -484,6 +484,32 @@ impl CachedObjectStore {
             .await?;
         let upstream_elapsed = put_start.elapsed();
 
+        // Build the head metadata from the PUT result. We construct it
+        // *before* the cache-root resolution check so the in-memory head
+        // cache can be populated unconditionally - readers of this
+        // location will get an in-memory hit even if the on-disk cache
+        // was unavailable at write time (e.g. root not yet resolved on
+        // the first writer-side put).
+        //
+        // last_modified is a stub: the cache doesn't use this
+        // field for invalidation, only echoes it back from
+        // cached_head(). The upstream object's real last_modified
+        // is filled in lazily the next time a HEAD goes upstream.
+        let head_meta = ObjectMeta {
+            location: location.clone(),
+            last_modified: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+            size: payload_size,
+            e_tag: result.e_tag.clone(),
+            version: result.version.clone(),
+        };
+        let head_attrs = object_store::Attributes::new();
+        // Pre-populate the in-memory head cache: this entry is now the
+        // authoritative head for this location. Done before the on-disk
+        // cache checks below so a startup race where `resolved_root` is
+        // still unset cannot leave the head unrecorded - the next reader
+        // hits the in-memory entry instead of S3 HEAD.
+        self.populate_head_cache(location, head_meta.clone(), head_attrs.clone());
+
         // Then, save to local cache if admission policy allows it
         let Some(cache_location) = self.cache_location_for(location) else {
             warn!(
@@ -512,25 +538,8 @@ impl CachedObjectStore {
         // throughput for 6+ seconds at compaction start. The
         // head is tiny (a few hundred bytes); writing it is
         // negligible cost.
-        //
-        // last_modified is a stub: the cache doesn't use this
-        // field for invalidation, only echoes it back from
-        // cached_head(). The upstream object's real last_modified
-        // is filled in lazily the next time a HEAD goes upstream.
-        let head_meta = ObjectMeta {
-            location: location.clone(),
-            last_modified: chrono::DateTime::<chrono::Utc>::MIN_UTC,
-            size: payload_size,
-            e_tag: result.e_tag.clone(),
-            version: result.version.clone(),
-        };
-        let head_attrs = object_store::Attributes::new();
         #[allow(clippy::disallowed_methods)]
         let head_start = tokio::time::Instant::now();
-        // Pre-populate the in-memory head cache: this entry is now the
-        // authoritative head for this location, and a foreground reader
-        // racing the manifest publish can skip the disk head read.
-        self.populate_head_cache(location, head_meta.clone(), head_attrs.clone());
         if let Err(e) = entry.save_head((&head_meta, &head_attrs)).await {
             warn!(
                 "cached_put_opts: save_head failed [location={}, error={:?}]",
