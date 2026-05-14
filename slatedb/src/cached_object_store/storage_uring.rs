@@ -311,6 +311,16 @@ enum WorkerOp {
     /// Drop the cached fd for `path` (called after rename / delete so the
     /// next read opens the new inode).
     InvalidateFd { path: std::path::PathBuf },
+    /// Insert a pre-opened fd into the worker's fd_cache for `path`.
+    /// Used by the tee-commit path to hand the worker already-opened
+    /// fds for newly-written part / head files, so the first
+    /// foreground read avoids a synchronous `open()` on the worker
+    /// thread (which has been observed taking 50+ ms under load, head-
+    /// of-line blocking subsequent pread SQEs).
+    SeedFdCache {
+        path: std::path::PathBuf,
+        file: Arc<File>,
+    },
     /// Hint the kernel to drop page cache pages for every part + head file
     /// under `dir`. Best-effort.
     AdviseDontneed { dir: std::path::PathBuf },
@@ -457,6 +467,15 @@ fn run_worker(
                 WorkerOp::Shutdown => return Ok(()),
                 WorkerOp::InvalidateFd { path } => {
                     fd_cache.remove(&path);
+                }
+                WorkerOp::SeedFdCache { path, file } => {
+                    // The opener (running on tokio::spawn_blocking)
+                    // already paid for the syscall; we just insert.
+                    // This unconditionally overwrites any prior entry
+                    // for `path` because the tee-commit rename
+                    // produced a new inode; a stale entry here would
+                    // serve old bytes.
+                    fd_cache.insert(path, file);
                 }
                 WorkerOp::AdviseDontneed { dir } => {
                     // Best-effort, sync. Not worth a uring round-trip; the
@@ -1122,7 +1141,25 @@ fn get_or_open_for_read(
     if direct_io {
         open.custom_flags(libc::O_DIRECT | libc::O_NOATIME);
     }
+    // Time the open syscall. Runs synchronously on the io_uring worker
+    // thread: any time spent here blocks subsequent foreground pread
+    // SQEs queued behind it. A 50 ms+ open under load means the FS
+    // metadata layer is contended (typically by parallel compaction
+    // tee writes / rename batches hitting the same inode allocator).
+    // Pair with `slow advance_block: next_iter ...` to confirm the
+    // first-block-of-fresh-SST slowness is the open and not the read.
+    const SLOW_OPEN_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(20);
+    let open_start = std::time::Instant::now();
     let file = open.open(path)?;
+    let open_elapsed = open_start.elapsed();
+    if open_elapsed > SLOW_OPEN_THRESHOLD {
+        log::warn!(
+            "slow io_uring worker open: path={} took={:?} direct_io={}",
+            path.display(),
+            open_elapsed,
+            direct_io,
+        );
+    }
     let arc = Arc::new(file);
     fd_cache.insert(path.to_path_buf(), arc.clone());
     Ok(arc)
@@ -1607,17 +1644,51 @@ impl LocalCacheTee for IoUringCacheTee {
             );
         }
 
-        // Invalidate any cached fds for the renamed final paths.
-        for (_, final_) in &pending_renames {
-            let _ = self
-                .worker
-                .tx
-                .send(WorkerOp::InvalidateFd { path: final_.clone() });
-        }
-        let _ = self
-            .worker
-            .tx
-            .send(WorkerOp::InvalidateFd { path: head_pair.1 });
+        // Seed the worker's fd_cache with already-opened fds for every
+        // newly-renamed file. Done on `spawn_blocking` so the open()
+        // syscalls stay off the io_uring worker thread; the worker
+        // just receives `Arc<File>` payloads and stuffs them into its
+        // local map. The next foreground read for any of these paths
+        // skips the synchronous open and goes straight to pread.
+        //
+        // We seed unconditionally (overwriting any prior entry) because
+        // the rename produced a new inode; an old cached fd would now
+        // point at an unlinked inode. The fd_cache's existing
+        // `is_handle_valid` check would have caught that on first read,
+        // but pre-seeding avoids the open in the success path too.
+        let worker_tx = self.worker.tx.clone();
+        let head_path = head_pair.1.clone();
+        let part_paths: Vec<std::path::PathBuf> = pending_renames
+            .iter()
+            .map(|(_, final_)| final_.clone())
+            .collect();
+        // Open in a single blocking task so we make at most one trip
+        // to the spawn_blocking pool per commit; the writes are
+        // expected to amortize over the size of the SST.
+        tokio::task::spawn_blocking(move || {
+            let mut open = OpenOptions::new();
+            open.read(true).custom_flags(libc::O_DIRECT | libc::O_NOATIME);
+            for path in part_paths.into_iter().chain(std::iter::once(head_path)) {
+                match open.open(&path) {
+                    Ok(f) => {
+                        let _ = worker_tx.send(WorkerOp::SeedFdCache {
+                            path,
+                            file: Arc::new(f),
+                        });
+                    }
+                    Err(e) => {
+                        // Best-effort: a failed seed just means the
+                        // first reader will pay the open cost. Log so
+                        // it's visible if it ever becomes systematic.
+                        warn!(
+                            "io_uring tee commit: failed to pre-open {} for fd seed: {:?}",
+                            path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        });
 
         result
     }
