@@ -647,10 +647,22 @@ impl CachedObjectStore {
         let s3_start = tokio::time::Instant::now();
         let get_result = self.object_store.get_opts(location, opts).await?;
         let s3_elapsed = s3_start.elapsed();
-        warn!(
-            "cache fall-through to upstream get_opts [location={}, reason={}, took={:?}]",
-            location, reason, s3_elapsed,
-        );
+        // Manifest and WAL paths are intentionally excluded from the
+        // cache on the write side (see `cached_put_opts`), so a
+        // fall-through here is expected, not pathological. Reserve
+        // `warn` for compacted-SST fall-throughs — those are the real
+        // signal we care about — and demote the rest to `debug`.
+        if Self::is_compacted_sst_path(location) {
+            warn!(
+                "cache fall-through to upstream get_opts [location={}, reason={}, took={:?}]",
+                location, reason, s3_elapsed,
+            );
+        } else {
+            log::debug!(
+                "cache fall-through to upstream get_opts (uncached path) [location={}, reason={}, took={:?}]",
+                location, reason, s3_elapsed,
+            );
+        }
 
         let result_meta = get_result.meta.clone();
         let result_attrs = get_result.attributes.clone();
