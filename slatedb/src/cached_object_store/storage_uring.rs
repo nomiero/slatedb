@@ -807,9 +807,12 @@ fn run_worker(
                         pw.failed = Some(wrap_io_err(e));
                         // Drain by pretending the chunk submitted and
                         // completed with error: jump to finalize on the
-                        // next pass.
+                        // next pass. We push to `still_delayed` rather
+                        // than `delayed_chunks` because the latter is
+                        // mid-`drain` here and can't be mutated again
+                        // until the iterator drops.
                         pw.next_offset_to_submit = pw.total_len;
-                        delayed_chunks.push((std::time::Instant::now(), id));
+                        still_delayed.push((std::time::Instant::now(), id));
                         next_user_data = next_user_data.wrapping_sub(1);
                         continue;
                     }

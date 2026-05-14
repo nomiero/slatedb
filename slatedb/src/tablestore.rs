@@ -361,6 +361,18 @@ impl TableStore {
     /// invalidation is best-effort and runs only after the remote DELETE
     /// succeeds; pre-DELETE we keep cache entries because a reader holding
     /// an older manifest snapshot may still legitimately read the SST.
+    ///
+    /// On the post-DELETE cache invalidation we now deliberately keep
+    /// the local cache entry untouched. Rationale: a foreground read
+    /// holding a stale `state.view()` snapshot can still legitimately
+    /// reference this SST id; if the local cache is wiped here, that
+    /// read falls through to an upstream GET against an object that
+    /// no longer exists, returning NotFound at best or stalling on
+    /// per-attempt retries at worst. By leaving the cache entry in
+    /// place the stale reader keeps serving correctly; the LRU
+    /// evictor reclaims the disk space later when capacity pressure
+    /// is real. SST ids are ULIDs (effectively unique forever) so
+    /// stale bytes can never collide with a future write.
     pub(crate) async fn delete_sst(&self, id: &SsTableId) -> Result<(), SlateDBError> {
         let object_store = self.object_stores.store_for(id);
         let path = self.path(id);
@@ -369,10 +381,6 @@ impl TableStore {
             .delete(&path)
             .await
             .map_err(SlateDBError::from)?;
-
-        if let Some(cached) = &self.cached_object_store {
-            cached.invalidate(&path).await;
-        }
         Ok(())
     }
 

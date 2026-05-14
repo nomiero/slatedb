@@ -113,6 +113,13 @@ impl CachedObjectStore {
     /// cache root has not yet been resolved (no GET/HEAD has succeeded for
     /// any object), this is a no-op since the cache cannot hold any entry
     /// for this location.
+    ///
+    /// Currently unused by production code: SST deletion in `TableStore::
+    /// delete_sst` deliberately leaves cache entries in place so a stale
+    /// reader snapshot can keep serving (the LRU evictor reclaims space
+    /// later). Kept available for tests and any future caller that
+    /// genuinely wants synchronous invalidation.
+    #[allow(dead_code)]
     pub(crate) async fn invalidate(&self, location: &Path) {
         // Drop the in-memory head first so a concurrent reader can't
         // pick up stale metadata while we tear down the disk entry.
