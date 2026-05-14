@@ -451,21 +451,16 @@ impl TokioCompactionExecutorInner {
             output_ssts.push(sst);
         }
 
-        // Hint to the OS that the input SSTs' page-cache pages are no
-        // longer needed. The SR we just produced replaces these inputs
-        // in the manifest momentarily, after which no reader (current
-        // or future) will look at the input bytes - they sit in page
-        // cache as dead weight, eventually pressuring the kernel's
-        // LRU list to evict reader-hot pages instead. POSIX_FADV_DONTNEED
-        // drops them now. Best-effort; no-op without a disk cache.
-        for h in &args.sst_views {
-            self.table_store.advise_dontneed(&h.sst.id).await;
-        }
-        for sr in &args.sorted_runs {
-            for view in &sr.sst_views {
-                self.table_store.advise_dontneed(&view.sst.id).await;
-            }
-        }
+        // We used to call `advise_dontneed` here to drop the input
+        // SSTs' page-cache pages, which was useful when the cache wrote
+        // bytes through the page cache. With the O_DIRECT pacing path,
+        // those writes bypass the page cache entirely - the only
+        // page-cache footprint is each SST's tiny head file (~hundreds
+        // of bytes), which is negligible. The dontneed sweep itself
+        // ran synchronously on the io_uring worker, doing one
+        // open+posix_fadvise+close per part file per input SST, and
+        // was producing 18-second read stalls under load. Skipping it
+        // is a net win when running with `direct_io`.
 
         Ok(SortedRun {
             id: args.destination,

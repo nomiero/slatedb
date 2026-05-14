@@ -392,6 +392,12 @@ impl TableStore {
     /// page cache just delays eviction of pages a current reader
     /// actually wants. Best-effort, no-op when no on-disk cache is
     /// configured.
+    ///
+    /// Currently unused: the compactor stopped calling this when running
+    /// with O_DIRECT pacing because the input SSTs already bypass the
+    /// page cache. Kept on the API surface for any future caller that
+    /// runs without O_DIRECT and wants the hint.
+    #[allow(dead_code)]
     pub(crate) async fn advise_dontneed(&self, id: &SsTableId) {
         let path = self.path(id);
         if let Some(cached) = &self.cached_object_store {

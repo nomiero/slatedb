@@ -142,6 +142,12 @@ impl CachedObjectStore {
     /// (the compactor) that have just finished consuming an SST and
     /// want to free its pages from page cache before the next reader
     /// touches the new sorted run.
+    ///
+    /// Currently unused in the compactor: with O_DIRECT pacing the
+    /// input SSTs already bypass the page cache, so the hint has
+    /// nothing meaningful to drop. Kept on the storage API surface
+    /// for future callers or non-O_DIRECT deployments.
+    #[allow(dead_code)]
     pub(crate) async fn advise_dontneed(&self, location: &Path) {
         let Some(cache_location) = self.cache_location_for(location) else {
             return;
