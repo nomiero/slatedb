@@ -186,8 +186,8 @@ impl FlushTracker {
     /// compaction via manifest refresh.
     async fn reconcile_and_dispatch(&mut self) -> Result<(), SlateDBError> {
         let imm_memtables: Vec<_> = {
-            let cow = self.inner.state.state();
-            cow.imm_memtable.iter().rev().cloned().collect()
+            let guard = self.inner.state.read();
+            guard.state().imm_memtable.iter().rev().cloned().collect()
         };
         let inner = &self.inner;
         self.frontier.register(imm_memtables.into_iter(), &mut || {
@@ -200,7 +200,7 @@ impl FlushTracker {
 
     fn available_l0_slots(&self) -> usize {
         let (l0_len, peak) = {
-            let state = self.inner.state.state();
+            let state = self.inner.state.read().state();
             let l0 = &state.core().tree.l0;
             (l0.len(), crate::db_state::max_l0_overlap(l0))
         };
@@ -497,10 +497,10 @@ mod tests {
         recent_flushed_wal_id: u64,
     ) {
         let seq = inner.oracle.next_seq();
-        let memtable = inner.state.memtable();
-        memtable.put(RowEntry::new_value(key, value, seq));
-        let last_seq = memtable.table().last_seq().unwrap();
-        inner.state.freeze_memtable(recent_flushed_wal_id);
+        let mut guard = inner.state.write();
+        guard.memtable().put(RowEntry::new_value(key, value, seq));
+        let last_seq = guard.memtable().table().last_seq().unwrap();
+        guard.freeze_memtable(recent_flushed_wal_id);
         // Advance the durable seq to simulate a wal flush
         inner.oracle.advance_durable_seq(last_seq);
     }
@@ -512,10 +512,10 @@ mod tests {
         recent_flushed_wal_id: u64,
     ) {
         let seq = inner.oracle.next_seq();
-        let memtable = inner.state.memtable();
-        memtable.put(RowEntry::new_merge(key, value, seq));
-        let last_seq = memtable.table().last_seq().unwrap();
-        inner.state.freeze_memtable(recent_flushed_wal_id);
+        let mut guard = inner.state.write();
+        guard.memtable().put(RowEntry::new_merge(key, value, seq));
+        let last_seq = guard.memtable().table().last_seq().unwrap();
+        guard.freeze_memtable(recent_flushed_wal_id);
         // Advance the durable seq to simulate a wal flush
         inner.oracle.advance_durable_seq(last_seq);
     }
@@ -575,10 +575,13 @@ mod tests {
     }
 
     fn set_local_l0_disjoint(harness: &TestHarness, ranges: &[(&[u8], &[u8])]) {
-        harness.inner.state.modify(|cow| {
-            cow.manifest.value.core.tree.l0.clear();
+        let mut guard = harness.inner.state.write();
+        guard.modify(|modifier| {
+            modifier.state.manifest.value.core.tree.l0.clear();
             for (first, last) in ranges {
-                cow.manifest
+                modifier
+                    .state
+                    .manifest
                     .value
                     .core
                     .tree
@@ -609,10 +612,13 @@ mod tests {
     }
 
     fn set_local_l0_len(harness: &TestHarness, l0_len: usize) {
-        harness.inner.state.modify(|cow| {
-            cow.manifest.value.core.tree.l0.clear();
+        let mut guard = harness.inner.state.write();
+        guard.modify(|modifier| {
+            modifier.state.manifest.value.core.tree.l0.clear();
             for idx in 0..l0_len {
-                cow.manifest
+                modifier
+                    .state
+                    .manifest
                     .value
                     .core
                     .tree
@@ -908,10 +914,10 @@ mod tests {
                 .is_err());
 
             // Clear both local and remote L0 so the flusher can make progress.
-            flusher
-                .inner
-                .state
-                .modify(|cow| cow.manifest.value.core.tree.l0.clear());
+            {
+                let mut guard = flusher.inner.state.write();
+                guard.modify(|modifier| modifier.state.manifest.value.core.tree.l0.clear());
+            }
             set_remote_l0_len(&path, object_store, 0).await;
 
             let result = timeout(Duration::from_secs(5), &mut flush)
@@ -996,10 +1002,10 @@ mod tests {
             .is_err());
 
         // Drain L0 locally and remotely; flush should now progress.
-        flusher
-            .inner
-            .state
-            .modify(|cow| cow.manifest.value.core.tree.l0.clear());
+        {
+            let mut guard = flusher.inner.state.write();
+            guard.modify(|modifier| modifier.state.manifest.value.core.tree.l0.clear());
+        }
         set_remote_l0_disjoint(&path, object_store, &[]).await;
 
         let result = timeout(Duration::from_secs(5), &mut flush)

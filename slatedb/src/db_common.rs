@@ -1,66 +1,63 @@
 use log::warn;
+use parking_lot::RwLockWriteGuard;
 
 use crate::db::DbInner;
+use crate::db_state::DbState;
 use crate::error::SlateDBError;
 use crate::oracle::Oracle;
 use crate::wal_replay::ReplayedMemtable;
 
 pub(crate) const MAX_WAL_FLUSHES_BEFORE_L0_FLUSH: u64 = 4096;
 
-/// Threshold above which the writer-side `state.modify()` work + mutex
-/// acquisition gets logged. Set on the high side (1 ms) since this is
-/// per-batch and we don't want chatter; the dips we're hunting are
-/// tens of ms.
-const SLOW_STATE_WRITE_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(1);
+/// Threshold above which `state.write()` acquisition + held-time gets
+/// logged. Set on the high side (1 ms) since this is per-batch and we
+/// don't want chatter; the dips we're hunting are tens of ms.
+const SLOW_STATE_WRITE_LOCK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(1);
 
 impl DbInner {
     pub(crate) fn maybe_freeze_current_memtable(&self) -> Result<(), SlateDBError> {
         let wal_id = self.wal_buffer.recent_flushed_wal_id();
-
-        // Double-check pattern: snapshot the state via a lock-free
-        // `ArcSwap` load, evaluate the freeze condition, and only
-        // escalate to a writer-mutex acquisition when we actually
-        // need to freeze. `freeze_memtable` is idempotent (returns
-        // early on empty memtable), so even if another writer races
-        // ahead and freezes the same memtable between our load and
-        // our subsequent `modify`, the second freeze is a no-op.
-        let needs_freeze = {
-            let cow = self.state.state();
-            let meta = cow.memtable.table().metadata();
-            let last_freeze_wal_id = cow
-                .imm_memtable
-                .front()
-                .map(|imm| imm.recent_flushed_wal_id())
-                .unwrap_or(cow.core().replay_after_wal_id);
-            let l0_sst_size_est = self
-                .table_store
-                .estimate_encoded_size_compacted(meta.entry_num, meta.entries_size_in_bytes);
-            let wal_id_gap = wal_id
-                .checked_sub(last_freeze_wal_id)
-                .ok_or_else(|| SlateDBError::InvalidDBState)?;
-            wal_id_gap >= MAX_WAL_FLUSHES_BEFORE_L0_FLUSH
-                || l0_sst_size_est >= self.settings.l0_sst_size_bytes
-        };
-
-        if !needs_freeze {
-            return Ok(());
-        }
-
-        // Slow path: actually freeze. Time the writer-mutex
-        // acquisition + work so pathological cases (e.g. the freeze
-        // itself blocking on a saturated flush queue) still surface.
+        // Slow-path tracing: time both the lock acquire and the work
+        // done while holding it. Per-batch on the writer task; if held
+        // long, every concurrent reader pays for it via state.read()
+        // contention.
         #[allow(clippy::disallowed_methods)]
-        let start = tokio::time::Instant::now();
-        let result = self.freeze_memtable(wal_id);
-        let elapsed = start.elapsed();
-        self.db_stats.state_write_acquisitions.increment(1);
-        self.db_stats
-            .state_write_held_micros_total
-            .increment(elapsed.as_micros() as u64);
-        if elapsed > SLOW_STATE_WRITE_THRESHOLD {
+        let acquire_start = tokio::time::Instant::now();
+        let mut guard = self.state.write();
+        let acquire_elapsed = acquire_start.elapsed();
+        #[allow(clippy::disallowed_methods)]
+        let work_start = tokio::time::Instant::now();
+        let meta = guard.memtable().metadata();
+
+        let last_freeze_wal_id = guard
+            .state()
+            .imm_memtable
+            .front()
+            .map(|imm| imm.recent_flushed_wal_id())
+            .unwrap_or(guard.state().core().replay_after_wal_id);
+
+        let l0_sst_size_est = self
+            .table_store
+            .estimate_encoded_size_compacted(meta.entry_num, meta.entries_size_in_bytes);
+
+        let wal_id_gap = wal_id
+            .checked_sub(last_freeze_wal_id)
+            .ok_or_else(|| SlateDBError::InvalidDBState)?;
+
+        let result = if wal_id_gap < MAX_WAL_FLUSHES_BEFORE_L0_FLUSH
+            && l0_sst_size_est < self.settings.l0_sst_size_bytes
+        {
+            Ok(())
+        } else {
+            self.freeze_memtable(&mut guard, wal_id)
+        };
+        let work_elapsed = work_start.elapsed();
+        if acquire_elapsed > SLOW_STATE_WRITE_LOCK_THRESHOLD
+            || work_elapsed > SLOW_STATE_WRITE_LOCK_THRESHOLD
+        {
             warn!(
-                "slow state.modify() in maybe_freeze_current_memtable: total={:?}",
-                elapsed,
+                "slow state.write() in maybe_freeze_current_memtable: acquire={:?}, work={:?}, l0_size_est={}",
+                acquire_elapsed, work_elapsed, l0_sst_size_est,
             );
         }
         result
@@ -68,19 +65,20 @@ impl DbInner {
 
     pub(crate) fn freeze_current_memtable(&self) -> Result<(), SlateDBError> {
         let wal_id = self.wal_buffer.recent_flushed_wal_id();
-        self.freeze_memtable(wal_id)
+        let mut guard = self.state.write();
+        self.freeze_memtable(&mut guard, wal_id)
     }
 
-    pub(crate) fn freeze_memtable(&self, wal_id: u64) -> Result<(), SlateDBError> {
-        // Cheap pre-check off the published snapshot. If the memtable
-        // is empty we skip the writer mutex entirely; freeze_memtable
-        // on the DbState side is also idempotent on an empty table,
-        // so any race here is benign.
-        if self.state.state().memtable.is_empty() {
+    pub(crate) fn freeze_memtable(
+        &self,
+        guard: &mut RwLockWriteGuard<'_, DbState>,
+        wal_id: u64,
+    ) -> Result<(), SlateDBError> {
+        if guard.memtable().is_empty() {
             return Ok(());
         }
 
-        self.state.freeze_memtable(wal_id);
+        guard.freeze_memtable(wal_id);
         let _ = self.memtable_flusher().notify_memtable_frozen();
         Ok(())
     }
@@ -89,6 +87,8 @@ impl DbInner {
         &self,
         replayed_memtable: ReplayedMemtable,
     ) -> Result<(), SlateDBError> {
+        let mut guard = self.state.write();
+
         // a WAL might contain the data across multiple memtables. we can only consider
         // last_wal_id - 1 as the recent persisted wal id when the memtable is reconstructed.
         // or when we need to replay again, we might risks to lose some WAL entries.
@@ -101,9 +101,10 @@ impl DbInner {
         // maybe_freeze_memtable's subtraction doesn't underflow.
         self.wal_buffer
             .advance_recent_flushed_wal_id(recent_flushed_wal_id);
-        self.freeze_memtable(recent_flushed_wal_id)?;
+        self.freeze_memtable(&mut guard, recent_flushed_wal_id)?;
 
         let last_wal = replayed_memtable.last_wal_id;
+        guard.modify(|modifier| modifier.state.manifest.value.core.next_wal_sst_id = last_wal + 1);
 
         // update seqs and clock
         // we know these won't move backwards (even though the replayed wal files might contain some
@@ -116,15 +117,10 @@ impl DbInner {
             .advance_committed_seq(replayed_memtable.last_seq);
         self.mono_clock.set_last_tick(replayed_memtable.last_tick)?;
 
-        // Bundle the next_wal_sst_id bump and the memtable replacement
-        // into a single `modify` so a concurrent reader can't observe
-        // the replaced memtable without the matching manifest update.
-        let dirty_manifest = self.state.modify(|cow| {
-            cow.manifest.value.core.next_wal_sst_id = last_wal + 1;
-            assert!(cow.memtable.is_empty());
-            cow.memtable = std::sync::Arc::new(replayed_memtable.table);
-            cow.manifest.clone()
-        });
+        // replace the memtable
+        guard.replace_memtable(replayed_memtable.table);
+        let dirty_manifest = guard.state().manifest.clone();
+        drop(guard);
         self.status_manager.report_manifest(dirty_manifest.into());
         Ok(())
     }

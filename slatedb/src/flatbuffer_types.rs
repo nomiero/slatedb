@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::ops::{Bound, RangeBounds};
-use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use chrono::{DateTime, Utc};
@@ -283,11 +282,11 @@ impl FlatBufferManifestCodec {
                 name: cp.name().map(|s| s.to_string()),
             })
             .collect();
-        let sequence_tracker = Arc::new(match manifest.sequence_tracker() {
+        let sequence_tracker = match manifest.sequence_tracker() {
             Some(bytes) => SequenceTracker::from_bytes(bytes.bytes())
                 .expect("Invalid encoding of sequence tracker in manifest."),
             None => SequenceTracker::new(),
-        });
+        };
         let external_dbs = manifest
             .external_dbs()
             .map(|external_dbs| {
@@ -403,11 +402,11 @@ impl FlatBufferManifestCodec {
                 name: cp.name().map(|s| s.to_string()),
             })
             .collect();
-        let sequence_tracker = Arc::new(match manifest.sequence_tracker() {
+        let sequence_tracker = match manifest.sequence_tracker() {
             Some(bytes) => SequenceTracker::from_bytes(bytes.bytes())
                 .expect("Invalid encoding of sequence tracker in manifest."),
             None => SequenceTracker::new(),
-        });
+        };
         let external_dbs = manifest
             .external_dbs()
             .map(|external_dbs| {

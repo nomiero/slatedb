@@ -332,9 +332,7 @@ impl TokioCompactionExecutorInner {
             job_args.is_dest_last_run,
             job_args.compaction_clock_tick,
             self.clock.clone(),
-            // db_state().sequence_tracker is Arc<SequenceTracker>;
-            // .clone() is a cheap Arc::clone, no deep copy.
-            stored_manifest.db_state().sequence_tracker.clone(),
+            Arc::new(stored_manifest.db_state().sequence_tracker.clone()),
         )
         .await?;
         retention_iter.init().await?;

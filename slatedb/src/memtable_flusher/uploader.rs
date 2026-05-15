@@ -330,11 +330,10 @@ mod tests {
         value: &[u8],
         seq: u64,
     ) -> Arc<crate::mem_table::ImmutableMemtable> {
-        db.state
-            .memtable()
-            .put(RowEntry::new_value(key, value, seq));
-        db.state.freeze_memtable(0);
-        db.state.state().imm_memtable.front().cloned().unwrap()
+        let mut guard = db.state.write();
+        guard.memtable().put(RowEntry::new_value(key, value, seq));
+        guard.freeze_memtable(0);
+        guard.state().imm_memtable.front().cloned().unwrap()
     }
 
     fn next_upload_job(db: &DbInner, key: &[u8], value: &[u8], seq: u64) -> UploadJob {
@@ -479,13 +478,23 @@ mod tests {
             Arc::new(FailPointRegistry::new()),
         )
         .await;
-        db.state.memtable().put(crate::types::RowEntry::new_merge(
-            b"key",
-            b"merge_operand",
-            1,
-        ));
-        db.state.freeze_memtable(0);
-        let imm_memtable = db.state.state().imm_memtable.front().cloned().unwrap();
+        {
+            let mut guard = db.state.write();
+            guard.memtable().put(crate::types::RowEntry::new_merge(
+                b"key",
+                b"merge_operand",
+                1,
+            ));
+            guard.freeze_memtable(0);
+        }
+        let imm_memtable = db
+            .state
+            .read()
+            .state()
+            .imm_memtable
+            .front()
+            .cloned()
+            .unwrap();
         let sst_id = SsTableId::Compacted(db.rand.rng().gen_ulid(db.system_clock.as_ref()));
         let job = UploadJob::new(imm_memtable, sst_id);
 
@@ -545,11 +554,21 @@ mod tests {
 
         // Create a merge entry without a merge operator — this causes a
         // fatal build error in the worker.
-        db.state
-            .memtable()
-            .put(crate::types::RowEntry::new_merge(b"key", b"operand", 1));
-        db.state.freeze_memtable(0);
-        let imm_memtable = db.state.state().imm_memtable.front().cloned().unwrap();
+        {
+            let mut guard = db.state.write();
+            guard
+                .memtable()
+                .put(crate::types::RowEntry::new_merge(b"key", b"operand", 1));
+            guard.freeze_memtable(0);
+        }
+        let imm_memtable = db
+            .state
+            .read()
+            .state()
+            .imm_memtable
+            .front()
+            .cloned()
+            .unwrap();
         let sst_id = SsTableId::Compacted(db.rand.rng().gen_ulid(db.system_clock.as_ref()));
         let bad_job = UploadJob::new(imm_memtable, sst_id);
 
