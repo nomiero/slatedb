@@ -68,11 +68,18 @@ impl CachedObjectStore {
         }))
     }
 
-    /// Insert (or overwrite) an entry in the in-memory head cache. Called
-    /// only from the write paths (`cached_put_opts` after the on-disk
-    /// save_head succeeds; the tee-commit path after a streaming write
-    /// finalizes). Reads must not call this - filling on reads would
-    /// require an invalidation hook the cache otherwise avoids.
+    /// Insert (or overwrite) an entry in the in-memory head cache.
+    ///
+    /// Callers:
+    /// - Write paths (`cached_put_opts` after the on-disk save_head
+    ///   succeeds; the tee-commit path after a streaming write
+    ///   finalizes).
+    /// - Read paths, when a head is served from the on-disk cache for
+    ///   a *compacted-SST path*. Those paths are immutable under a
+    ///   stable id, so the in-memory copy can't diverge from the
+    ///   authoritative source. Non-SST paths (manifests, WALs) must
+    ///   NOT trigger this from the read side - they can be rewritten
+    ///   without any invalidation signal into this cache.
     pub(crate) fn populate_head_cache(
         &self,
         location: &Path,
@@ -249,10 +256,16 @@ impl CachedObjectStore {
         let mut remaining_bytes = max_bytes;
         let mut files_to_load = Vec::with_capacity(file_paths.len());
 
-        // First pass: sequentially get metadata and select files that fit
-        // This is done sequentially because the head calls should be very quick compared to files loading
+        // First pass: sequentially fetch metadata for each SST and
+        // pick the ones that fit in the budget. Routed through
+        // `cached_head` so that, on a warm-disk restart, the head can
+        // be served from the on-disk cache instead of issuing a fresh
+        // S3 HEAD per SST. Cold starts still hit S3 once per SST
+        // (same as before), but the result is now saved to disk by
+        // `cached_head`'s miss path, which keeps the second pass's
+        // `maybe_prefetch_range` from doing it again.
         for path in file_paths {
-            match self.object_store.head(&path).await {
+            match self.cached_head(&path).await {
                 Ok(meta) => {
                     let file_size = meta.size as usize;
                     if remaining_bytes >= file_size {
@@ -408,9 +421,17 @@ impl CachedObjectStore {
             let entry = self
                 .cache_storage
                 .entry(&cache_location, self.part_size_bytes);
-            if let Ok(Some((meta, _))) = entry.read_head().await {
+            if let Ok(Some((meta, attrs))) = entry.read_head().await {
                 if cacheable {
                     self.stats.object_store_cache_head_hits.increment(1);
+                    // Populate the in-memory head cache from the disk
+                    // hit. Safe for compacted-SST paths because they
+                    // are immutable under a stable id (the write side
+                    // never rewrites the same path). Skipped for non-
+                    // cacheable paths (manifests, WALs) which can be
+                    // rewritten and have no invalidation channel into
+                    // this cache.
+                    self.populate_head_cache(location, meta.clone(), attrs);
                 }
                 return Ok(meta);
             }
@@ -650,6 +671,15 @@ impl CachedObjectStore {
                 Ok(Some((meta, attrs))) => {
                     if cacheable {
                         self.stats.object_store_cache_head_hits.increment(1);
+                        // Populate the in-memory head cache from the
+                        // disk hit. See the matching block in
+                        // `cached_head` for the safety argument: only
+                        // valid for immutable compacted-SST paths.
+                        self.populate_head_cache(
+                            location,
+                            meta.clone(),
+                            attrs.clone(),
+                        );
                     }
                     return Ok((meta, attrs));
                 }
