@@ -9,6 +9,7 @@ use object_store::{path::Path, GetOptions, GetResult, ObjectMeta, ObjectStore};
 use object_store::{Attributes, GetRange, GetResultPayload, PutMultipartOptions, PutResult};
 use object_store::{ListResult, MultipartUpload, PutOptions, PutPayload};
 use slatedb_common::clock::SystemClock;
+use std::collections::HashMap;
 use std::{ops::Range, sync::Arc};
 use tokio::sync::OnceCell;
 
@@ -30,6 +31,17 @@ pub(crate) struct CachedObjectStore {
     // Absolute path of the root folder relative to the bucket. See #1319.
     resolved_root: Arc<OnceCell<Path>>,
     stats: Arc<CachedObjectStoreStats>,
+    /// In-memory cache of head metadata, keyed by upstream location.
+    /// Populated only on write paths (L0 flush via `cached_put_opts`,
+    /// compaction via the tee commit). Reads never fill this map - that
+    /// keeps the cache coherent with the on-disk head files without an
+    /// invalidation protocol, and avoids amplifying read-side memory
+    /// pressure when reads stream over many short-lived objects.
+    ///
+    /// Hits here skip both the on-disk head read and any S3 HEAD round
+    /// trip. The per-entry payload is ~hundreds of bytes; an SST working
+    /// set in the thousands of entries fits comfortably in low MBs.
+    head_cache: Arc<parking_lot::Mutex<HashMap<Path, (ObjectMeta, Attributes)>>>,
 }
 
 impl CachedObjectStore {
@@ -52,7 +64,38 @@ impl CachedObjectStore {
             admission_picker: AdmissionPicker::default(),
             cache_puts,
             resolved_root: Arc::new(OnceCell::new()),
+            head_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }))
+    }
+
+    /// Insert (or overwrite) an entry in the in-memory head cache.
+    ///
+    /// Callers:
+    /// - Write paths (`cached_put_opts` after the on-disk save_head
+    ///   succeeds; the tee-commit path after a streaming write
+    ///   finalizes).
+    /// - Read paths, when a head is served from the on-disk cache for
+    ///   a *compacted-SST path*. Those paths are immutable under a
+    ///   stable id, so the in-memory copy can't diverge from the
+    ///   authoritative source. Non-SST paths (manifests, WALs) must
+    ///   NOT trigger this from the read side - they can be rewritten
+    ///   without any invalidation signal into this cache.
+    pub(crate) fn populate_head_cache(
+        &self,
+        location: &Path,
+        meta: ObjectMeta,
+        attrs: Attributes,
+    ) {
+        self.head_cache
+            .lock()
+            .insert(location.clone(), (meta, attrs));
+    }
+
+    /// Drop an entry from the in-memory head cache. Used when the
+    /// underlying object is removed so the next reader doesn't see
+    /// stale metadata. Best-effort; absence of an entry is fine.
+    pub(crate) fn invalidate_head_cache(&self, location: &Path) {
+        self.head_cache.lock().remove(location);
     }
 
     pub(crate) async fn start_evictor(&self) {
@@ -77,7 +120,17 @@ impl CachedObjectStore {
     /// cache root has not yet been resolved (no GET/HEAD has succeeded for
     /// any object), this is a no-op since the cache cannot hold any entry
     /// for this location.
+    ///
+    /// Currently unused by production code: SST deletion in `TableStore::
+    /// delete_sst` deliberately leaves cache entries in place so a stale
+    /// reader snapshot can keep serving (the LRU evictor reclaims space
+    /// later). Kept available for tests and any future caller that
+    /// genuinely wants synchronous invalidation.
+    #[allow(dead_code)]
     pub(crate) async fn invalidate(&self, location: &Path) {
+        // Drop the in-memory head first so a concurrent reader can't
+        // pick up stale metadata while we tear down the disk entry.
+        self.invalidate_head_cache(location);
         let Some(cache_location) = self.cache_location_for(location) else {
             return;
         };
@@ -139,10 +192,16 @@ impl CachedObjectStore {
         let mut remaining_bytes = max_bytes;
         let mut files_to_load = Vec::with_capacity(file_paths.len());
 
-        // First pass: sequentially get metadata and select files that fit
-        // This is done sequentially because the head calls should be very quick compared to files loading
+        // First pass: sequentially fetch metadata for each SST and
+        // pick the ones that fit in the budget. Routed through
+        // `cached_head` so that, on a warm-disk restart, the head can
+        // be served from the on-disk cache instead of issuing a fresh
+        // S3 HEAD per SST. Cold starts still hit S3 once per SST
+        // (same as before), but the result is now saved to disk by
+        // `cached_head`'s miss path, which keeps the second pass's
+        // `maybe_prefetch_range` from doing it again.
         for path in file_paths {
-            match self.object_store.head(&path).await {
+            match self.cached_head(&path).await {
                 Ok(meta) => {
                     let file_size = meta.size as usize;
                     if remaining_bytes >= file_size {
@@ -279,13 +338,29 @@ impl CachedObjectStore {
         if cacheable {
             self.stats.object_store_cache_head_access.increment(1);
         }
+        // In-memory shortcut: populated only on write commits, so a hit
+        // here is authoritative without any disk I/O.
+        if let Some((meta, _)) = self.head_cache.lock().get(location).cloned() {
+            if cacheable {
+                self.stats.object_store_cache_head_hits.increment(1);
+            }
+            return Ok(meta);
+        }
         if let Some(cache_location) = self.cache_location_for(location) {
             let entry = self
                 .cache_storage
                 .entry(&cache_location, self.part_size_bytes);
-            if let Ok(Some((meta, _))) = entry.read_head().await {
+            if let Ok(Some((meta, attrs))) = entry.read_head().await {
                 if cacheable {
                     self.stats.object_store_cache_head_hits.increment(1);
+                    // Populate the in-memory head cache from the disk
+                    // hit. Safe for compacted-SST paths because they
+                    // are immutable under a stable id (the write side
+                    // never rewrites the same path). Skipped for non-
+                    // cacheable paths (manifests, WALs) which can be
+                    // rewritten and have no invalidation channel into
+                    // this cache.
+                    self.populate_head_cache(location, meta.clone(), attrs);
                 }
                 return Ok(meta);
             }
@@ -383,6 +458,32 @@ impl CachedObjectStore {
             .put_opts(location, payload.clone(), opts)
             .await?;
 
+        // Build the head metadata from the PUT result. We construct it
+        // *before* the cache-root resolution check so the in-memory head
+        // cache can be populated unconditionally - readers of this
+        // location will get an in-memory hit even if the on-disk cache
+        // was unavailable at write time (e.g. root not yet resolved on
+        // the first writer-side put).
+        //
+        // last_modified is a stub: the cache doesn't use this
+        // field for invalidation, only echoes it back from
+        // cached_head(). The upstream object's real last_modified
+        // is filled in lazily the next time a HEAD goes upstream.
+        let head_meta = ObjectMeta {
+            location: location.clone(),
+            last_modified: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+            size: payload_size,
+            e_tag: result.e_tag.clone(),
+            version: result.version.clone(),
+        };
+        let head_attrs = object_store::Attributes::new();
+        // Pre-populate the in-memory head cache: this entry is now the
+        // authoritative head for this location. Done before the on-disk
+        // cache checks below so a startup race where `resolved_root` is
+        // still unset cannot leave the head unrecorded - the next reader
+        // hits the in-memory entry instead of S3 HEAD.
+        self.populate_head_cache(location, head_meta.clone(), head_attrs.clone());
+
         // Then, save to local cache if admission policy allows it
         let Some(cache_location) = self.cache_location_for(location) else {
             return Ok(result);
@@ -391,29 +492,10 @@ impl CachedObjectStore {
             .cache_storage
             .entry(&cache_location, self.part_size_bytes);
         if self.admission_picker.pick(entry.as_ref()).admitted() {
-            // Save the head metadata (size, location, etag from the
-            // PUT result) so the next reader's `cached_head` lookup
-            // hits the local cache. Without this, the FIRST reader to
-            // touch a freshly-flushed L0 SST falls through to an S3
-            // HEAD request - and S3 HEAD has a multi-second tail
-            // latency that has been observed stalling reader
-            // throughput for 6+ seconds at compaction start. The
-            // head is tiny (a few hundred bytes); writing it is
-            // negligible cost.
-            //
-            // last_modified is a stub (chrono::Utc::now()): the
-            // cache doesn't use this field for invalidation, only
-            // echoes it back from cached_head(). The upstream
-            // object's real last_modified is filled in lazily the
-            // next time a HEAD goes upstream.
-            let head_meta = ObjectMeta {
-                location: location.clone(),
-                last_modified: chrono::DateTime::<chrono::Utc>::MIN_UTC,
-                size: payload_size,
-                e_tag: result.e_tag.clone(),
-                version: result.version.clone(),
-            };
-            let head_attrs = object_store::Attributes::new();
+            // Save the head metadata to the on-disk cache. The
+            // in-memory head was already populated above; here we
+            // mirror it on disk so a reader served after eviction
+            // of the in-memory entry still hits the local cache.
             entry
                 .save_head((&head_meta, &head_attrs))
                 .await
@@ -457,6 +539,14 @@ impl CachedObjectStore {
         if cacheable {
             self.stats.object_store_cache_head_access.increment(1);
         }
+        // In-memory shortcut: populated only on write commits, so a hit
+        // here is authoritative without any disk I/O.
+        if let Some((meta, attrs)) = self.head_cache.lock().get(location).cloned() {
+            if cacheable {
+                self.stats.object_store_cache_head_hits.increment(1);
+            }
+            return Ok((meta, attrs));
+        }
         if let Some(cache_location) = self.cache_location_for(location) {
             let entry = self
                 .cache_storage
@@ -465,6 +555,15 @@ impl CachedObjectStore {
                 Ok(Some((meta, attrs))) => {
                     if cacheable {
                         self.stats.object_store_cache_head_hits.increment(1);
+                        // Populate the in-memory head cache from the
+                        // disk hit. See the matching block in
+                        // `cached_head` for the safety argument: only
+                        // valid for immutable compacted-SST paths.
+                        self.populate_head_cache(
+                            location,
+                            meta.clone(),
+                            attrs.clone(),
+                        );
                     }
                     return Ok((meta, attrs));
                 }
@@ -796,6 +895,11 @@ impl ObjectStore for CachedObjectStore {
 
     async fn delete(&self, location: &Path) -> object_store::Result<()> {
         // TODO: handle cache eviction
+        // Drop the in-memory head so a subsequent reader doesn't see
+        // metadata describing an object the upstream no longer has.
+        // The on-disk cache eviction is still a TODO above; this is
+        // strictly an improvement over the previous behavior.
+        self.invalidate_head_cache(location);
         self.object_store.delete(location).await
     }
 
@@ -1010,6 +1114,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         ));
         let prefixed: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
             backing_store.clone(),
@@ -1066,6 +1171,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         ));
 
         let store_a: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
@@ -1163,6 +1269,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         ));
         let cached_store =
             CachedObjectStore::new(bad_meta_store, cache_storage, 1024, false, stats).unwrap();
@@ -1210,6 +1317,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         ));
 
         let part_size = 1024;
@@ -1289,6 +1397,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         ));
 
         let cached_store =
@@ -1335,6 +1444,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         ));
 
         let cached_store =
@@ -1426,6 +1536,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         ));
         let cached_store =
             CachedObjectStore::new(object_store, cache_storage, 1024, false, stats).unwrap();
@@ -1450,6 +1561,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         ));
         let cached_store =
             CachedObjectStore::new(object_store, cache_storage, 1024, false, stats).unwrap();
@@ -1482,6 +1594,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         ));
         let cached_store =
             CachedObjectStore::new(object_store.clone(), cache_storage, 1024, false, stats)
@@ -1564,6 +1677,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         ));
 
         let object_store = Arc::new(object_store::memory::InMemory::new());
@@ -1615,6 +1729,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         ));
 
         let object_store = Arc::new(object_store::memory::InMemory::new());
@@ -1662,6 +1777,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         ));
         let cached_store =
             CachedObjectStore::new(backing_store.clone(), cache_storage, 1024, false, stats)
@@ -1723,6 +1839,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         ));
         let cached =
             CachedObjectStore::new(backing_store.clone(), cache_storage, 1024, true, stats)
@@ -1798,6 +1915,7 @@ mod tests {
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
             1000,
+            false, // direct_io
         ));
         let cached_store =
             CachedObjectStore::new(backing_store, cache_storage, 1024, false, stats).unwrap();
