@@ -1696,6 +1696,7 @@ impl<'a> flatbuffers::Follow<'a> for BlockMeta<'a> {
 impl<'a> BlockMeta<'a> {
   pub const VT_OFFSET: flatbuffers::VOffsetT = 4;
   pub const VT_FIRST_KEY: flatbuffers::VOffsetT = 6;
+  pub const VT_LENGTH: flatbuffers::VOffsetT = 8;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -1707,6 +1708,7 @@ impl<'a> BlockMeta<'a> {
     args: &'args BlockMetaArgs<'args>
   ) -> flatbuffers::WIPOffset<BlockMeta<'bldr>> {
     let mut builder = BlockMetaBuilder::new(_fbb);
+    builder.add_length(args.length);
     builder.add_offset(args.offset);
     if let Some(x) = args.first_key { builder.add_first_key(x); }
     builder.finish()
@@ -1727,6 +1729,13 @@ impl<'a> BlockMeta<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(BlockMeta::VT_FIRST_KEY, None).unwrap()}
   }
+  #[inline]
+  pub fn length(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(BlockMeta::VT_LENGTH, Some(0)).unwrap()}
+  }
 }
 
 impl flatbuffers::Verifiable for BlockMeta<'_> {
@@ -1738,6 +1747,7 @@ impl flatbuffers::Verifiable for BlockMeta<'_> {
     v.visit_table(pos)?
      .visit_field::<u64>("offset", Self::VT_OFFSET, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("first_key", Self::VT_FIRST_KEY, true)?
+     .visit_field::<u64>("length", Self::VT_LENGTH, false)?
      .finish();
     Ok(())
   }
@@ -1745,6 +1755,7 @@ impl flatbuffers::Verifiable for BlockMeta<'_> {
 pub struct BlockMetaArgs<'a> {
     pub offset: u64,
     pub first_key: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
+    pub length: u64,
 }
 impl<'a> Default for BlockMetaArgs<'a> {
   #[inline]
@@ -1752,6 +1763,7 @@ impl<'a> Default for BlockMetaArgs<'a> {
     BlockMetaArgs {
       offset: 0,
       first_key: None, // required field
+      length: 0,
     }
   }
 }
@@ -1768,6 +1780,10 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> BlockMetaBuilder<'a, 'b, A> {
   #[inline]
   pub fn add_first_key(&mut self, first_key: flatbuffers::WIPOffset<flatbuffers::Vector<'b , u8>>) {
     self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(BlockMeta::VT_FIRST_KEY, first_key);
+  }
+  #[inline]
+  pub fn add_length(&mut self, length: u64) {
+    self.fbb_.push_slot::<u64>(BlockMeta::VT_LENGTH, length, 0);
   }
   #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> BlockMetaBuilder<'a, 'b, A> {
@@ -1790,6 +1806,7 @@ impl core::fmt::Debug for BlockMeta<'_> {
     let mut ds = f.debug_struct("BlockMeta");
       ds.field("offset", &self.offset());
       ds.field("first_key", &self.first_key());
+      ds.field("length", &self.length());
       ds.finish()
   }
 }

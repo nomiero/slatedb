@@ -157,15 +157,59 @@ impl CachedObjectStore {
             Some(f) => f,
         };
         let stats = Arc::new(CachedObjectStoreStats::new(recorder));
-        let cache_storage = Arc::new(FsCacheStorage::new(
-            cache_root_folder.clone(),
-            options.max_cache_size_bytes,
-            options.scan_interval,
-            stats.clone(),
-            clock,
-            rand,
-            options.max_open_file_handles,
-        ));
+        let cache_storage: Arc<dyn crate::cached_object_store::LocalCacheStorage> =
+            if options.use_io_uring {
+                #[cfg(target_os = "linux")]
+                {
+                    match crate::cached_object_store::storage_uring::IoUringCacheStorage::try_new(
+                        cache_root_folder.clone(),
+                        options.direct_io,
+                    ) {
+                        Ok(s) => Arc::new(s),
+                        Err(e) => {
+                            warn!(
+                                "io_uring cache storage init failed; falling back to FsCacheStorage [error={:?}]",
+                                e
+                            );
+                            Arc::new(FsCacheStorage::new(
+                                cache_root_folder.clone(),
+                                options.max_cache_size_bytes,
+                                options.scan_interval,
+                                stats.clone(),
+                                clock.clone(),
+                                rand.clone(),
+                                options.max_open_file_handles,
+                                options.direct_io,
+                            ))
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    warn!("use_io_uring set but not on Linux; falling back to FsCacheStorage");
+                    Arc::new(FsCacheStorage::new(
+                        cache_root_folder.clone(),
+                        options.max_cache_size_bytes,
+                        options.scan_interval,
+                        stats.clone(),
+                        clock.clone(),
+                        rand.clone(),
+                        options.max_open_file_handles,
+                        options.direct_io,
+                    ))
+                }
+            } else {
+                Arc::new(FsCacheStorage::new(
+                    cache_root_folder.clone(),
+                    options.max_cache_size_bytes,
+                    options.scan_interval,
+                    stats.clone(),
+                    clock,
+                    rand,
+                    options.max_open_file_handles,
+                    options.direct_io,
+                ))
+            };
         let cached = Self::new(
             object_store,
             cache_storage,

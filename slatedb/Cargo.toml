@@ -18,6 +18,7 @@ bytes = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
 sysinfo = { workspace = true }
 crc32fast = { workspace = true }
+crossbeam-channel = "0.5"
 crossbeam-skiplist = { workspace = true }
 dotenvy = { workspace = true }
 duration-str = { workspace = true, features = [
@@ -70,6 +71,13 @@ tokio-util = { workspace = true, default-features = false, features = [
 ] }
 thread_local = { workspace = true }
 url = "2.5.4"
+
+# io_uring backend for the on-disk cache. Linux-only by design; on other
+# targets the storage_uring module is cfg'd out and the cache falls back to
+# the standard FsCacheStorage. Pin to a tested 0.7.x.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+core_affinity = "0.8"
 
 [dev-dependencies]
 backtrace = "0.3"
