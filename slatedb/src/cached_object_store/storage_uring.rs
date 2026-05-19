@@ -321,9 +321,6 @@ enum WorkerOp {
         path: std::path::PathBuf,
         file: Arc<File>,
     },
-    /// Hint the kernel to drop page cache pages for every part + head file
-    /// under `dir`. Best-effort.
-    AdviseDontneed { dir: std::path::PathBuf },
     /// Remove the cache directory for a location (recursive).
     RemoveDir {
         dir: std::path::PathBuf,
@@ -476,22 +473,6 @@ fn run_worker(
                     // produced a new inode; a stale entry here would
                     // serve old bytes.
                     fd_cache.insert(path, file);
-                }
-                WorkerOp::AdviseDontneed { dir } => {
-                    // Best-effort, sync. Not worth a uring round-trip; the
-                    // dontneed hint is rare (compaction completion) and
-                    // benefits from being applied to all part files together.
-                    if let Ok(rd) = std::fs::read_dir(&dir) {
-                        for entry in rd.flatten() {
-                            let p = entry.path();
-                            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                            if name == "_head" || name.starts_with("_part") {
-                                if let Ok(f) = std::fs::File::open(&p) {
-                                    advise_dontneed(f.as_raw_fd());
-                                }
-                            }
-                        }
-                    }
                 }
                 WorkerOp::RemoveDir { dir, sender } => {
                     let res = std::fs::remove_dir_all(&dir).map_err(wrap_io_err);
@@ -826,9 +807,11 @@ fn run_worker(
                         pw.failed = Some(wrap_io_err(e));
                         // Drain by pretending the chunk submitted and
                         // completed with error: jump to finalize on the
-                        // next pass.
+                        // next pass. Push into the new vec being built
+                        // (`still_delayed`) rather than `delayed_chunks`,
+                        // which is currently being drained.
                         pw.next_offset_to_submit = pw.total_len;
-                        delayed_chunks.push((std::time::Instant::now(), id));
+                        still_delayed.push((std::time::Instant::now(), id));
                         next_user_data = next_user_data.wrapping_sub(1);
                         continue;
                     }
@@ -1113,13 +1096,6 @@ fn handle_paced_chunk_completion(
     let _ = pw.sender.send(result);
 }
 
-fn advise_dontneed(fd: RawFd) {
-    // SAFETY: fd is valid for the duration of this call (caller holds a File).
-    unsafe {
-        libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
-    }
-}
-
 fn get_or_open_for_read(
     fd_cache: &mut HashMap<std::path::PathBuf, Arc<File>>,
     path: &std::path::Path,
@@ -1293,13 +1269,6 @@ impl LocalCacheStorage for IoUringCacheStorage {
         }))
     }
 
-    async fn advise_dontneed(&self, location: &Path) {
-        let dir = self.root_folder.join(location.to_string());
-        let _ = self
-            .worker_for_location(location)
-            .tx
-            .send(WorkerOp::AdviseDontneed { dir });
-    }
 }
 
 #[derive(Debug)]
