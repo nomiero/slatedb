@@ -275,15 +275,26 @@ impl CachedObjectStore {
     }
 
     pub(crate) async fn cached_head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+        let cacheable = Self::is_compacted_sst_path(location);
+        if cacheable {
+            self.stats.object_store_cache_head_access.increment(1);
+        }
         if let Some(cache_location) = self.cache_location_for(location) {
             let entry = self
                 .cache_storage
                 .entry(&cache_location, self.part_size_bytes);
             if let Ok(Some((meta, _))) = entry.read_head().await {
+                if cacheable {
+                    self.stats.object_store_cache_head_hits.increment(1);
+                }
                 return Ok(meta);
             }
         }
 
+        // Cache miss: fall through to S3 HEAD. This path has
+        // multi-second tail latency on AWS; the (access - hit) gap
+        // tracked here is the most useful early-warning signal for
+        // reader stalls during compaction events.
         let result = self
             .object_store
             .get_opts(
@@ -343,11 +354,28 @@ impl CachedObjectStore {
         payload: object_store::PutPayload,
         opts: object_store::PutOptions,
     ) -> object_store::Result<PutResult> {
-        // Only cache if the cache_puts option is enabled
-        if !self.cache_puts {
-            // If caching is disabled, just write to the upstream object store without cloning
+        // Only cache if the cache_puts option is enabled, AND the put is for
+        // a compacted SST. WAL frames, manifests, and compactions metadata
+        // are excluded:
+        //   - WAL: only used for crash recovery; caching it wastes disk and
+        //     write bandwidth on data we never re-read on the hot path.
+        //   - manifests / compactions metadata: small, mutable, and read
+        //     through dedicated paths that don't benefit from this layer.
+        // Compacted SSTs are the only PUT-shaped writes worth caching here.
+        // Streaming SST writes (multipart uploads) flow through the prewarm
+        // tee in EncodedSsTableWriter, not through this method.
+        if !self.cache_puts || !Self::is_compacted_sst_path(location) {
             return self.object_store.put_opts(location, payload, opts).await;
         }
+
+        // Compute the payload size before consuming `payload` for the
+        // upstream PUT - we need it to build the ObjectMeta we save
+        // alongside the parts so subsequent reads don't have to do an
+        // S3 HEAD round-trip.
+        let payload_size: u64 = payload
+            .iter()
+            .map(|b| b.len() as u64)
+            .sum();
 
         // First, write to the upstream object store (cloning payload is cheap since it's just a Arc internally)
         let result = self
@@ -363,8 +391,35 @@ impl CachedObjectStore {
             .cache_storage
             .entry(&cache_location, self.part_size_bytes);
         if self.admission_picker.pick(entry.as_ref()).admitted() {
+            // Save the head metadata (size, location, etag from the
+            // PUT result) so the next reader's `cached_head` lookup
+            // hits the local cache. Without this, the FIRST reader to
+            // touch a freshly-flushed L0 SST falls through to an S3
+            // HEAD request - and S3 HEAD has a multi-second tail
+            // latency that has been observed stalling reader
+            // throughput for 6+ seconds at compaction start. The
+            // head is tiny (a few hundred bytes); writing it is
+            // negligible cost.
+            //
+            // last_modified is a stub (chrono::Utc::now()): the
+            // cache doesn't use this field for invalidation, only
+            // echoes it back from cached_head(). The upstream
+            // object's real last_modified is filled in lazily the
+            // next time a HEAD goes upstream.
+            let head_meta = ObjectMeta {
+                location: location.clone(),
+                last_modified: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+                size: payload_size,
+                e_tag: result.e_tag.clone(),
+                version: result.version.clone(),
+            };
+            let head_attrs = object_store::Attributes::new();
+            entry
+                .save_head((&head_meta, &head_attrs))
+                .await
+                .ok();
+
             // Convert PutPayload to stream and save parts to cache.
-            // Note: cached_head() already saved the head, so we only need to save parts
             let stream = stream::iter(payload.into_iter()).map(Ok::<Bytes, object_store::Error>);
 
             // Save parts only, ignoring errors (cache failures shouldn't fail the PUT operation)
@@ -372,6 +427,14 @@ impl CachedObjectStore {
         }
 
         Ok(result)
+    }
+
+    /// True when `location` points at a compacted-SST file. We match on a
+    /// `compacted/` path segment rather than any specific root prefix so the
+    /// detection works under prefix-stores, multi-tenant layouts, and tests
+    /// that mount the DB under arbitrary paths.
+    fn is_compacted_sst_path(location: &Path) -> bool {
+        location.parts().any(|p| p.as_ref() == "compacted")
     }
 
     // if an object is not cached before, maybe_prefetch_range will try to prefetch the object from the
@@ -385,12 +448,26 @@ impl CachedObjectStore {
         location: &Path,
         mut opts: GetOptions,
     ) -> object_store::Result<(ObjectMeta, Attributes)> {
+        // Mirror `cached_head`: every call to this function is a head
+        // lookup, so it must count toward head_access_count regardless
+        // of whether the cache root is resolved. Without this, the
+        // counter only reflects calls that came through `cached_head`
+        // directly, and `cached_get_opts` traffic is invisible.
+        let cacheable = Self::is_compacted_sst_path(location);
+        if cacheable {
+            self.stats.object_store_cache_head_access.increment(1);
+        }
         if let Some(cache_location) = self.cache_location_for(location) {
             let entry = self
                 .cache_storage
                 .entry(&cache_location, self.part_size_bytes);
             match entry.read_head().await {
-                Ok(Some((meta, attrs))) => return Ok((meta, attrs)),
+                Ok(Some((meta, attrs))) => {
+                    if cacheable {
+                        self.stats.object_store_cache_head_hits.increment(1);
+                    }
+                    return Ok((meta, attrs));
+                }
                 Ok(None) => {}
                 Err(e) => {
                     warn!(
@@ -1626,6 +1703,82 @@ mod tests {
         assert!(
             entry.read_head().await.unwrap().is_none(),
             "head should be gone after invalidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_puts_skips_wal_and_manifest_paths() {
+        // cache_puts=true should only populate the cache for compacted-SST
+        // paths. WAL frames and manifest writes go straight to upstream so
+        // we don't burn local disk on bytes we'll never re-read on the hot
+        // path.
+        let backing_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let recorder = MetricsRecorderHelper::noop();
+        let stats = Arc::new(CachedObjectStoreStats::new(&recorder));
+        let cache_storage = Arc::new(FsCacheStorage::new(
+            new_test_cache_folder(),
+            None,
+            None,
+            stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        ));
+        let cached =
+            CachedObjectStore::new(backing_store.clone(), cache_storage, 1024, true, stats)
+                .unwrap();
+
+        // Resolve the cache root by reading something through the cache
+        // (otherwise cache_location_for returns None and the cache writes
+        // skip for an unrelated reason).
+        let warm = Path::from("warmup-object");
+        backing_store
+            .put(&warm, PutPayload::from_bytes(Bytes::from_static(b"hi")))
+            .await
+            .unwrap();
+        let _ = cached.cached_head(&warm).await.unwrap();
+
+        // Put to a WAL path. The upstream should accept it but the cache
+        // should not have any parts for it.
+        let wal_path = Path::from("db/wal/00000000000000000001.sst");
+        cached
+            .put(&wal_path, PutPayload::from_bytes(Bytes::from_static(b"wal-frame")))
+            .await
+            .unwrap();
+        let wal_entry = cached.cache_storage.entry(&wal_path, 1024);
+        assert!(
+            wal_entry.cached_parts().await.unwrap().is_empty(),
+            "WAL puts must not populate the cache"
+        );
+
+        // Put to a manifest path. Same expectation.
+        let manifest_path = Path::from("db/manifest/0001.manifest");
+        cached
+            .put(
+                &manifest_path,
+                PutPayload::from_bytes(Bytes::from_static(b"manifest-bytes")),
+            )
+            .await
+            .unwrap();
+        let manifest_entry = cached.cache_storage.entry(&manifest_path, 1024);
+        assert!(
+            manifest_entry.cached_parts().await.unwrap().is_empty(),
+            "manifest puts must not populate the cache"
+        );
+
+        // Put to a compacted SST path. This one *should* land in the cache.
+        let compacted_path = Path::from("db/compacted/01HQ.sst");
+        cached
+            .put(
+                &compacted_path,
+                PutPayload::from_bytes(Bytes::from_static(b"compacted-sst-bytes")),
+            )
+            .await
+            .unwrap();
+        let compacted_entry = cached.cache_storage.entry(&compacted_path, 1024);
+        assert!(
+            !compacted_entry.cached_parts().await.unwrap().is_empty(),
+            "compacted SST puts must populate the cache when cache_puts=true"
         );
     }
 

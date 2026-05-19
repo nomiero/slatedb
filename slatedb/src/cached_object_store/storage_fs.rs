@@ -3,7 +3,6 @@ use crate::rand::DbRand;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use log::{debug, warn};
-use lru::LruCache;
 use object_store::path::Path;
 use object_store::{Attributes, ObjectMeta};
 use rand::{distr::Alphanumeric, Rng};
@@ -11,7 +10,6 @@ use slatedb_common::clock::SystemClock;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::io::Write;
-use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -30,6 +28,45 @@ use crate::utils::format_bytes_si;
 /// any final rename.
 const TEE_TMP_INFIX: &str = ".tmp-";
 
+/// Write a `Bytes` payload to `file`, optionally pacing the write so a single
+/// large SST part doesn't saturate the device. Reads from foreground requests
+/// can otherwise queue behind a sustained 100MB+ write at compaction time and
+/// inflate `r_await`.
+///
+/// Pacing is controlled via env vars and only kicks in when both are set:
+/// - `SLATEDB_CACHE_WRITE_CHUNK_BYTES`: chunk size (e.g. 8388608 = 8MB).
+/// - `SLATEDB_CACHE_WRITE_PAUSE_US`: microseconds to sleep between chunks.
+///
+/// Unset / zero on either side preserves the original `write_all` semantics
+/// (one syscall, no pause). Reading the env on every call is cheap relative
+/// to a 100MB+ disk write and lets the bencher tune without a rebuild.
+fn write_all_paced(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    let chunk_bytes = std::env::var("SLATEDB_CACHE_WRITE_CHUNK_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let pause_us = std::env::var("SLATEDB_CACHE_WRITE_PAUSE_US")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    if chunk_bytes == 0 || pause_us == 0 || bytes.len() <= chunk_bytes {
+        return file.write_all(bytes);
+    }
+
+    let pause = Duration::from_micros(pause_us);
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = (offset + chunk_bytes).min(bytes.len());
+        file.write_all(&bytes[offset..end])?;
+        offset = end;
+        if offset < bytes.len() {
+            std::thread::sleep(pause);
+        }
+    }
+    Ok(())
+}
+
 /// A cached file handle node. Callers that obtain an `Arc<CachedFileHandle>`
 /// keep the underlying fd alive even after the entry is evicted from the cache.
 #[derive(Debug)]
@@ -45,32 +82,36 @@ impl CachedFileHandle {
 
 /// A cache of open file descriptors, keyed by filesystem path.
 ///
-/// Uses a `Mutex` protecting an `LruCache` for O(1) lookup, promotion, and
-/// eviction. Individual file reads use positional I/O (`pread` /
-/// `read_exact_at`) which does not touch the file cursor, so multiple threads
-/// can read from the same `Arc<CachedFileHandle>` concurrently without any
-/// per-file locking.
+/// Backed by `scc::HashMap`, which provides lock-free reads via per-bucket
+/// atomic state. Steady-state lookups never block another reader. Inserts
+/// (cold-miss path) take a brief per-bucket lock. There is no eviction;
+/// under the intended config (preload all SSTs + evictor disabled) the fd
+/// set is write-once-read-many and unbounded growth is a non-issue.
+///
+/// Individual file reads use positional I/O (`pread` / `read_exact_at`)
+/// which does not touch the file cursor, so multiple threads can read from
+/// the same `Arc<CachedFileHandle>` concurrently without any per-file
+/// locking.
 #[derive(Clone)]
 pub(crate) struct FileHandleCache {
-    inner: Arc<std::sync::Mutex<LruCache<std::path::PathBuf, Arc<CachedFileHandle>>>>,
+    inner: Arc<scc::HashMap<std::path::PathBuf, Arc<CachedFileHandle>>>,
 }
 
 impl std::fmt::Debug for FileHandleCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock().expect("lock should not be poisoned");
         f.debug_struct("FileHandleCache")
-            .field("len", &inner.len())
-            .field("cap", &inner.cap())
+            .field("len", &self.inner.len())
             .finish()
     }
 }
 
 impl FileHandleCache {
-    fn new(max_handles: usize) -> Self {
+    fn new(_max_handles: usize) -> Self {
+        // max_handles is accepted for API compatibility but ignored: the
+        // scc-backed map is unbounded by design. Callers that pass a small
+        // cap should be aware that the cache will not enforce it.
         Self {
-            inner: Arc::new(std::sync::Mutex::new(LruCache::new(
-                NonZeroUsize::new(max_handles).expect("max_handles must be > 0"),
-            ))),
+            inner: Arc::new(scc::HashMap::new()),
         }
     }
 
@@ -80,13 +121,14 @@ impl FileHandleCache {
         &self,
         path: &std::path::Path,
     ) -> Result<Option<Arc<CachedFileHandle>>, std::io::Error> {
-        let mut cache = self.inner.lock().expect("lock should not be poisoned");
-        if let Some(handle) = cache.get(path) {
-            if Self::is_valid(handle, path) {
-                return Ok(Some(handle.clone()));
+        // Hot path: lock-free lookup.
+        if let Some(entry) = self.inner.read(path, |_, v| v.clone()) {
+            if Self::is_valid(&entry, path) {
+                return Ok(Some(entry));
             }
-            // Stale entry — remove it so we reopen below.
-            cache.pop(path);
+            // Stale (file replaced or unlinked). Remove and fall through to
+            // reopen.
+            self.inner.remove(path);
         }
 
         let file = match std::fs::File::open(path) {
@@ -95,10 +137,27 @@ impl FileHandleCache {
             Err(err) => return Err(err),
         };
 
+        // Hint the kernel that we will read randomly inside this file. SST
+        // reads pull small block ranges out of large parts; the default
+        // readahead is wasted I/O. Best-effort: ignore failures.
+        Self::set_random_advise(&file);
+
         let handle = Arc::new(CachedFileHandle { file });
 
-        cache.push(path.to_path_buf(), handle.clone());
-        Ok(Some(handle))
+        // Race-tolerant insert: if another thread inserted concurrently, we
+        // discard our newly opened fd and use theirs. Either way we return a
+        // valid handle.
+        match self.inner.insert(path.to_path_buf(), handle.clone()) {
+            Ok(()) => Ok(Some(handle)),
+            Err((_path, _handle)) => {
+                // Lost the race. Try to pick up the winner; if a third
+                // thread (e.g. invalidate after a delete_sst) yanked the
+                // entry between insert and read, the map is empty for this
+                // path. In that case fall back to our freshly opened fd.
+                let winner = self.inner.read(path, |_, v| v.clone()).unwrap_or(handle);
+                Ok(Some(winner))
+            }
+        }
     }
 
     /// Check whether a cached file descriptor still refers to a live file.
@@ -121,11 +180,38 @@ impl FileHandleCache {
         path.exists()
     }
 
+    /// Hint the kernel that we will read randomly inside this file. SST
+    /// reads pull small block ranges out of large parts; the default
+    /// readahead window wastes I/O fetching adjacent blocks we don't need.
+    /// Best-effort: failures are ignored silently. Linux uses
+    /// `posix_fadvise(POSIX_FADV_RANDOM)`; macOS uses `fcntl(F_RDAHEAD, 0)`.
+    #[cfg(target_os = "linux")]
+    fn set_random_advise(file: &std::fs::File) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: posix_fadvise only inspects the fd; it does not transfer
+        // ownership and is safe to call on any open file.
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_random_advise(file: &std::fs::File) {
+        use std::os::unix::io::AsRawFd;
+        // F_RDAHEAD with arg 0 disables sequential prefetching for the file.
+        // SAFETY: fcntl with F_RDAHEAD only sets a per-fd flag.
+        unsafe {
+            libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0);
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn set_random_advise(_file: &std::fs::File) {}
+
     /// Remove a cached handle, e.g. after eviction or after a write replaces
     /// the file (since the cached fd would still reference the old inode).
     fn invalidate(&self, path: &std::path::Path) {
-        let mut cache = self.inner.lock().expect("lock should not be poisoned");
-        cache.pop(path);
+        self.inner.remove(path);
     }
 }
 
@@ -306,16 +392,22 @@ impl FsCacheEntry {
     async fn atomic_write(&self, path: std::path::PathBuf, buf: Bytes) -> object_store::Result<()> {
         let tmp_path = path.with_extension(format!("_tmp{}", self.make_rand_suffix()));
 
-        // try triggering evict before writing
+        // Notify the evictor of this cache entry. The evictor's mpsc
+        // channel is shared with the much-higher-frequency read-access
+        // tracking (every `read_part` call); under load the channel
+        // can fill, in which case `track_entry_accessed` returns
+        // false. Previously this silently skipped the file write,
+        // which manifested as readers falling through to S3 because
+        // a fraction of head/part files were never written despite
+        // the SST being published in the manifest.
+        //
+        // The fix: tracking failure must NOT skip the write. Eviction
+        // accounting can be slightly off (the evictor will pick it up
+        // on the next periodic scan); a missing cache file cannot.
         if let Some(evictor) = &self.evictor {
-            // If the evictor is backpressured, skip this cache write to avoid
-            // stalling foreground PUTs. Cache writes are best-effort.
-            if !evictor
+            evictor
                 .track_entry_accessed(path.clone(), buf.len(), true)
-                .await
-            {
-                return Ok(());
-            }
+                .await;
         }
 
         // Spawn a blocking task and do synchronous I/O rather than use the tokio async apis.
@@ -339,8 +431,12 @@ impl FsCacheEntry {
                 .truncate(true)
                 .open(tmp_path)
                 .map_err(wrap_io_err)?;
-            file.write_all(&buf).map_err(wrap_io_err)?;
-            file.sync_all().map_err(wrap_io_err)?;
+            write_all_paced(&mut file, &buf).map_err(wrap_io_err)?;
+            // No fsync. The cache is reconstructable from the upstream
+            // object store; a power loss may leave torn or zero-length
+            // files, which the read path treats as a miss and refetches.
+            // Skipping fsync removes a per-part barrier that dominates the
+            // write hot path on local SSDs.
             std::fs::rename(tmp_path, path).map_err(wrap_io_err)
         })
         .await?
@@ -662,7 +758,11 @@ impl FsCacheTee {
             rand,
             file_handle_cache,
             evictor,
-            part_buf: bytes::BytesMut::with_capacity(part_size),
+            // Grow lazily. `BytesMut::with_capacity(part_size)` would
+            // allocate the full part up front, which for large part sizes
+            // (256MB) wastes memory if the SST is smaller than one part.
+            // The amortized growth cost is dominated by the disk write.
+            part_buf: bytes::BytesMut::new(),
             next_part_number: 0,
             total_bytes: 0,
             pending: Vec::new(),
@@ -704,8 +804,11 @@ impl FsCacheTee {
                 .create(true)
                 .truncate(true)
                 .open(&tmp_path)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
+            write_all_paced(&mut file, &bytes)?;
+            // No fsync. The tee is best-effort: on a crash before the
+            // rename-into-place barrier the orphan tmp files are swept by
+            // scan_entries on next start. On a crash after rename, a torn
+            // or short final file simply produces a cache miss on read.
             Ok(())
         })
         .await
@@ -829,11 +932,8 @@ impl LocalCacheTee for FsCacheTee {
             self.part_buf.extend_from_slice(&remaining[..take]);
             remaining = &remaining[take..];
             if self.part_buf.len() == self.part_size {
-                let payload = std::mem::replace(
-                    &mut self.part_buf,
-                    bytes::BytesMut::with_capacity(self.part_size),
-                )
-                .freeze();
+                let payload =
+                    std::mem::replace(&mut self.part_buf, bytes::BytesMut::new()).freeze();
                 self.dispatch_part(payload).await?;
                 if self.poisoned {
                     return Ok(());
@@ -909,7 +1009,8 @@ impl LocalCacheTee for FsCacheTee {
             return worker_result;
         }
 
-        // All temp files are on disk and fsynced. Now atomically rename in
+        // All temp files are on disk (not fsynced; the cache is best-effort
+        // and reconstructable from upstream). Atomically rename in
         // a single blocking task. Order matters: rename all parts before the
         // head, so that once read_head() returns Some(...) every part is
         // visible.

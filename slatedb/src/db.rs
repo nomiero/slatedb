@@ -3013,8 +3013,12 @@ mod tests {
             ("tmp/test_kv_store_with_put_cache_enabled/manifest/00000000000000000002.manifest", 0),
             // 1 part is cached because of wal_replay after fencing (which reads the SST, thereby caching it)
             ("tmp/test_kv_store_with_put_cache_enabled/wal/00000000000000000001.sst", 1),
-            // 1 part is cached because the put with cache_puts enabled should cache the test_key put
-            ("tmp/test_kv_store_with_put_cache_enabled/wal/00000000000000000002.sst", 1),
+            // Not cached: `cache_puts=true` only caches *compacted-SST* puts.
+            // WAL writes are excluded because WALs are crash-recovery only
+            // and never re-read on the hot path; caching them wastes disk.
+            // Nothing reads `wal/...0002.sst` back during this test, so it
+            // never gets read-side cached either.
+            ("tmp/test_kv_store_with_put_cache_enabled/wal/00000000000000000002.sst", 0),
         ];
 
         let (_cached_object_store, kv_store) = test_object_store_cache_helper(
