@@ -203,6 +203,7 @@ impl EncodedWalSsTableBuilder {
             &BlockMetaArgs {
                 offset: block.offset,
                 first_key: self.first_seq,
+                length: block.length,
             },
         );
         self.block_meta.push(block_meta);

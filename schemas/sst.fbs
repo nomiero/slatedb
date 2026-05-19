@@ -96,6 +96,13 @@ table BlockMeta {
 
     // First key contained in the block.
     first_key: [ubyte] (required);
+
+    // Encoded length of the block on disk, excluding any post-block padding.
+    // Blocks are padded to a 4 KiB-aligned slot so reads under O_DIRECT
+    // map 1:1 to a single aligned device IO. The reader uses
+    // `offset..offset+length` to slice exactly the block bytes,
+    // ignoring the trailing padding.
+    length: ulong;
 }
 
 table SsTableIndex {

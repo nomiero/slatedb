@@ -108,7 +108,8 @@ impl SsTableFormat {
             self.min_filter_keys,
             self.sst_codec.clone(),
             &self.filter_policies,
-        );
+        )
+        .with_block_align(self.block_align);
         if let Some(block_format) = self.block_format {
             builder = builder.with_block_format(block_format);
         }
@@ -134,6 +135,7 @@ pub(crate) struct EncodedSsTableBuilder<'a> {
     current_len: u64,
     blocks: VecDeque<EncodedSsTableBlock>,
     block_size: usize,
+    block_align: usize,
     block_format: BlockFormat,
     sst_format_version: u16,
     min_filter_keys: u32,
@@ -165,6 +167,7 @@ impl EncodedSsTableBuilder<'_> {
             sst_last_key: None,
             current_block_max_key: None,
             block_size,
+            block_align: 0,
             block_format: BlockFormat::Latest,
             builder: BlockBuilderWithStats::new(BlockBuilder::new_latest(block_size)),
             sst_format_version: SST_FORMAT_VERSION_LATEST,
@@ -176,6 +179,14 @@ impl EncodedSsTableBuilder<'_> {
             compression_codec: None,
             block_transformer: None,
         }
+    }
+
+    /// Pad every data block out so the next block starts at a multiple of
+    /// `align` bytes. Matches RocksDB's `block_align` semantics. 0 disables
+    /// padding (legacy behavior).
+    fn with_block_align(mut self, align: usize) -> Self {
+        self.block_align = align;
+        self
     }
 
     fn new_block_builder(&self) -> BlockBuilderWithStats {
@@ -284,7 +295,8 @@ impl EncodedSsTableBuilder<'_> {
         let new_builder = self.new_block_builder();
         let old_builder = std::mem::replace(&mut self.builder, new_builder);
         let (builder, block_stats) = old_builder.into_parts();
-        let mut block_builder = EncodedSsTableBlockBuilder::new(builder, self.current_len);
+        let mut block_builder = EncodedSsTableBlockBuilder::new(builder, self.current_len)
+            .with_block_align(self.block_align);
         if let Some(codec) = self.compression_codec {
             block_builder = block_builder.with_compression_codec(codec);
         }
@@ -297,6 +309,7 @@ impl EncodedSsTableBuilder<'_> {
             &BlockMetaArgs {
                 offset: block.offset,
                 first_key: self.first_key,
+                length: block.length,
             },
         );
         self.block_meta.push(block_meta);
@@ -955,7 +968,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(88, index.size());
+        // Index size grew by `block_meta_count * sizeof(u64)` after adding
+        // the new `length` field to `BlockMeta`. Two-block WAL SST -> +16
+        // for the field values, plus the flatbuffer vtable space -> 120.
+        assert_eq!(120, index.size());
     }
 
     #[tokio::test]

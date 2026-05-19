@@ -224,13 +224,17 @@ impl SsTableInfo {
 pub(crate) struct EncodedSsTableBlock {
     /// offset of the block within the SST
     pub(crate) offset: u64,
+    /// length of the block on disk, excluding any post-block padding
+    pub(crate) length: u64,
     /// uncompressed and untransformed block
     pub(crate) block: Block,
-    /// compressed and transformed block
+    /// compressed and transformed block, including any post-block padding
     pub(crate) encoded_bytes: Bytes,
 }
 
 impl EncodedSsTableBlock {
+    /// Total on-disk footprint for this block including post-block padding.
+    /// Use [`Self::length`] when slicing the actual block bytes for decode.
     pub(crate) fn len(&self) -> usize {
         self.encoded_bytes.len()
     }
@@ -246,6 +250,9 @@ pub(crate) struct EncodedSsTableBlockBuilder {
     compression_codec: Option<CompressionCodec>,
     /// transformer for transforming the data block (e.g. encryption)
     block_transformer: Option<Arc<dyn BlockTransformer>>,
+    /// pad the encoded block out to a multiple of this many bytes. 0 means
+    /// no padding. See `SsTableFormat::block_align`.
+    block_align: usize,
 }
 
 impl EncodedSsTableBlockBuilder {
@@ -255,6 +262,7 @@ impl EncodedSsTableBlockBuilder {
             offset,
             compression_codec: None,
             block_transformer: None,
+            block_align: 0,
         }
     }
 
@@ -270,6 +278,15 @@ impl EncodedSsTableBlockBuilder {
         self
     }
 
+    /// Pad the encoded block out so the next block starts at a multiple of
+    /// `align` bytes. Matches RocksDB's `block_align` semantics: padding is
+    /// appended after the block + checksum and is never read by the decoder.
+    /// 0 disables padding.
+    pub(crate) fn with_block_align(mut self, align: usize) -> Self {
+        self.block_align = align;
+        self
+    }
+
     pub(crate) async fn build(self) -> Result<EncodedSsTableBlock, SlateDBError> {
         let block = self.block_builder.build()?;
         let encoded_block = block.encode();
@@ -281,8 +298,26 @@ impl EncodedSsTableBlockBuilder {
             self.block_transformer.as_ref(),
         )
         .await?;
+        let length = compressed_and_transformed_block.len() as u64;
+        // Pad the slot so the next block starts at a multiple of
+        // `block_align`. The padding bytes sit after the checksum and are
+        // never sliced into the decode path - the reader uses `length`
+        // recorded in the index to stop before them.
+        if self.block_align > 0 {
+            let align = self.block_align as u64;
+            let slot_end = self.offset + length;
+            let aligned_end = slot_end.div_ceil(align) * align;
+            let pad = (aligned_end - slot_end) as usize;
+            if pad > 0 {
+                compressed_and_transformed_block.resize(
+                    compressed_and_transformed_block.len() + pad,
+                    0,
+                );
+            }
+        }
         Ok(EncodedSsTableBlock {
             offset: self.offset,
+            length,
             block,
             encoded_bytes: Bytes::from(compressed_and_transformed_block),
         })
@@ -608,7 +643,18 @@ pub(crate) struct SsTableFormat {
     pub(crate) compression_codec: Option<CompressionCodec>,
     pub(crate) block_transformer: Option<Arc<dyn BlockTransformer>>,
     pub(crate) block_format: Option<crate::sst_builder::BlockFormat>,
+    /// On-disk alignment for data blocks. Each block is zero-padded so the
+    /// next block starts at a multiple of this many bytes. Set to the device
+    /// page size (typically 4096) so reads under O_DIRECT map to a single
+    /// aligned device IO with no widening. Matches RocksDB's
+    /// `BlockBasedTableOptions::block_align`. Set to 0 to disable padding.
+    pub(crate) block_align: usize,
 }
+
+/// Default block-slot alignment for new SSTs. Matches the typical NVMe page
+/// size and the `O_DIRECT` minimum alignment on Linux. Picked to keep one
+/// data block read = one aligned device IO.
+pub(crate) const DEFAULT_BLOCK_ALIGN: usize = 4096;
 
 impl Default for SsTableFormat {
     fn default() -> Self {
@@ -620,6 +666,7 @@ impl Default for SsTableFormat {
             compression_codec: None,
             block_transformer: None,
             block_format: None,
+            block_align: DEFAULT_BLOCK_ALIGN,
         }
     }
 }
@@ -904,12 +951,22 @@ impl SsTableFormat {
         info: &SsTableInfo,
         index: &SsTableIndex,
     ) -> Range<u64> {
-        let mut end_offset = info.filter_offset;
-        if blocks.end < index.block_meta().len() {
-            let next_block_meta = index.block_meta().get(blocks.end);
-            end_offset = next_block_meta.offset();
-        }
         let start_offset = index.block_meta().get(blocks.start).offset();
+        // End at the last block's actual end (offset + length) rather than
+        // the next block's offset. With `block_align`, the next block's
+        // offset is past zero-padding that the decoder must not see, and
+        // for the trailing block there is no next-block offset to use.
+        // Falling back to `block_meta_length()` keeps the old behavior for
+        // legacy SSTs that wrote `length = 0`.
+        let last_block_meta = index.block_meta().get(blocks.end - 1);
+        let last_block_length = last_block_meta.length();
+        let end_offset = if last_block_length > 0 {
+            last_block_meta.offset() + last_block_length
+        } else if blocks.end < index.block_meta().len() {
+            index.block_meta().get(blocks.end).offset()
+        } else {
+            info.filter_offset
+        };
         start_offset..end_offset
     }
 
@@ -931,13 +988,28 @@ impl SsTableFormat {
         let bytes: Bytes = obj.read_range(range).await?;
         let mut decoded_blocks = VecDeque::new();
         let compression_codec = info.compression_codec;
+        let block_meta_count = index.block_meta().len();
         for block in blocks {
             let block_meta = index.block_meta().get(block);
             let block_bytes_start = usize::try_from(block_meta.offset() - start_range).expect(
                 "attempted to read byte data with size \
                 larger than 32 bits on a 32-bit system",
             );
-            let block_bytes = if block == index.block_meta().len() - 1 {
+            // Prefer the explicit `length` field (set by all writers since
+            // block-alignment landed). Fall back to the offset-delta
+            // scheme for legacy SSTs that stored `length = 0`. Both
+            // branches must stop before any post-block padding bytes so
+            // the checksum at the tail of the block is correctly located
+            // by the decoder.
+            let block_length = block_meta.length();
+            let block_bytes = if block_length > 0 {
+                let block_bytes_end = block_bytes_start
+                    + usize::try_from(block_length).expect(
+                        "attempted to read byte data with size \
+                        larger than 32 bits on a 32-bit system",
+                    );
+                bytes.slice(block_bytes_start..block_bytes_end)
+            } else if block == block_meta_count - 1 {
                 bytes.slice(block_bytes_start..)
             } else {
                 let next_block_meta = index.block_meta().get(block + 1);
