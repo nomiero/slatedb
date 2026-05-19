@@ -76,11 +76,29 @@ use crate::wal_replay::{WalReplayIterator, WalReplayOptions};
 use crate::{DbCacheManagerOps, DbMetadataOps, DbReadOps, DbWriteOps};
 use slatedb_common::clock::SystemClock;
 use slatedb_common::metrics::MetricsRecorderHelper;
-use slatedb_txn_obj::DirtyObject;
+use slatedb_txn_obj::{DirtyObject, TransactionalObject};
 
 use crate::db_status::{ClosedResultWriter, DbStatusManager};
 pub use builder::DbBuilder;
 pub use builder::DbReaderBuilder;
+
+/// Stats returned by [`Db::bulk_load_sorted_run`]. Useful for
+/// reporting / asserting on the size of the seeded data.
+#[derive(Debug, Clone, Copy)]
+pub struct BulkLoadStats {
+    /// Number of SSTs written into the new sorted run.
+    pub ssts_written: usize,
+    /// Total compressed-block bytes across all written SSTs.
+    pub bytes_written: u64,
+    /// Number of entries consumed from the input iterator.
+    pub entries_written: u64,
+    /// Maximum sequence number observed in the input. The manifest's
+    /// `last_l0_seq` is bumped to this value.
+    pub max_seq: u64,
+    /// Id of the sorted run inserted into the manifest. Always `0`
+    /// for now (the empty-DB precondition guarantees no collision).
+    pub sort_run_id: u32,
+}
 
 pub(crate) mod builder;
 
@@ -114,6 +132,9 @@ pub(crate) struct DbInner {
     pub(crate) txn_manager: Arc<TransactionManager>,
     pub(crate) snapshot_manager: Arc<SnapshotManager>,
     pub(crate) status_manager: DbStatusManager,
+    /// Manifest store handle, kept here so `Db::bulk_load_sorted_run`
+    /// can mutate the manifest directly without re-opening the store.
+    pub(crate) manifest_store: Arc<crate::manifest::store::ManifestStore>,
 }
 
 impl DbInner {
@@ -129,6 +150,7 @@ impl DbInner {
         fp_registry: Arc<FailPointRegistry>,
         merge_operator: Option<crate::merge_operator::MergeOperatorType>,
         status_manager: DbStatusManager,
+        manifest_store: Arc<crate::manifest::store::ManifestStore>,
     ) -> Result<Self, SlateDBError> {
         // both last_seq and last_committed_seq will be updated after WAL replay.
         let last_l0_seq = manifest.value.core.last_l0_seq;
@@ -200,6 +222,7 @@ impl DbInner {
             txn_manager,
             snapshot_manager,
             status_manager,
+            manifest_store,
         };
         Ok(db_inner)
     }
@@ -1698,6 +1721,188 @@ impl Db {
             .refresh_manifest()
             .await
             .map_err(Into::into)
+    }
+
+    /// Bulk-load a pre-sorted iterator of [`RowEntry`] into a brand-new
+    /// sorted run.
+    ///
+    /// This bypasses the normal write path (memtable → WAL → flush →
+    /// compact) and writes the entries straight to the object store as
+    /// one or more compacted SSTs, then publishes them as a single
+    /// sorted run via the manifest. Intended for testing / tooling
+    /// where you want to seed a database with a known size without
+    /// paying the cost of replaying writes through the foreground
+    /// pipeline.
+    ///
+    /// ## Preconditions
+    /// - The database **must be empty**: no L0 SSTs and no compacted
+    ///   sorted runs. Returns
+    ///   [`SlateDBError::BulkLoadDatabaseNotEmpty`] otherwise. This is
+    ///   intentional: it lets us skip every concurrency / merge-with-
+    ///   existing-tree concern that a general bulk-import API would
+    ///   need to handle.
+    /// - Entries must be in **strictly ascending key order**. Returns
+    ///   [`SlateDBError::BulkLoadKeysOutOfOrder`] otherwise.
+    ///
+    /// ## Side effects
+    /// - Writes one or more SSTs of up to `max_sst_size` bytes each.
+    /// - Mutates the manifest: inserts a single sorted run with id `0`
+    ///   into `compacted`, and bumps `last_l0_seq` to the maximum seq
+    ///   number observed in `entries`.
+    /// - Does **not** automatically refresh the in-memory state of
+    ///   this `Db` instance. After `bulk_load_sorted_run` returns,
+    ///   call [`Db::refresh_manifest`] (or close + reopen) before
+    ///   issuing reads.
+    ///
+    /// ## Caveats
+    /// - The WAL is not touched. Bulk-loaded data is durable as soon
+    ///   as the manifest commit succeeds, just like compaction output.
+    /// - On crash mid-ingest, written-but-not-yet-published SSTs
+    ///   become orphans and get reclaimed by the existing GC path
+    ///   after `min_age` expires.
+    pub async fn bulk_load_sorted_run<I>(
+        &self,
+        entries: I,
+        max_sst_size: usize,
+    ) -> Result<BulkLoadStats, crate::Error>
+    where
+        I: IntoIterator<Item = crate::types::RowEntry>,
+    {
+        use crate::db_state::{SortedRun, SsTableId, SsTableView};
+        use ulid::Ulid;
+
+        self.inner.check_closed()?;
+
+        // Empty-database precondition. Snapshot the state via the
+        // lock-free `ArcSwap::load` and inspect the tree shape.
+        {
+            let cow = self.inner.state.state();
+            let core = cow.core();
+            if !core.tree.l0.is_empty() || !core.tree.compacted.is_empty() {
+                return Err(crate::Error::from(
+                    crate::error::SlateDBError::BulkLoadDatabaseNotEmpty,
+                ));
+            }
+        }
+
+        let table_store = Arc::clone(&self.inner.table_store);
+        let mut output_handles: Vec<crate::db_state::SsTableHandle> = Vec::new();
+        let mut writer = table_store.table_writer(SsTableId::Compacted(Ulid::new()));
+        let mut bytes_in_current_sst: usize = 0;
+        let mut entries_in_current_sst: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut entries_written: u64 = 0;
+        let mut max_seq: u64 = 0;
+        let mut prev_key: Option<Bytes> = None;
+
+        for entry in entries {
+            // Strictly ascending key order. Equal keys are rejected
+            // because callers building deduplicated input never need
+            // them, and allowing equal keys would require defining a
+            // tie-breaking rule on (key, seq) which is more contract
+            // than this API wants to commit to.
+            if let Some(prev) = &prev_key {
+                if entry.key.as_ref() <= prev.as_ref() {
+                    return Err(crate::Error::from(
+                        crate::error::SlateDBError::BulkLoadKeysOutOfOrder,
+                    ));
+                }
+            }
+            prev_key = Some(entry.key.clone());
+            max_seq = max_seq.max(entry.seq);
+
+            if let Some(block_size) = writer.add(entry).await.map_err(crate::Error::from)? {
+                bytes_in_current_sst = bytes_in_current_sst.saturating_add(block_size);
+                total_bytes = total_bytes.saturating_add(block_size as u64);
+            }
+            entries_written += 1;
+            entries_in_current_sst += 1;
+
+            if bytes_in_current_sst > max_sst_size {
+                let handle = writer.close().await.map_err(crate::Error::from)?;
+                output_handles.push(handle);
+                bytes_in_current_sst = 0;
+                entries_in_current_sst = 0;
+                writer = table_store.table_writer(SsTableId::Compacted(Ulid::new()));
+            }
+        }
+
+        // Close the final writer iff it received any entries. The size
+        // gate above only counts *finished* blocks, so the writer can
+        // still hold buffered entries even when `bytes_in_current_sst`
+        // is zero. Use the entry count instead.
+        if entries_in_current_sst > 0 {
+            let handle = writer.close().await.map_err(crate::Error::from)?;
+            output_handles.push(handle);
+        }
+
+        if output_handles.is_empty() {
+            return Ok(BulkLoadStats {
+                ssts_written: 0,
+                bytes_written: 0,
+                entries_written: 0,
+                max_seq: 0,
+                sort_run_id: 0,
+            });
+        }
+
+        let sst_views: Vec<SsTableView> = output_handles
+            .into_iter()
+            .map(SsTableView::identity)
+            .collect();
+        let ssts_written = sst_views.len();
+        let sorted_run = SortedRun {
+            id: 0,
+            sst_views,
+        };
+
+        // Reload the latest manifest, mutate it, and persist. Using
+        // `maybe_apply_update` retries automatically on a manifest
+        // version conflict (e.g. if a parallel compactor wrote to the
+        // manifest in the meantime), though for the empty-DB case
+        // there's no compactor work to conflict with.
+        let mut stored = crate::manifest::store::StoredManifest::load(
+            Arc::clone(&self.inner.manifest_store),
+            Arc::clone(&self.inner.system_clock),
+        )
+        .await
+        .map_err(crate::Error::from)?;
+        let sorted_run_for_apply = sorted_run.clone();
+        stored
+            .maybe_apply_update(|sm| {
+                let core = &sm.object().core;
+                if !core.tree.l0.is_empty() || !core.tree.compacted.is_empty() {
+                    return Err(crate::error::SlateDBError::BulkLoadDatabaseNotEmpty);
+                }
+                let mut dirty = sm.prepare_dirty()?;
+                dirty.value.core.tree.compacted = vec![sorted_run_for_apply.clone()];
+                dirty.value.core.last_l0_seq =
+                    dirty.value.core.last_l0_seq.max(max_seq);
+                Ok(Some(dirty))
+            })
+            .await
+            .map_err(crate::Error::from)?;
+
+        // Advance the oracle's in-memory sequence numbers so reads
+        // performed against this Db instance after `bulk_load_sorted_run`
+        // returns can actually see the loaded entries (otherwise the
+        // MVCC snapshot is `last_committed_seq=0` and every loaded row
+        // looks "in the future"). The manifest writer keeps writer-
+        // side `last_l0_seq` on merge, so simply calling
+        // `refresh_manifest` is not enough to bump these.
+        if max_seq > 0 {
+            self.inner.oracle.advance_last_seq(max_seq);
+            self.inner.oracle.advance_committed_seq(max_seq);
+            self.inner.oracle.advance_durable_seq(max_seq);
+        }
+
+        Ok(BulkLoadStats {
+            ssts_written,
+            bytes_written: total_bytes,
+            entries_written,
+            max_seq,
+            sort_run_id: sorted_run.id,
+        })
     }
 
     /// Begin a new transaction with the specified isolation level.
@@ -8230,6 +8435,128 @@ mod tests {
             l0_count.is_some_and(|v| v > 0),
             "expected l0_sst_count > 0, got {:?}",
             l0_count
+        );
+        db.close().await.unwrap();
+    }
+
+    fn bulk_entry(key: &[u8], value: &[u8], seq: u64) -> RowEntry {
+        use crate::types::ValueDeletable;
+        RowEntry::new(
+            Bytes::copy_from_slice(key),
+            ValueDeletable::Value(Bytes::copy_from_slice(value)),
+            seq,
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_bulk_load_sorted_run_seeds_data_visible_after_refresh() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_bulk_load_basic";
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        let entries: Vec<RowEntry> = (0..1000u64)
+            .map(|i| {
+                let k = format!("key{:08}", i);
+                let v = format!("value{:08}", i);
+                bulk_entry(k.as_bytes(), v.as_bytes(), i + 1)
+            })
+            .collect();
+
+        let stats = db
+            .bulk_load_sorted_run(entries, 64 * 1024)
+            .await
+            .expect("bulk load");
+        assert!(stats.ssts_written >= 1);
+        assert_eq!(stats.entries_written, 1000);
+        assert_eq!(stats.max_seq, 1000);
+
+        // Before refresh the in-memory state is still empty.
+        assert_eq!(db.get(b"key00000042").await.unwrap(), None);
+
+        db.refresh_manifest().await.expect("refresh");
+
+        let manifest = db.manifest();
+        let compacted = manifest.compacted();
+        eprintln!(
+            "post-refresh manifest: id={}, compacted={} l0={} last_l0_seq={}",
+            manifest.id(),
+            compacted.len(),
+            manifest.l0().len(),
+            manifest.last_l0_seq(),
+        );
+        assert_eq!(compacted.len(), 1);
+        assert_eq!(compacted[0].id, 0);
+        assert!(!compacted[0].sst_views.is_empty());
+
+        let got = db.get(b"key00000042").await.unwrap();
+        assert_eq!(got, Some(Bytes::from_static(b"value00000042")));
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bulk_load_rejects_non_empty_database() {
+        use crate::config::{FlushOptions, FlushType};
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_bulk_load_not_empty";
+        let db = Db::builder(path, object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        // Write something through the regular put path first, then
+        // explicitly flush the memtable so it shows up in L0. (The
+        // default `flush()` flushes the WAL when WAL is enabled, but
+        // keeps the memtable in memory.)
+        db.put(b"existing", b"v").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        let entries = vec![bulk_entry(b"k", b"v", 1)];
+        let err = db
+            .bulk_load_sorted_run(entries, 64 * 1024)
+            .await
+            .expect_err("should reject");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("bulk load requires an empty database"),
+            "unexpected error: {msg}"
+        );
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bulk_load_rejects_unsorted_input() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_bulk_load_unsorted";
+        let db = Db::builder(path, object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        let entries = vec![
+            bulk_entry(b"b", b"v", 1),
+            bulk_entry(b"a", b"v", 2),
+        ];
+        let err = db
+            .bulk_load_sorted_run(entries, 64 * 1024)
+            .await
+            .expect_err("should reject");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("strictly ascending key order"),
+            "unexpected error: {msg}"
         );
         db.close().await.unwrap();
     }
