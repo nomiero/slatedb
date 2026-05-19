@@ -257,16 +257,14 @@ impl DbInner {
         &self,
         entries: Vec<RowEntry>,
     ) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
-        let guard = self.state.read();
-        let memtable = guard.memtable();
+        let memtable = self.state.memtable();
         entries.into_iter().for_each(|entry| memtable.put(entry));
         memtable.table().durable_watcher()
     }
 
     fn record_memtable_sequence(&self, seq: u64) {
         let ts = self.system_clock.now();
-        let guard = self.state.read();
-        guard.memtable().record_sequence(seq, ts);
+        self.state.memtable().record_sequence(seq, ts);
     }
 }
 

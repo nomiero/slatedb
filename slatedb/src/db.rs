@@ -39,7 +39,6 @@ use crate::garbage_collector::GC_TASK_NAME;
 use crate::transaction_manager::IsolationLevel;
 use crate::CloseReason;
 use log::{info, trace, warn};
-use parking_lot::RwLock;
 use std::time::Duration;
 
 use crate::batch::WriteBatch;
@@ -86,7 +85,7 @@ pub use builder::DbReaderBuilder;
 pub(crate) mod builder;
 
 pub(crate) struct DbInner {
-    pub(crate) state: Arc<RwLock<DbState>>,
+    pub(crate) state: Arc<DbState>,
     pub(crate) settings: Settings,
     pub(crate) table_store: Arc<TableStore>,
     pub(crate) memtable_flusher: Arc<MemtableFlusher>,
@@ -146,8 +145,7 @@ impl DbInner {
         ));
 
         // state are mostly manifest, including IMM, L0, etc.
-        let db_state = DbState::new(manifest);
-        let state = Arc::new(RwLock::new(db_state));
+        let state = Arc::new(DbState::new(manifest));
 
         let db_stats = DbStats::new(&recorder);
         let wal_enabled = DbInner::wal_enabled_in_options(&settings);
@@ -166,7 +164,7 @@ impl DbInner {
             merge_operator.clone(),
         );
 
-        let recent_flushed_wal_id = state.read().state().core().replay_after_wal_id;
+        let recent_flushed_wal_id = state.state().core().replay_after_wal_id;
         let wal_buffer = Arc::new(WalBufferManager::new(
             state.clone(),
             status_manager.clone(),
@@ -224,7 +222,7 @@ impl DbInner {
         options: &ReadOptions,
     ) -> Result<Option<KeyValue>, SlateDBError> {
         self.check_closed()?;
-        let db_state = self.state.read().view();
+        let db_state = self.state.view();
         self.reader
             .get_key_value_with_options(key, options, &db_state, None, None)
             .await
@@ -236,7 +234,7 @@ impl DbInner {
         options: &ScanOptions,
     ) -> Result<DbIterator, SlateDBError> {
         self.check_closed()?;
-        let db_state = self.state.read().view();
+        let db_state = self.state.view();
         self.reader
             .scan_with_options(
                 range,
@@ -259,7 +257,7 @@ impl DbInner {
     ) -> Result<DbIterator, SlateDBError> {
         self.check_closed()?;
         let range = BytesRange::from_prefix(prefix.as_ref());
-        let db_state = self.state.read().view();
+        let db_state = self.state.view();
         self.reader
             .scan_with_options(
                 range,
@@ -281,7 +279,7 @@ impl DbInner {
         options: &ScanOptions,
     ) -> Result<RecencyPrefixIterator, SlateDBError> {
         self.check_closed()?;
-        let db_state = self.state.read().view();
+        let db_state = self.state.view();
         self.reader
             .scan_prefix_by_recency(prefix, options, &db_state, None, None)
             .await
@@ -314,9 +312,8 @@ impl DbInner {
                     manifest.refresh().await?;
                     let remote_dirty = manifest.prepare_dirty()?;
                     let dirty_manifest = {
-                        let mut state = self.state.write();
-                        state.merge_remote_manifest(remote_dirty);
-                        state.state().manifest.clone()
+                        self.state.merge_remote_manifest(remote_dirty);
+                        self.state.state().manifest.clone()
                     };
                     self.status_manager.report_manifest(dirty_manifest.into());
                     empty_wal_id += 1;
@@ -417,7 +414,7 @@ impl DbInner {
             let (wal_size_bytes, imm_memtable_size_bytes) = {
                 let wal_size_bytes = self.wal_buffer.estimated_bytes()?;
                 let imm_memtable_size_bytes = {
-                    let guard = self.state.read();
+                    let guard = self.state.state();
                     // Exclude active memtable to avoid a write lock.
                     guard
                         .state()
@@ -458,7 +455,7 @@ impl DbInner {
                 );
 
                 let maybe_oldest_unflushed_memtable = {
-                    let guard = self.state.read();
+                    let guard = self.state.state();
                     guard.state().imm_memtable.back().cloned()
                 };
 
@@ -594,7 +591,7 @@ impl DbInner {
             min_seq: None,
         };
 
-        let db_state = self.state.read().state().core().clone();
+        let db_state = self.state.state().core().clone();
         let mut replay_iter =
             WalReplayIterator::new(&db_state, replay_options, Arc::clone(&self.table_store))
                 .await?;
@@ -622,7 +619,7 @@ impl DbInner {
         cached_obj_store: &CachedObjectStore,
         path_resolver: &PathResolver,
     ) -> Result<(), SlateDBError> {
-        let state = self.state.read().state();
+        let state = self.state.state();
         let cache_opts = &self.settings.object_store_cache_options;
         crate::utils::preload_cache_from_manifest(
             &state.manifest.value.core,
@@ -658,7 +655,7 @@ impl DbInner {
     }
 
     pub(crate) fn manifest(&self) -> VersionedManifest {
-        self.state.read().state().manifest.clone().into()
+        self.state.state().manifest.clone().into()
     }
 }
 
@@ -2118,7 +2115,7 @@ mod tests {
         db.put(b"test_key", b"test_value").await.unwrap();
 
         let manifest = db.manifest();
-        let expected: VersionedManifest = db.inner.state.read().state().manifest.clone().into();
+        let expected: VersionedManifest = db.inner.state.state().manifest.clone().into();
         assert_eq!(manifest, expected);
 
         db.close().await.unwrap();
@@ -2164,7 +2161,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), async move {
             loop {
                 {
-                    let state = db_poll.inner.state.read();
+                    let state = db_poll.inner.state.state();
                     if !state.state().core().tree.compacted.is_empty() {
                         return;
                     }
@@ -2763,8 +2760,8 @@ mod tests {
             if db
                 .inner
                 .state
-                .write()
                 .memtable()
+                .table()
                 .metadata()
                 .entries_size_in_bytes
                 > (SsTableFormat::default().block_size * 3)
@@ -2780,7 +2777,7 @@ mod tests {
         );
         db.flush().await.unwrap();
 
-        let state = db.inner.state.read().view();
+        let state = db.inner.state.view();
         assert_eq!(1, state.state.manifest.value.core.tree.l0.len());
         let view = state.state.manifest.value.core.tree.l0.front().unwrap();
         let index = db
@@ -3731,7 +3728,7 @@ mod tests {
 
         // Verify no memtable was frozen or L0 flush happened.
         {
-            let guard = kv_store.inner.state.read();
+            let guard = kv_store.inner.state.state();
             assert!(guard.state().imm_memtable.is_empty());
             assert_eq!(guard.state().core().tree.l0.len(), 0);
         }
@@ -3770,7 +3767,7 @@ mod tests {
 
         // Verify no more memtables were frozen or L0 flush happened.
         {
-            let guard = kv_store.inner.state.read();
+            let guard = kv_store.inner.state.state();
             assert_eq!(guard.state().core().tree.l0.len(), 1);
         }
 
@@ -4049,7 +4046,6 @@ mod tests {
         let live_tracker = kv_store
             .inner
             .state
-            .read()
             .state()
             .core()
             .sequence_tracker
@@ -4080,7 +4076,6 @@ mod tests {
         let reopened_tracker = reopened
             .inner
             .state
-            .read()
             .state()
             .core()
             .sequence_tracker
@@ -4195,13 +4190,13 @@ mod tests {
         flush_handle.await.unwrap().unwrap();
 
         {
-            let guard = db.inner.state.read();
+            let guard = db.inner.state.state();
             // The background flush should have drained the single immutable memtable we created.
             assert!(guard.state().imm_memtable.is_empty());
         }
 
         let manifest_state = {
-            let guard = db.inner.state.read();
+            let guard = db.inner.state.state();
             guard.state().manifest.value.core.clone()
         };
         let last_l0_seq = manifest_state.last_l0_seq;
@@ -4554,7 +4549,7 @@ mod tests {
 
         db.flush().await.unwrap();
 
-        let db_state = db.inner.state.read().view();
+        let db_state = db.inner.state.view();
         assert_eq!(db_state.state.imm_memtable.len(), 1);
     }
 
@@ -4588,14 +4583,11 @@ mod tests {
             .unwrap();
 
         let memtable = {
-            let lock = kv_store.inner.state.read();
-            lock.memtable()
-                .put(RowEntry::new_value(b"abc1111", b"value1111", 1));
-            lock.memtable()
-                .put(RowEntry::new_value(b"abc2222", b"value2222", 2));
-            lock.memtable()
-                .put(RowEntry::new_value(b"abc3333", b"value3333", 3));
-            lock.memtable().table().clone()
+            let memtable = kv_store.inner.state.memtable();
+            memtable.put(RowEntry::new_value(b"abc1111", b"value1111", 1));
+            memtable.put(RowEntry::new_value(b"abc2222", b"value2222", 2));
+            memtable.put(RowEntry::new_value(b"abc3333", b"value3333", 3));
+            memtable.table().clone()
         };
 
         let mut iter = memtable.iter();
@@ -4775,9 +4767,8 @@ mod tests {
             .await
             .unwrap();
 
-        let state = db_restored.inner.state.read();
-        let memtable = state.memtable();
-        let mut iter = memtable.table().iter();
+        let state = db_restored.inner.state.state();
+        let mut iter = state.memtable.table().iter();
         assert_iterator(
             &mut iter,
             vec![
@@ -4830,7 +4821,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), async move {
             loop {
                 {
-                    let db_state = db_poll.inner.state.read();
+                    let db_state = db_poll.inner.state.state();
                     if !db_state.state().core().tree.compacted.is_empty() {
                         return;
                     }
@@ -4863,9 +4854,8 @@ mod tests {
         let val = db.get(b"key1").await.unwrap();
         assert_eq!(val, Some(Bytes::from_static(b"value1")));
 
-        let state = db.inner.state.read();
-        let memtable = state.memtable();
-        assert_eq!(memtable.table().last_seq(), Some(1));
+        let state = db.inner.state.state();
+        assert_eq!(state.memtable.table().last_seq(), Some(1));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5163,7 +5153,7 @@ mod tests {
         next_wal_id += 1;
 
         // verify that we reload imm
-        let db_state = reader.inner.state.read().view();
+        let db_state = reader.inner.state.view();
         assert_eq!(db_state.state.imm_memtable.len(), 2);
 
         // one empty wal and two wals for the puts
@@ -5252,7 +5242,7 @@ mod tests {
             .await
             .unwrap();
 
-        let db_state = db.inner.state.read().view();
+        let db_state = db.inner.state.view();
 
         // resume write-compacted-sst-io-error since we got a snapshot and
         // want to let the test finish.
@@ -5537,7 +5527,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        assert_eq!(db.inner.state.read().state().core().next_wal_sst_id, 2);
+        assert_eq!(db.inner.state.state().core().next_wal_sst_id, 2);
         db.put(b"1", b"1").await.unwrap();
         // assert that second open writes another empty wal.
         let db = Db::builder(path, object_store.clone())
@@ -5545,7 +5535,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        assert_eq!(db.inner.state.read().state().core().next_wal_sst_id, 4);
+        assert_eq!(db.inner.state.state().core().next_wal_sst_id, 4);
     }
 
     #[tokio::test]
@@ -5585,7 +5575,7 @@ mod tests {
         assert_eq!(err.to_string(), "Closed error: detected newer DB client");
 
         do_put(&db2, b"2", b"2").await.unwrap();
-        assert_eq!(db2.inner.state.read().state().core().next_wal_sst_id, 5);
+        assert_eq!(db2.inner.state.state().core().next_wal_sst_id, 5);
     }
 
     #[tokio::test]
@@ -6158,7 +6148,7 @@ mod tests {
 
         // Initial state: recent_snapshot_min_seq should be 0
         {
-            let state = db.inner.state.read();
+            let state = db.inner.state.state();
             assert_eq!(state.state().core().recent_snapshot_min_seq, 0);
         }
 
@@ -6167,7 +6157,7 @@ mod tests {
         db.inner.flush_memtables(FlushTarget::All).await.unwrap();
 
         {
-            let state = db.inner.state.read();
+            let state = db.inner.state.state();
             let recent_min_seq = state.state().core().recent_snapshot_min_seq;
             // After flush, recent_snapshot_min_seq should be updated (no active snapshots)
             assert!(
@@ -6190,7 +6180,7 @@ mod tests {
         assert_eq!(min_active_seq.unwrap(), snapshot_seq);
 
         {
-            let state = db.inner.state.read();
+            let state = db.inner.state.state();
             let recent_min_seq = state.state().core().recent_snapshot_min_seq;
             assert_eq!(
                 recent_min_seq,
@@ -6208,7 +6198,7 @@ mod tests {
 
         // Now recent_snapshot_min_seq should be updated to higher value (no active snapshots)
         {
-            let state = db.inner.state.read();
+            let state = db.inner.state.state();
             let recent_min_seq = state.state().core().recent_snapshot_min_seq;
             let last_l0_seq = state.state().core().last_l0_seq;
 
@@ -6228,7 +6218,7 @@ mod tests {
         let db = Db::builder(path, object_store).build().await.unwrap();
 
         {
-            let state = db.inner.state.read();
+            let state = db.inner.state.state();
             assert_eq!(state.state().core().recent_snapshot_min_seq, 0);
         }
 
@@ -6251,7 +6241,7 @@ mod tests {
         assert_eq!(min_active_seq, Some(txn_seq));
 
         {
-            let state = db.inner.state.read();
+            let state = db.inner.state.state();
             let recent_min_seq = state.state().core().recent_snapshot_min_seq;
             assert_eq!(
                 recent_min_seq, txn_seq,
@@ -6268,7 +6258,7 @@ mod tests {
             .unwrap();
 
         {
-            let state = db.inner.state.read();
+            let state = db.inner.state.state();
             let recent_min_seq = state.state().core().recent_snapshot_min_seq;
             let last_l0_seq = state.state().core().last_l0_seq;
             assert_eq!(
@@ -6317,7 +6307,7 @@ mod tests {
             .unwrap();
 
         {
-            let state = db.inner.state.read();
+            let state = db.inner.state.state();
             let recent_min_seq = state.state().core().recent_snapshot_min_seq;
             assert_eq!(
                 recent_min_seq,
@@ -6338,7 +6328,7 @@ mod tests {
         assert_eq!(db.inner.txn_manager.min_active_seq(), Some(txn_seq));
 
         {
-            let state = db.inner.state.read();
+            let state = db.inner.state.state();
             let recent_min_seq = state.state().core().recent_snapshot_min_seq;
             assert_eq!(
                 recent_min_seq,
@@ -6387,7 +6377,7 @@ mod tests {
             .unwrap();
 
         {
-            let state = db.inner.state.read();
+            let state = db.inner.state.state();
             let recent_min_seq = state.state().core().recent_snapshot_min_seq;
             assert_eq!(
                 recent_min_seq,
@@ -6411,7 +6401,7 @@ mod tests {
         );
 
         {
-            let state = db.inner.state.read();
+            let state = db.inner.state.state();
             let recent_min_seq = state.state().core().recent_snapshot_min_seq;
             assert_eq!(
                 recent_min_seq,
@@ -7176,7 +7166,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let (last_l0_seq, has_immutable_memtable) = {
-                    let guard = db.inner.state.read();
+                    let guard = db.inner.state.state();
                     (
                         guard.state().core().last_l0_seq,
                         !guard.state().imm_memtable.is_empty(),
@@ -7623,7 +7613,7 @@ mod tests {
             loop {
                 should_compact.store(true, Ordering::SeqCst);
                 {
-                    let state = db.inner.state.read();
+                    let state = db.inner.state.state();
                     info!(
                         "l0: {:?}",
                         state
@@ -7776,7 +7766,7 @@ mod tests {
             loop {
                 should_compact.store(true, Ordering::SeqCst);
                 {
-                    let state = db.inner.state.read();
+                    let state = db.inner.state.state();
                     info!(
                         "l0: {:?}",
                         state

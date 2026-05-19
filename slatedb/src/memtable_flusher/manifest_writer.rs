@@ -363,8 +363,8 @@ impl ManifestWriterHandler {
     fn take_next_ready_batch(&mut self) -> Option<Vec<UploadedMemtable>> {
         let durable_seq = self.db_status_rx.borrow().durable_seq;
         let imm_memtables: Vec<_> = {
-            let guard = self.db.state.read();
-            guard.state().imm_memtable.iter().rev().cloned().collect()
+            let cow = self.db.state.state();
+            cow.imm_memtable.iter().rev().cloned().collect()
         };
         let mut batch = Vec::new();
 
@@ -464,19 +464,21 @@ impl ManifestWriterHandler {
         .into_iter()
         .flatten()
         .min();
-        let mut guard = self.db.state.write();
-        let manifest = guard.modify(|modifier| {
+        // When a batch of memtables finishes uploading, this function
+        // takes the writer-side mutex via `state.modify` to install
+        // the new L0 SSTs into the manifest. Held while iterating
+        // `staged_batch` and rebuilding the COWDbState; readers do
+        // not block on this (lock-free `ArcSwap` load), but other
+        // writers do.
+        let manifest = self.db.state.modify(|cow| {
             for uploaded in staged_batch {
                 let uploaded_tracker = uploaded.imm_memtable.sequence_tracker();
-                let popped = modifier
-                    .state
+                let popped = cow
                     .imm_memtable
                     .pop_back()
                     .expect("expected imm memtable");
                 assert!(Arc::ptr_eq(&popped, &uploaded.imm_memtable));
-                modifier
-                    .state
-                    .manifest
+                cow.manifest
                     .value
                     .core
                     .tree
@@ -485,40 +487,43 @@ impl ManifestWriterHandler {
                         self.db.rand.rng().gen_ulid(self.db.system_clock.as_ref()),
                         uploaded.sst_handle.clone(),
                     ));
-                modifier.state.manifest.value.core.replay_after_wal_id =
+                cow.manifest.value.core.replay_after_wal_id =
                     uploaded.imm_memtable.recent_flushed_wal_id();
 
                 let memtable_tick = uploaded.imm_memtable.table().last_tick();
-                modifier.state.manifest.value.core.last_l0_clock_tick = cmp::max(
-                    modifier.state.manifest.value.core.last_l0_clock_tick,
+                cow.manifest.value.core.last_l0_clock_tick = cmp::max(
+                    cow.manifest.value.core.last_l0_clock_tick,
                     memtable_tick,
                 );
-                if modifier.state.manifest.value.core.last_l0_clock_tick != memtable_tick {
+                if cow.manifest.value.core.last_l0_clock_tick != memtable_tick {
                     return Err(SlateDBError::InvalidClockTick {
-                        last_tick: modifier.state.manifest.value.core.last_l0_clock_tick,
+                        last_tick: cow.manifest.value.core.last_l0_clock_tick,
                         next_tick: memtable_tick,
                     });
                 }
 
                 // The same sequence number can't span multiple L0' SSTs--only SSTs in SRs
                 // can do that. So assert `>` rather than `>=`.
-                assert!(uploaded.last_seq > modifier.state.manifest.value.core.last_l0_seq);
-                modifier.state.manifest.value.core.last_l0_seq = uploaded.last_seq;
-                modifier.state.manifest.value.core.recent_snapshot_min_seq =
+                assert!(uploaded.last_seq > cow.manifest.value.core.last_l0_seq);
+                cow.manifest.value.core.last_l0_seq = uploaded.last_seq;
+                cow.manifest.value.core.recent_snapshot_min_seq =
                     min_active_snapshot_seq.unwrap_or(uploaded.last_seq);
 
-                modifier
-                    .state
-                    .manifest
-                    .value
-                    .core
-                    .sequence_tracker
-                    .extend_from(uploaded_tracker);
+                // Use `Arc::make_mut` to clone-on-write the tracker
+                // only when there are other holders. After the swap
+                // in `apply_uploaded_state`, the only references
+                // come from outstanding `manifest.clone()` snapshots
+                // taken on a previous tick; under steady-state load
+                // those snapshots are short-lived, so this is
+                // effectively an in-place mutation most of the time.
+                let tracker = std::sync::Arc::make_mut(
+                    &mut cow.manifest.value.core.sequence_tracker,
+                );
+                tracker.extend_from(uploaded_tracker);
             }
-            Ok(modifier.state.manifest.clone())
+            Ok(cow.manifest.clone())
         })?;
 
-        drop(guard);
         self.db.status_manager.report_manifest(manifest.into());
         Ok(())
     }
@@ -575,11 +580,7 @@ impl ManifestWriterHandler {
     fn clone_local_manifest_for_write(
         &self,
     ) -> slatedb_txn_obj::DirtyObject<crate::manifest::Manifest> {
-        let dirty = {
-            let rguard_state = self.db.state.read();
-            rguard_state.state().manifest.clone()
-        };
-        dirty
+        self.db.state.state().manifest.clone()
     }
 
     async fn load_manifest(&mut self) -> Result<(), SlateDBError> {
@@ -607,16 +608,17 @@ impl ManifestWriterHandler {
         &self,
         remote_dirty: slatedb_txn_obj::DirtyObject<crate::manifest::Manifest>,
     ) {
-        let dirty_manifest = {
-            let mut wguard_state = self.db.state.write();
-            wguard_state.merge_remote_manifest(remote_dirty);
-            let cow = wguard_state.state();
-            self.db
-                .db_stats
-                .l0_sst_count
-                .set(cow.core().tree.l0.len() as i64);
-            cow.manifest.clone()
-        };
+        // Apply the remote manifest via the writer-side `modify`
+        // path; readers don't block on this (lock-free `ArcSwap` load)
+        // but other writers do.
+        self.db.state.merge_remote_manifest(remote_dirty);
+
+        let cow = self.db.state.state();
+        self.db
+            .db_stats
+            .l0_sst_count
+            .set(cow.core().tree.l0.len() as i64);
+        let dirty_manifest = cow.manifest.clone();
         self.db
             .status_manager
             .report_manifest(dirty_manifest.into());
@@ -1025,10 +1027,12 @@ mod tests {
         value: &[u8],
     ) -> Arc<crate::mem_table::ImmutableMemtable> {
         let seq = inner.oracle.next_seq();
-        let mut guard = inner.state.write();
-        guard.memtable().put(RowEntry::new_value(key, value, seq));
-        guard.freeze_memtable(0);
-        guard.state().imm_memtable.front().cloned().unwrap()
+        inner
+            .state
+            .memtable()
+            .put(RowEntry::new_value(key, value, seq));
+        inner.state.freeze_memtable(0);
+        inner.state.state().imm_memtable.front().cloned().unwrap()
     }
 
     /// Build an uploaded memtable without advancing the WAL durable sequence.

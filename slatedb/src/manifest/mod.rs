@@ -359,7 +359,17 @@ pub(crate) struct ManifestCore {
 
     /// A sequence tracker that maps sequence numbers to timestamps as defined in
     /// RFC-0012.
-    pub sequence_tracker: SequenceTracker,
+    ///
+    /// Wrapped in `Arc` so manifest clones (which happen under
+    /// `state.write()` on every memtable freeze and every remote-
+    /// manifest merge) are O(1) instead of `O(tracker_len)`.
+    /// `Vec`-backed deep clones of a tracker that grows monotonically
+    /// over the database's lifetime were measured at 2-10 ms per
+    /// merge and dominated the lock-held time in
+    /// `merge_remote_manifest`. With `Arc`, the same path is a
+    /// pointer bump; mutation sites use `Arc::make_mut` to
+    /// copy-on-write.
+    pub sequence_tracker: Arc<SequenceTracker>,
 
     /// A list of checkpoints that are currently open.
     pub checkpoints: Vec<Checkpoint>,
@@ -382,7 +392,7 @@ impl ManifestCore {
             checkpoints: vec![],
             wal_object_store_uri: None,
             recent_snapshot_min_seq: 0,
-            sequence_tracker: SequenceTracker::new(),
+            sequence_tracker: Arc::new(SequenceTracker::new()),
         }
     }
 

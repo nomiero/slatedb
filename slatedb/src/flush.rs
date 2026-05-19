@@ -58,7 +58,7 @@ impl DbInner {
         &self,
         imm_table: Arc<KVTable>,
     ) -> Result<RetentionIterator<Box<dyn RowEntryIterator>>, SlateDBError> {
-        let state = self.state.read().view();
+        let state = self.state.view();
 
         // Compute retention boundary using the minimum active sequences from active snapshots AND
         // active transactions AND durable watermark. This does not need to be atomic as even if a
@@ -98,7 +98,9 @@ impl DbInner {
             false,
             imm_table.last_tick(),
             self.system_clock.clone(),
-            Arc::new(state.core().sequence_tracker.clone()),
+            // sequence_tracker is Arc<SequenceTracker>; .clone() is
+            // a cheap Arc::clone, no deep copy.
+            state.core().sequence_tracker.clone(),
         )
         .await?;
         iter.init().await?;

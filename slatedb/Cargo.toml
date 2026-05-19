@@ -9,6 +9,7 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
+arc-swap = "1"
 async-channel = { workspace = true }
 async-trait = { workspace = true }
 atomic = { workspace = true }
@@ -45,7 +46,7 @@ parking_lot = { workspace = true }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }
 scc = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true }
 siphasher = { workspace = true }
 slatedb-common = { workspace = true, features = ["serde"] }
