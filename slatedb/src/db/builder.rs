@@ -178,6 +178,7 @@ pub struct DbBuilder<P: Into<Path>> {
     db_cache: Option<Arc<dyn DbCache>>,
     system_clock: Option<Arc<dyn SystemClock>>,
     gc_runtime: Option<Handle>,
+    memtable_flusher_runtime: Option<Handle>,
     compactor_builder: Option<CompactorBuilder<Path>>,
     gc_builder: Option<GarbageCollectorBuilder<Path>>,
     fp_registry: Arc<FailPointRegistry>,
@@ -200,6 +201,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             db_cache: default_db_cache(),
             system_clock: None,
             gc_runtime: None,
+            memtable_flusher_runtime: None,
             compactor_builder: None,
             gc_builder: None,
             fp_registry: Arc::new(FailPointRegistry::new()),
@@ -259,6 +261,19 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// Sets the garbage collection runtime to use for the database.
     pub fn with_gc_runtime(mut self, gc_runtime: Handle) -> Self {
         self.gc_runtime = Some(gc_runtime);
+        self
+    }
+
+    /// Sets a dedicated runtime for the memtable flusher (uploader,
+    /// manifest writer, and flush tracker). Building an SST from a
+    /// frozen memtable is CPU-heavy (encoding entries, computing bloom
+    /// hashes, building the index); running it on the foreground
+    /// runtime can starve user-facing reads and writes during flush
+    /// events. Pass a small dedicated runtime here to isolate that
+    /// work, mirroring the existing `with_runtime` for the compactor.
+    /// Defaults to `Handle::current()` when not set.
+    pub fn with_memtable_flusher_runtime(mut self, runtime: Handle) -> Self {
+        self.memtable_flusher_runtime = Some(runtime);
         self
     }
 
@@ -699,10 +714,17 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Start the memtable flusher before WAL replay so that
         // replayed immutable memtables can be flushed concurrently.
+        // Optionally on a dedicated runtime so the SST-build CPU burst
+        // doesn't compete with user-facing reads/writes on the
+        // foreground runtime.
+        let memtable_flusher_handle = self
+            .memtable_flusher_runtime
+            .as_ref()
+            .unwrap_or(&tokio_handle);
         memtable_flusher.start(
             inner.clone(),
             manifest,
-            &tokio_handle,
+            memtable_flusher_handle,
             &task_executor,
             &inner.status_manager,
         )?;

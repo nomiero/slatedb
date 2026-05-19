@@ -124,11 +124,26 @@ impl DbInner {
     #[instrument(level = "trace", skip_all, fields(batch_size = batch.ops.len()))]
     async fn write_batch(&self, batch: WriteBatch, options: &WriteOptions) -> WriteBatchResult {
         let _options = options;
+        // Slow-path tracing inside the writer task. Each phase below is
+        // wrapped in a discrete timer; if it exceeds the threshold we
+        // emit a `warn!` so a tail-latency outlier can be attributed to
+        // a specific phase rather than reading "writer task slow".
+        const SLOW_WRITE_BATCH_PHASE_THRESHOLD: std::time::Duration =
+            std::time::Duration::from_millis(50);
+        #[allow(clippy::disallowed_methods)]
+        let phase_start = tokio::time::Instant::now();
         #[cfg(not(dst))]
         let now = self.mono_clock.now().await?;
         #[cfg(dst)]
         // Force the current timestamp for DST operations. See #719 for details.
         let now = options.now;
+        let mono_clock_elapsed = phase_start.elapsed();
+        if mono_clock_elapsed > SLOW_WRITE_BATCH_PHASE_THRESHOLD {
+            warn!(
+                "slow write_batch phase: mono_clock.now took {:?}",
+                mono_clock_elapsed
+            );
+        }
         let commit_seq = self.oracle.next_seq();
 
         // Check for transaction conflicts before proceeding with the write batch
@@ -141,6 +156,8 @@ impl DbInner {
 
         // Count batch-local merge folding on the flush path so DB-side merge
         // resolution uses one metric for both write batches and memtable flushes.
+        #[allow(clippy::disallowed_methods)]
+        let phase_start = tokio::time::Instant::now();
         let entries = batch
             .extract_entries(
                 commit_seq,
@@ -149,7 +166,16 @@ impl DbInner {
                 self.flush_merge_operator.clone(),
             )
             .await?;
+        let extract_elapsed = phase_start.elapsed();
+        if extract_elapsed > SLOW_WRITE_BATCH_PHASE_THRESHOLD {
+            warn!(
+                "slow write_batch phase: extract_entries took {:?}",
+                extract_elapsed
+            );
+        }
 
+        #[allow(clippy::disallowed_methods)]
+        let phase_start = tokio::time::Instant::now();
         let durable_watcher = if self.wal_enabled {
             // WAL entries must be appended to the wal buffer atomically. Otherwise,
             // the WAL buffer might flush the entries in the middle of the batch, which
@@ -166,6 +192,13 @@ impl DbInner {
             // if WAL is disabled, we just write the entries to memtable.
             self.write_entries_to_memtable(entries)
         };
+        let write_path_elapsed = phase_start.elapsed();
+        if write_path_elapsed > SLOW_WRITE_BATCH_PHASE_THRESHOLD {
+            warn!(
+                "slow write_batch phase: wal_append + memtable_write took {:?} (wal_enabled={})",
+                write_path_elapsed, self.wal_enabled
+            );
+        }
 
         // update the last_applied_seq to wal buffer. if a chunk of WAL entries are applied to the memtable
         // and flushed to the remote storage, WAL buffer manager will recycle these WAL entries.
@@ -203,7 +236,16 @@ impl DbInner {
         self.record_memtable_sequence(commit_seq);
 
         // maybe freeze the memtable.
+        #[allow(clippy::disallowed_methods)]
+        let phase_start = tokio::time::Instant::now();
         self.maybe_freeze_current_memtable()?;
+        let freeze_elapsed = phase_start.elapsed();
+        if freeze_elapsed > SLOW_WRITE_BATCH_PHASE_THRESHOLD {
+            warn!(
+                "slow write_batch phase: maybe_freeze_current_memtable took {:?}",
+                freeze_elapsed
+            );
+        }
 
         let write_handle = WriteHandle::new(commit_seq, now);
 

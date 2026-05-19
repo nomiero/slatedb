@@ -272,14 +272,10 @@ impl TableStore {
                         .insert((*id, offset).into(), CachedEntry::with_block(block))
                         .await;
                 }
-                cache
-                    .insert(
-                        (*id, encoded_sst.info.index_offset).into(),
-                        CachedEntry::with_sst_index(Arc::new(encoded_sst.index)),
-                    )
-                    .await;
             }
         }
+        self.cache_index(*id, encoded_sst.info.index_offset, encoded_sst.index)
+            .await;
         self.cache_filters(*id, encoded_sst.info.filter_offset, encoded_sst.filters)
             .await;
         Ok(SsTableHandle::new(
@@ -298,6 +294,22 @@ impl TableStore {
                 .insert((sst, id).into(), CachedEntry::with_filters(filters))
                 .await;
         }
+    }
+
+    // Inserts the SST index into the meta cache. Done unconditionally (even
+    // for `write_sst(write_cache=false)` and for the streaming `close()`
+    // path) so that by the time the manifest reflects the new SST, readers
+    // can answer scans without an object-store round trip for the index.
+    async fn cache_index(&self, sst: SsTableId, offset: u64, index: SsTableIndexOwned) {
+        let Some(ref cache) = self.cache else {
+            return;
+        };
+        cache
+            .insert(
+                (sst, offset).into(),
+                CachedEntry::with_sst_index(Arc::new(index)),
+            )
+            .await;
     }
 
     /// Decodes an `EncodedCachedFilter` slice into a fully-decoded
@@ -882,6 +894,14 @@ impl EncodedSsTableWriter<'_> {
             }
         }
 
+        // Pre-warm the meta cache before returning the handle. Compaction
+        // and L0 flush both call into the manifest writer with this handle,
+        // and the manifest update should not become visible to readers
+        // until filter+index are in memory and the SST bytes are durable
+        // upstream (which the prior `shutdown().await?` ensures).
+        self.table_store
+            .cache_index(self.id, encoded_sst.info.index_offset, encoded_sst.index)
+            .await;
         self.table_store
             .cache_filters(self.id, encoded_sst.info.filter_offset, encoded_sst.filters)
             .await;
@@ -1477,6 +1497,20 @@ mod tests {
             assert!(cached_block.is_some());
             assert!(block == *cached_block.unwrap().block().unwrap());
         }
+
+        // Index and filter must be present in the meta cache after
+        // write_sst returns. This is the invariant the manifest writer
+        // relies on for "manifest commit implies meta cache warm".
+        assert!(wrapper
+            .get_index(&(id, sst_info.index_offset).into())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(wrapper
+            .get_filter(&(id, sst_info.filter_offset).into())
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -1516,6 +1550,68 @@ mod tests {
                 .unwrap();
             assert!(cached_block.is_none());
         }
+    }
+
+    // Verifies the manifest-commit invariant for the streaming compaction
+    // writer: by the time `close()` returns the handle, the SST's index and
+    // filter are already in the meta cache. Without this, the first reader
+    // to touch a freshly-compacted SST pays an object-store round trip,
+    // which is what produces the deep read-throughput dips at compaction
+    // boundaries.
+    #[tokio::test]
+    async fn test_table_writer_close_warms_meta_cache() {
+        let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let meta_cache = Arc::new(TestCache::new());
+        let split_cache = Arc::new(
+            SplitCache::new()
+                .with_meta_cache(Some(meta_cache.clone()))
+                .build(),
+        );
+        let wrapper = Arc::new(DbCacheWrapper::new(
+            split_cache,
+            &recorder,
+            Arc::new(DefaultSystemClock::default()),
+        ));
+        let format = SsTableFormat {
+            block_size: 32,
+            min_filter_keys: 1,
+            ..SsTableFormat::default()
+        };
+        let ts = Arc::new(TableStore::new(
+            ObjectStores::new(os, None),
+            format,
+            Path::from(ROOT),
+            Some(wrapper.clone()),
+        ));
+
+        let id = SsTableId::Compacted(ulid::Ulid::new());
+        let mut writer = ts.table_writer(id);
+        for i in 0..32u8 {
+            writer
+                .add(RowEntry::new_value(&[i; 16], &[1u8; 16], 0))
+                .await
+                .unwrap();
+        }
+        let handle = writer.close().await.unwrap();
+
+        assert!(handle.info.filter_len > 0, "expected SST to carry filters");
+        assert!(
+            wrapper
+                .get_index(&(id, handle.info.index_offset).into())
+                .await
+                .unwrap()
+                .is_some(),
+            "index must be in meta cache after close()",
+        );
+        assert!(
+            wrapper
+                .get_filter(&(id, handle.info.filter_offset).into())
+                .await
+                .unwrap()
+                .is_some(),
+            "filter must be in meta cache after close()",
+        );
     }
 
     #[allow(dead_code)]
