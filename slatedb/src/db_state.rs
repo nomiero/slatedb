@@ -61,8 +61,28 @@ impl AsRef<SsTableHandle> for SsTableHandle {
 
 /// A projected view of an SSTable, combining the physical SST handle with an
 /// optional visible_range projection.
+///
+/// Cheap to clone: the payload lives behind an `Arc`, so `clone` is a single
+/// refcount bump rather than a deep copy of the handle and range `Bytes`.
+/// Field access goes through `Deref` to [`SsTableViewInner`].
 #[derive(Clone, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct SsTableView {
+    inner: Arc<SsTableViewInner>,
+}
+
+impl std::ops::Deref for SsTableView {
+    type Target = SsTableViewInner;
+
+    fn deref(&self) -> &SsTableViewInner {
+        &self.inner
+    }
+}
+
+/// Payload of an [`SsTableView`]. Held behind an `Arc` and never mutated after
+/// construction; all access is through `SsTableView`'s `Deref`.
+#[derive(PartialEq, Serialize)]
+pub struct SsTableViewInner {
     /// Unique identifier for this view.
     pub id: Ulid,
 
@@ -113,10 +133,12 @@ impl SsTableView {
         };
 
         SsTableView {
-            id,
-            sst,
-            visible_range: None,
-            effective_range,
+            inner: Arc::new(SsTableViewInner {
+                id,
+                sst,
+                visible_range: None,
+                effective_range,
+            }),
         }
     }
 
@@ -148,10 +170,12 @@ impl SsTableView {
                 .expect("An intersection of visible and physical range must be non-empty.")
         }
         SsTableView {
-            id,
-            sst,
-            visible_range,
-            effective_range,
+            inner: Arc::new(SsTableViewInner {
+                id,
+                sst,
+                visible_range,
+                effective_range,
+            }),
         }
     }
 
@@ -715,10 +739,8 @@ impl DbState {
 
     pub(crate) fn freeze_memtable(&self, recent_flushed_wal_id: u64) {
         self.modify(|cow| {
-            let old_memtable = std::mem::replace(
-                &mut cow.memtable,
-                Arc::new(WritableKVTable::new()),
-            );
+            let old_memtable =
+                std::mem::replace(&mut cow.memtable, Arc::new(WritableKVTable::new()));
             cow.imm_memtable
                 .push_front(Arc::new(ImmutableMemtable::from_arc(
                     old_memtable.table().clone(),
@@ -761,10 +783,7 @@ impl Debug for DbState {
 /// Extracted so it can be invoked from outside `DbState::merge_remote_manifest`
 /// when a caller already holds the COWDbState reference (e.g. tests
 /// that drove `StateModifier::merge_remote_manifest` directly).
-fn apply_merge_remote_manifest(
-    cow: &mut COWDbState,
-    mut remote_manifest: DirtyObject<Manifest>,
-) {
+fn apply_merge_remote_manifest(cow: &mut COWDbState, mut remote_manifest: DirtyObject<Manifest>) {
     let my_db_state = cow.core();
     let remote = &remote_manifest.value.core;
     let tree = my_db_state.tree.merge_from_compactor(&remote.tree);
@@ -1071,8 +1090,7 @@ mod tests {
             let view: SsTableView = SsTableView::identity(handle);
             db_state.modify(|modifier| {
                 modifier.manifest.value.core.tree.l0.push_front(view);
-                modifier.manifest.value.core.replay_after_wal_id =
-                    imm.recent_flushed_wal_id();
+                modifier.manifest.value.core.replay_after_wal_id = imm.recent_flushed_wal_id();
             });
         }
     }

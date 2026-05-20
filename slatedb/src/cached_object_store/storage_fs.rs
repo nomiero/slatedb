@@ -651,9 +651,7 @@ impl LocalCacheEntry for FsCacheEntry {
                 let req_len = range_in_part.len();
                 let aligned_off = (req_off / O_DIRECT_ALIGN as u64) * O_DIRECT_ALIGN as u64;
                 let head_pad = (req_off - aligned_off) as usize;
-                let aligned_len = (head_pad + req_len)
-                    .div_ceil(O_DIRECT_ALIGN)
-                    * O_DIRECT_ALIGN;
+                let aligned_len = (head_pad + req_len).div_ceil(O_DIRECT_ALIGN) * O_DIRECT_ALIGN;
                 let mut aligned = AlignedBuf::new(aligned_len).map_err(wrap_io_err)?;
                 read_exact_at_offset(
                     file.file(),
@@ -913,9 +911,7 @@ impl FsCacheTee {
         }
     }
 
-    async fn run_worker(
-        mut rx: tokio::sync::mpsc::Receiver<TeeMsg>,
-    ) -> object_store::Result<()> {
+    async fn run_worker(mut rx: tokio::sync::mpsc::Receiver<TeeMsg>) -> object_store::Result<()> {
         while let Some(msg) = rx.recv().await {
             match msg {
                 TeeMsg::Write { tmp_path, bytes } => {
@@ -990,11 +986,7 @@ impl FsCacheTee {
             p.push("_head");
             p
         };
-        let tmp_name = format!(
-            "_head{}{}",
-            TEE_TMP_INFIX,
-            self.make_rand_suffix()
-        );
+        let tmp_name = format!("_head{}{}", TEE_TMP_INFIX, self.make_rand_suffix());
         let mut tmp = final_path.clone();
         tmp.set_file_name(tmp_name);
         (final_path, tmp)
@@ -1091,8 +1083,7 @@ impl LocalCacheTee for FsCacheTee {
     ) -> object_store::Result<()> {
         // Flush the tail.
         if !self.poisoned && !self.part_buf.is_empty() {
-            let payload =
-                std::mem::replace(&mut self.part_buf, bytes::BytesMut::new()).freeze();
+            let payload = std::mem::replace(&mut self.part_buf, bytes::BytesMut::new()).freeze();
             self.dispatch_part(payload).await?;
         }
 
@@ -1160,22 +1151,24 @@ impl LocalCacheTee for FsCacheTee {
         let file_handle_cache = self.file_handle_cache.clone();
 
         #[allow(clippy::disallowed_methods)]
-        let rename_result = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<(std::path::PathBuf, u64)>> {
-            // Reorder so the head rename is last.
-            let mut parts: Vec<(std::path::PathBuf, std::path::PathBuf)> = pending;
-            // The head was pushed at head_idx; move it to the end.
-            if head_idx < parts.len() {
-                let head_pair = parts.remove(head_idx);
-                parts.push(head_pair);
-            }
-            let mut renamed = Vec::with_capacity(parts.len());
-            for (tmp, final_) in parts {
-                std::fs::rename(&tmp, &final_)?;
-                let size = std::fs::metadata(&final_).map(|m| m.len()).unwrap_or(0);
-                renamed.push((final_, size));
-            }
-            Ok(renamed)
-        })
+        let rename_result = tokio::task::spawn_blocking(
+            move || -> std::io::Result<Vec<(std::path::PathBuf, u64)>> {
+                // Reorder so the head rename is last.
+                let mut parts: Vec<(std::path::PathBuf, std::path::PathBuf)> = pending;
+                // The head was pushed at head_idx; move it to the end.
+                if head_idx < parts.len() {
+                    let head_pair = parts.remove(head_idx);
+                    parts.push(head_pair);
+                }
+                let mut renamed = Vec::with_capacity(parts.len());
+                for (tmp, final_) in parts {
+                    std::fs::rename(&tmp, &final_)?;
+                    let size = std::fs::metadata(&final_).map(|m| m.len()).unwrap_or(0);
+                    renamed.push((final_, size));
+                }
+                Ok(renamed)
+            },
+        )
         .await
         .map_err(wrap_io_err)?
         .map_err(wrap_io_err);
@@ -1489,7 +1482,10 @@ impl FsCacheEvictorInner {
         #[allow(clippy::disallowed_methods)]
         let paths = tokio::task::spawn_blocking(move || {
             let mut keep = Vec::new();
-            for entry in WalkDir::new(&root_folder).into_iter().filter_map(|e| e.ok()) {
+            for entry in WalkDir::new(&root_folder)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -1877,7 +1873,7 @@ mod tests {
             1024 * 2,
             Arc::new(CachedObjectStoreStats::new(&recorder)),
             Arc::new(DbRand::default()),
-            FileHandleCache::new(1000),
+            FileHandleCache::new(1000, false),
         );
 
         let path0 = gen_rand_file(temp_dir.path(), "file0", 1024);
@@ -1920,7 +1916,7 @@ mod tests {
             Arc::new(CachedObjectStoreStats::new(&recorder)),
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
-            FileHandleCache::new(1000),
+            FileHandleCache::new(1000, false),
         );
 
         // Simulate started state without a running receiver so the channel can fill.
@@ -1951,7 +1947,7 @@ mod tests {
             1024 * 2,
             Arc::new(CachedObjectStoreStats::new(&recorder)),
             Arc::new(DbRand::default()),
-            FileHandleCache::new(1000),
+            FileHandleCache::new(1000, false),
         ));
 
         let path0 = gen_rand_file(temp_dir.path(), "file0", 1024);
@@ -1983,7 +1979,7 @@ mod tests {
             1024 * 2,
             Arc::new(CachedObjectStoreStats::new(&recorder)),
             Arc::new(DbRand::default()),
-            FileHandleCache::new(1000),
+            FileHandleCache::new(1000, false),
         ));
 
         gen_rand_file(temp_dir.path(), "file0", 1024);
@@ -2034,7 +2030,7 @@ mod tests {
             1024,
             Arc::new(CachedObjectStoreStats::new(&recorder)),
             Arc::new(DbRand::default()),
-            FileHandleCache::new(1000),
+            FileHandleCache::new(1000, false),
         );
 
         let keys: Vec<std::path::PathBuf> = key_indices
@@ -2082,7 +2078,7 @@ mod tests {
             1024 * 2,
             Arc::new(CachedObjectStoreStats::new(&helper)),
             Arc::new(DbRand::default()),
-            FileHandleCache::new(1000),
+            FileHandleCache::new(1000, false),
         );
 
         // when: add two entries (within capacity)
@@ -2177,7 +2173,14 @@ mod tests {
         // track_entry_accessed events through a bounded mpsc channel; we
         // poll for the accounting to reflect the writes instead of using a
         // fixed sleep, which is flaky under parallel test load.
-        let inner = storage.evictor.as_ref().unwrap().inner.get().unwrap().clone();
+        let inner = storage
+            .evictor
+            .as_ref()
+            .unwrap()
+            .inner
+            .get()
+            .unwrap()
+            .clone();
         let mut cache_size_before = 0u64;
         for _ in 0..50 {
             cache_size_before = inner.cache_size_bytes.load(Ordering::SeqCst);
@@ -2340,7 +2343,7 @@ mod tests {
             1024 * 1024,
             Arc::new(CachedObjectStoreStats::new(&recorder)),
             Arc::new(DbRand::default()),
-            FileHandleCache::new(1000),
+            FileHandleCache::new(1000, false),
         ));
 
         inner.scan_entries(false).await;
@@ -2370,9 +2373,6 @@ mod tests {
         storage.start_evictor().await;
 
         // Removing a never-cached location must be a clean no-op.
-        storage
-            .remove(&Path::from("never/seen.sst"))
-            .await
-            .unwrap();
+        storage.remove(&Path::from("never/seen.sst")).await.unwrap();
     }
 }

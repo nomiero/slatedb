@@ -47,7 +47,9 @@ const RUN_OPS_PER_TASK: u64 = 5_000;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
-    let mode = std::env::args().nth(1).unwrap_or_else(|| "tuned".to_string());
+    let mode = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "tuned".to_string());
 
     let tmp_root = std::env::temp_dir().join(format!("slatedb_cache_bench_{}", mode));
     let upstream_dir = tmp_root.join("upstream");
@@ -60,9 +62,8 @@ async fn main() {
     // the cache and upstream on the same local disk, no per-request delay
     // means the cache adds pure overhead with no win to offset it. 5ms is
     // a generous lower bound for S3 round-trip on the same region.
-    let raw: Arc<dyn ObjectStore> = Arc::new(
-        LocalFileSystem::new_with_prefix(&upstream_dir).expect("create local upstream"),
-    );
+    let raw: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(&upstream_dir).expect("create local upstream"));
     let upstream: Arc<dyn ObjectStore> = Arc::new(SlowObjectStore {
         inner: raw,
         delay: std::time::Duration::from_millis(20),
@@ -100,6 +101,8 @@ async fn main() {
                 scan_interval: None,
                 max_open_file_handles: 4096,
                 prewarm_cache_on_compaction: true,
+                use_io_uring: false,
+                direct_io: false,
             };
         }
         other => {
@@ -119,7 +122,9 @@ async fn main() {
             .max_cache_size_bytes
             .map(|b| format!("on@{}MB", b / (1024 * 1024)))
             .unwrap_or_else(|| "OFF".to_string()),
-        settings.object_store_cache_options.prewarm_cache_on_compaction,
+        settings
+            .object_store_cache_options
+            .prewarm_cache_on_compaction,
         settings
             .object_store_cache_options
             .preload_disk_cache_on_startup,
@@ -159,7 +164,10 @@ async fn main() {
 
     // Warmup: write the full key set with concurrent non-durable puts so we
     // saturate the WAL pipeline instead of one-shot blocking on each put.
-    println!("warmup: writing {} keys ({} concurrent)", KEY_COUNT, WARMUP_CONCURRENCY);
+    println!(
+        "warmup: writing {} keys ({} concurrent)",
+        KEY_COUNT, WARMUP_CONCURRENCY
+    );
     let warmup_start = Instant::now();
     let chunks_per_task = KEY_COUNT.div_ceil(WARMUP_CONCURRENCY as u64) as usize;
     let mut warmup_handles = Vec::with_capacity(WARMUP_CONCURRENCY);
@@ -436,11 +444,7 @@ impl ObjectStore for SlowObjectStore {
         self.inner.get_opts(location, opts).await
     }
 
-    async fn get_range(
-        &self,
-        location: &Path,
-        range: Range<u64>,
-    ) -> object_store::Result<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> object_store::Result<Bytes> {
         tokio::time::sleep(self.delay).await;
         self.inner.get_range(location, range).await
     }
