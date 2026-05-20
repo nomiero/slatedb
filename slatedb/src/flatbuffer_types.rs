@@ -96,13 +96,32 @@ impl SsTableIndexOwned {
     }
 }
 
-impl RangePartitionedKeySpace for SsTableIndex<'_> {
+/// A [`RangePartitionedKeySpace`] view over an SST index that resolves the
+/// `block_meta` flatbuffer vector once, up front.
+///
+/// A binary search over the index does `~log2(blocks)` probes. Calling
+/// `SsTableIndex::block_meta` per probe re-walks the index table's vtable
+/// every time, so the resolution is hoisted into the constructor and each
+/// probe indexes the already-resolved vector directly.
+pub(crate) struct SsTableIndexKeySpace<'a> {
+    block_meta: flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<BlockMeta<'a>>>,
+}
+
+impl<'a> SsTableIndexKeySpace<'a> {
+    pub(crate) fn new(index: &SsTableIndex<'a>) -> Self {
+        Self {
+            block_meta: index.block_meta(),
+        }
+    }
+}
+
+impl RangePartitionedKeySpace for SsTableIndexKeySpace<'_> {
     fn partitions(&self) -> usize {
-        self.block_meta().len()
+        self.block_meta.len()
     }
 
     fn partition_first_key(&self, partition: usize) -> &[u8] {
-        self.block_meta().get(partition).first_key().bytes()
+        self.block_meta.get(partition).first_key().bytes()
     }
 }
 

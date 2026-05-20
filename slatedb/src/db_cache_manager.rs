@@ -8,7 +8,7 @@ use tokio::sync::OnceCell;
 use crate::bytes_range::BytesRange;
 use crate::db_state::{SsTableHandle, SsTableId, SsTableView};
 use crate::error::SlateDBError;
-use crate::flatbuffer_types::SsTableIndexOwned;
+use crate::flatbuffer_types::{SsTableIndexKeySpace, SsTableIndexOwned};
 use crate::manifest::VersionedManifest;
 use crate::partitioned_keyspace::partitions_covering_range;
 use crate::tablestore::TableStore;
@@ -154,9 +154,10 @@ async fn warm_data(
     }
 
     let index = ensure_index(table_store, handle, index_cell).await?;
+    let key_space = SsTableIndexKeySpace::new(&index.borrow());
     for r in &intersections {
         let block_range = partitions_covering_range(
-            &index.borrow(),
+            &key_space,
             r.start_bound().map(|b| b.as_ref()),
             r.end_bound().map(|b| b.as_ref()),
         );
@@ -272,9 +273,12 @@ mod tests {
             .read_index(&handle, false)
             .await
             .expect("read_index");
-        let block_idx =
-            partitions_covering_range(&index.borrow(), Bound::Included(key), Bound::Included(key))
-                .start;
+        let block_idx = partitions_covering_range(
+            &SsTableIndexKeySpace::new(&index.borrow()),
+            Bound::Included(key),
+            Bound::Included(key),
+        )
+        .start;
         let offset = index.borrow().block_meta().get(block_idx).offset();
         let cache = table_store.cache().expect("cache configured").clone();
         let cache_key: CachedKey = (sst_id, offset).into();
