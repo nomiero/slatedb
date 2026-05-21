@@ -348,18 +348,11 @@ fn parse_cpu_range(spec: &str) -> Option<(usize, usize)> {
     Some((n, n))
 }
 
-/// Restrict the calling thread to the CPUs named by `SLATEDB_URING_CPUS`,
-/// if that env var is set. The value is an inclusive range `start-end`
-/// or a single core index; the io_uring worker then floats across that
-/// CPU set under the kernel scheduler. Unset leaves affinity untouched.
-fn pin_uring_thread() {
-    let Ok(spec) = std::env::var("SLATEDB_URING_CPUS") else {
-        return;
-    };
-    let Some((start, end)) = parse_cpu_range(&spec) else {
-        warn!("ignoring malformed SLATEDB_URING_CPUS={:?}", spec);
-        return;
-    };
+/// Restrict the calling thread to the inclusive CPU range `cpus` via
+/// `sched_setaffinity`. The io_uring worker then floats across that CPU
+/// set under the kernel scheduler.
+fn set_uring_affinity(cpus: (usize, usize)) {
+    let (start, end) = cpus;
     // SAFETY: `set` is zeroed before use; `sched_setaffinity` with pid 0
     // targets the calling thread.
     unsafe {
@@ -379,17 +372,48 @@ fn pin_uring_thread() {
     }
 }
 
+/// Read an inclusive CPU range from env var `var`. Returns `None` if
+/// unset; logs and returns `None` if set but malformed.
+fn cpu_range_from_env(var: &str) -> Option<(usize, usize)> {
+    let spec = std::env::var(var).ok()?;
+    match parse_cpu_range(&spec) {
+        Some(range) => Some(range),
+        None => {
+            warn!("ignoring malformed {}={:?}", var, spec);
+            None
+        }
+    }
+}
+
+/// Read a positive worker count from env var `var`, defaulting to 1.
+fn worker_count_from_env(var: &str) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1)
+}
+
 impl WorkerHandle {
-    fn spawn(direct_io: bool, worker_idx: usize) -> std::io::Result<Self> {
+    /// Spawn a worker thread. `kind` is `"r"` or `"w"` and only feeds the
+    /// thread name; `cpus`, when set, pins the thread to that CPU range.
+    fn spawn(
+        direct_io: bool,
+        kind: &'static str,
+        worker_idx: usize,
+        cpus: Option<(usize, usize)>,
+    ) -> std::io::Result<Self> {
         let (tx, rx) = crossbeam_channel::unbounded::<WorkerOp>();
         let join = std::thread::Builder::new()
-            .name(format!("slatedb-uring-{}", worker_idx))
+            .name(format!("slatedb-uring-{}{}", kind, worker_idx))
             .spawn(move || {
-                pin_uring_thread();
+                if let Some(cpus) = cpus {
+                    set_uring_affinity(cpus);
+                }
                 if let Err(e) = run_worker(rx, direct_io, worker_idx) {
                     warn!(
-                        "slatedb-uring worker {} exited with error: {:?}",
-                        worker_idx, e
+                        "slatedb-uring worker {}{} exited with error: {:?}",
+                        kind, worker_idx, e
                     );
                 }
             })?;
@@ -1182,19 +1206,24 @@ fn is_handle_valid(file: &File) -> bool {
 // Public types implementing the LocalCacheStorage / Entry / Tee traits.
 // -----------------------------------------------------------------------------
 
-/// io_uring-backed `LocalCacheStorage`. Owns a fixed-size pool of
-/// dedicated I/O worker threads (each owning its own `IoUring` + fd
-/// cache + pending map). Operations are sharded across workers by
-/// hashing the location path: every operation for a given SST always
+/// io_uring-backed `LocalCacheStorage`. Owns two fixed-size pools of
+/// dedicated I/O worker threads - a read pool and a write pool - each
+/// worker owning its own `IoUring` + fd cache + pending map. Splitting
+/// reads from writes keeps foreground read SQEs from queueing behind
+/// background write SQEs in the same submission ring, and lets the two
+/// classes pin to different CPUs. Within a pool, operations are sharded
+/// by hashing the location path: every operation for a given SST always
 /// lands on the same worker so its fd cache stays consistent and
 /// per-file ordering (e.g. tee chunk submission) is preserved without
-/// cross-worker locking. Pool size from `SLATEDB_URING_WORKERS`
-/// (default 1).
+/// cross-worker locking. Pool sizes from `SLATEDB_URING_READ_WORKERS` /
+/// `SLATEDB_URING_WRITE_WORKERS` (default 1 each); CPU affinity from
+/// `SLATEDB_URING_READ_CPUS` / `SLATEDB_URING_WRITE_CPUS`.
 #[derive(Debug)]
 pub(crate) struct IoUringCacheStorage {
     root_folder: std::path::PathBuf,
     direct_io: bool,
-    workers: Vec<Arc<WorkerHandle>>,
+    read_workers: Vec<Arc<WorkerHandle>>,
+    write_workers: Vec<Arc<WorkerHandle>>,
     /// Monotonically increasing tee id, used to namespace temp filenames.
     tee_seq: AtomicU64,
 }
@@ -1203,10 +1232,11 @@ impl std::fmt::Display for IoUringCacheStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "IoUringCacheStorage(root={}, direct_io={}, workers={})",
+            "IoUringCacheStorage(root={}, direct_io={}, read_workers={}, write_workers={})",
             self.root_folder.display(),
             self.direct_io,
-            self.workers.len(),
+            self.read_workers.len(),
+            self.write_workers.len(),
         )
     }
 }
@@ -1218,41 +1248,58 @@ impl IoUringCacheStorage {
         root_folder: std::path::PathBuf,
         direct_io: bool,
     ) -> std::io::Result<Self> {
-        let n = std::env::var("SLATEDB_URING_WORKERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(1);
-        let mut workers = Vec::with_capacity(n);
-        for i in 0..n {
-            workers.push(Arc::new(WorkerHandle::spawn(direct_io, i)?));
+        let read_cpus = cpu_range_from_env("SLATEDB_URING_READ_CPUS");
+        let write_cpus = cpu_range_from_env("SLATEDB_URING_WRITE_CPUS");
+        let n_read = worker_count_from_env("SLATEDB_URING_READ_WORKERS");
+        let n_write = worker_count_from_env("SLATEDB_URING_WRITE_WORKERS");
+        let mut read_workers = Vec::with_capacity(n_read);
+        for i in 0..n_read {
+            read_workers.push(Arc::new(WorkerHandle::spawn(direct_io, "r", i, read_cpus)?));
+        }
+        let mut write_workers = Vec::with_capacity(n_write);
+        for i in 0..n_write {
+            write_workers.push(Arc::new(WorkerHandle::spawn(direct_io, "w", i, write_cpus)?));
         }
         info!(
-            "using io_uring cache storage [root={}, direct_io={}, workers={}]",
+            "using io_uring cache storage [root={}, direct_io={}, \
+             read_workers={}, write_workers={}]",
             root_folder.display(),
             direct_io,
-            n
+            n_read,
+            n_write
         );
         Ok(Self {
             root_folder,
             direct_io,
-            workers,
+            read_workers,
+            write_workers,
             tee_seq: AtomicU64::new(0),
         })
     }
 
-    /// Pick the worker that owns `location`. Same location always maps
-    /// to the same worker for the lifetime of the storage so the fd
-    /// cache stays consistent and per-file ordering is preserved.
-    fn worker_for_location(&self, location: &Path) -> Arc<WorkerHandle> {
-        if self.workers.len() == 1 {
-            return self.workers[0].clone();
+    /// Pick the worker that owns `location` within `workers`. Same
+    /// location always maps to the same worker for the lifetime of the
+    /// storage so the fd cache stays consistent and per-file ordering is
+    /// preserved.
+    fn worker_in(workers: &[Arc<WorkerHandle>], location: &Path) -> Arc<WorkerHandle> {
+        if workers.len() == 1 {
+            return workers[0].clone();
         }
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         location.to_string().hash(&mut h);
-        let idx = (h.finish() as usize) % self.workers.len();
-        self.workers[idx].clone()
+        let idx = (h.finish() as usize) % workers.len();
+        workers[idx].clone()
+    }
+
+    /// Read worker owning `location` (serves `Read` and fd-cache ops).
+    fn read_worker(&self, location: &Path) -> Arc<WorkerHandle> {
+        Self::worker_in(&self.read_workers, location)
+    }
+
+    /// Write worker owning `location` (serves `AtomicWrite` / `RemoveDir`).
+    fn write_worker(&self, location: &Path) -> Arc<WorkerHandle> {
+        Self::worker_in(&self.write_workers, location)
     }
 }
 
@@ -1261,7 +1308,8 @@ impl LocalCacheStorage for IoUringCacheStorage {
     fn entry(&self, location: &Path, part_size: usize) -> Box<dyn LocalCacheEntry> {
         Box::new(IoUringCacheEntry {
             root_folder: self.root_folder.clone(),
-            worker: self.worker_for_location(location),
+            read_worker: self.read_worker(location),
+            write_worker: self.write_worker(location),
             location: location.clone(),
             part_size,
         })
@@ -1277,7 +1325,7 @@ impl LocalCacheStorage for IoUringCacheStorage {
 
     async fn remove(&self, location: &Path) -> object_store::Result<()> {
         let dir = self.root_folder.join(location.to_string());
-        let worker = self.worker_for_location(location);
+        let worker = self.write_worker(location);
         let (sender, recv) = oneshot::channel();
         worker
             .tx
@@ -1291,7 +1339,8 @@ impl LocalCacheStorage for IoUringCacheStorage {
         let tee_id = self.tee_seq.fetch_add(1, Ordering::Relaxed);
         Some(Box::new(IoUringCacheTee {
             root_folder: self.root_folder.clone(),
-            worker: self.worker_for_location(location),
+            read_worker: self.read_worker(location),
+            write_worker: self.write_worker(location),
             location: location.clone(),
             part_size,
             tee_id,
@@ -1309,7 +1358,8 @@ struct IoUringCacheEntry {
     root_folder: std::path::PathBuf,
     location: Path,
     part_size: usize,
-    worker: Arc<WorkerHandle>,
+    read_worker: Arc<WorkerHandle>,
+    write_worker: Arc<WorkerHandle>,
 }
 
 impl IoUringCacheEntry {
@@ -1335,7 +1385,7 @@ impl LocalCacheEntry for IoUringCacheEntry {
         );
         let tmp_path = final_path.with_extension(format!("_tmp{}", self.make_rand_suffix()));
         let (sender, recv) = oneshot::channel();
-        self.worker
+        self.write_worker
             .tx
             .send(WorkerOp::AtomicWrite {
                 tmp_path,
@@ -1348,8 +1398,11 @@ impl LocalCacheEntry for IoUringCacheEntry {
             .await
             .map_err(|e| wrap_io_err(std::io::Error::other(format!("oneshot recv: {e}"))))?;
         // Invalidate any cached fd at final_path so the next read sees the
-        // new inode.
-        let _ = self.worker.tx.send(WorkerOp::InvalidateFd { path: final_path });
+        // new inode. The fd cache lives on the read worker.
+        let _ = self
+            .read_worker
+            .tx
+            .send(WorkerOp::InvalidateFd { path: final_path });
         result
     }
 
@@ -1368,7 +1421,7 @@ impl LocalCacheEntry for IoUringCacheEntry {
         let offset = range_in_part.start as u64;
         let (sender, recv) = oneshot::channel();
         if self
-            .worker
+            .read_worker
             .tx
             .send(WorkerOp::Read {
                 path,
@@ -1437,7 +1490,7 @@ impl LocalCacheEntry for IoUringCacheEntry {
         let buf: Bytes = serde_json::to_vec(&head_struct).map_err(wrap_io_err)?.into();
         let tmp_path = head_path.with_extension(format!("_tmp{}", self.make_rand_suffix()));
         let (sender, recv) = oneshot::channel();
-        self.worker
+        self.write_worker
             .tx
             .send(WorkerOp::AtomicWrite {
                 tmp_path,
@@ -1449,7 +1502,10 @@ impl LocalCacheEntry for IoUringCacheEntry {
         let result = recv
             .await
             .map_err(|e| wrap_io_err(std::io::Error::other(format!("oneshot recv: {e}"))))?;
-        let _ = self.worker.tx.send(WorkerOp::InvalidateFd { path: head_path });
+        let _ = self
+            .read_worker
+            .tx
+            .send(WorkerOp::InvalidateFd { path: head_path });
         result
     }
 
@@ -1465,7 +1521,7 @@ impl LocalCacheEntry for IoUringCacheEntry {
             return Ok(None);
         }
         let (sender, recv) = oneshot::channel();
-        self.worker
+        self.read_worker
             .tx
             .send(WorkerOp::Read {
                 path,
@@ -1498,7 +1554,8 @@ struct IoUringCacheTee {
     root_folder: std::path::PathBuf,
     location: Path,
     part_size: usize,
-    worker: Arc<WorkerHandle>,
+    read_worker: Arc<WorkerHandle>,
+    write_worker: Arc<WorkerHandle>,
     tee_id: u64,
     part_buf: bytes::BytesMut,
     next_part_number: usize,
@@ -1529,7 +1586,7 @@ impl IoUringCacheTee {
         // op: AtomicWrite where final_path equals tmp_path skips the rename
         // because std::fs::rename(a, a) is OK on Linux (no-op).
         let (sender, recv) = oneshot::channel();
-        self.worker
+        self.write_worker
             .tx
             .send(WorkerOp::AtomicWrite {
                 tmp_path: tmp_path.clone(),
@@ -1597,7 +1654,7 @@ impl LocalCacheTee for IoUringCacheTee {
         let head_final = make_head_path(self.root_folder.clone(), &self.location);
         let head_tmp = head_final.with_extension(format!("_tee{}-head", self.tee_id));
         let (sender, recv) = oneshot::channel();
-        self.worker
+        self.write_worker
             .tx
             .send(WorkerOp::AtomicWrite {
                 tmp_path: head_tmp.clone(),
@@ -1654,8 +1711,9 @@ impl LocalCacheTee for IoUringCacheTee {
         // the rename produced a new inode; an old cached fd would now
         // point at an unlinked inode. The fd_cache's existing
         // `is_handle_valid` check would have caught that on first read,
-        // but pre-seeding avoids the open in the success path too.
-        let worker_tx = self.worker.tx.clone();
+        // but pre-seeding avoids the open in the success path too. The
+        // fd cache lives on the read worker, so seed it there.
+        let worker_tx = self.read_worker.tx.clone();
         let head_path = head_pair.1.clone();
         let part_paths: Vec<std::path::PathBuf> = pending_renames
             .iter()
