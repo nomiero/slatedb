@@ -3085,7 +3085,6 @@ dependencies = [
  "bitflags 2.11.1",
  "bytes",
  "chrono",
- "core_affinity",
  "crc32fast",
  "criterion",
  "crossbeam-channel",

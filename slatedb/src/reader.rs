@@ -233,7 +233,13 @@ impl Reader {
         db_stats: Option<DbStats>,
     ) -> Result<VecDeque<Box<dyn RowEntryIterator + 'a>>, SlateDBError> {
         let mut iters = VecDeque::new();
-        for sst in &db_state.core().tree.l0 {
+        for sst in db_state
+            .core()
+            .tree
+            .l0
+            .iter()
+            .filter(|sst| sst.overlaps_range(range))
+        {
             let iterator = SstIterator::new_owned_with_stats(
                 range.clone(),
                 sst.clone(),
@@ -284,8 +290,16 @@ impl Reader {
         let range_clone = range.clone();
         let table_store = self.table_store.clone();
         let sst_iter_options = sst_iter_options.clone();
+        let overlapping: Vec<_> = db_state
+            .core()
+            .tree
+            .l0
+            .iter()
+            .filter(|sst| sst.overlaps_range(range))
+            .cloned()
+            .collect();
         build_concurrent(
-            db_state.core().tree.l0.iter().cloned(),
+            overlapping.into_iter(),
             max_parallel,
             move |sst| {
                 let table_store = table_store.clone();
@@ -356,7 +370,14 @@ impl Reader {
         sst_iter_options: &SstIteratorOptions,
     ) -> Result<VecDeque<Box<dyn RowEntryIterator + 'a>>, SlateDBError> {
         let mut iters = VecDeque::new();
-        for sst in db_state.core().tree.l0.iter().cloned() {
+        for sst in db_state
+            .core()
+            .tree
+            .l0
+            .iter()
+            .filter(|sst| sst.overlaps_range(range))
+            .cloned()
+        {
             let iterator = SstIterator::new_owned_with_stats(
                 range.clone(),
                 sst,

@@ -387,17 +387,6 @@ fn run_worker(
     let mut next_paced_id: u64 = 1;
     let mut delayed_chunks: Vec<(std::time::Instant, u64)> = Vec::new();
 
-    // Optional pin of this thread to a specific core. Single integer
-    // pins all workers there; a comma list (e.g. "0,1,2,3") pins worker
-    // `i` to `list[i % list.len()]`. Unset / invalid → OS scheduler.
-    if let Ok(s) = std::env::var("SLATEDB_URING_CPU") {
-        let cpus: Vec<usize> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-        if !cpus.is_empty() {
-            let cpu = cpus[worker_idx % cpus.len()];
-            let _ = core_affinity::set_for_current(core_affinity::CoreId { id: cpu });
-        }
-    }
-
     // Cache-write pacing. Reads env once at worker start. When set, big
     // AtomicWrite ops get split into `chunk_bytes`-sized SQEs with
     // `pause` between each chunk's completion and the next chunk's

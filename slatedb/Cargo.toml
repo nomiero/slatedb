@@ -78,7 +78,6 @@ url = "2.5.4"
 # the standard FsCacheStorage. Pin to a tested 0.7.x.
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
-core_affinity = "0.8"
 
 [dev-dependencies]
 backtrace = "0.3"

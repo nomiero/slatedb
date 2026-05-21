@@ -215,6 +215,13 @@ impl SsTableView {
         &self.effective_range
     }
 
+    /// Returns `true` if this view's effective key range overlaps `range`.
+    /// Cheap, in-memory check used to skip non-overlapping SSTs before
+    /// paying for an iterator (clone, index read, block search).
+    pub(crate) fn overlaps_range(&self, range: &BytesRange) -> bool {
+        self.effective_range.intersect(range).is_some()
+    }
+
     pub(crate) fn compacted_intersection(
         &self,
         next_view: Option<&SsTableView>,
