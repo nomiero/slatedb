@@ -336,12 +336,56 @@ struct WorkerHandle {
     join: parking_lot::Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Parse an inclusive CPU range `"start-end"`, or a single core `"n"`.
+fn parse_cpu_range(spec: &str) -> Option<(usize, usize)> {
+    let spec = spec.trim();
+    if let Some((a, b)) = spec.split_once('-') {
+        let start = a.trim().parse().ok()?;
+        let end = b.trim().parse().ok()?;
+        return (start <= end).then_some((start, end));
+    }
+    let n = spec.parse().ok()?;
+    Some((n, n))
+}
+
+/// Restrict the calling thread to the CPUs named by `SLATEDB_URING_CPUS`,
+/// if that env var is set. The value is an inclusive range `start-end`
+/// or a single core index; the io_uring worker then floats across that
+/// CPU set under the kernel scheduler. Unset leaves affinity untouched.
+fn pin_uring_thread() {
+    let Ok(spec) = std::env::var("SLATEDB_URING_CPUS") else {
+        return;
+    };
+    let Some((start, end)) = parse_cpu_range(&spec) else {
+        warn!("ignoring malformed SLATEDB_URING_CPUS={:?}", spec);
+        return;
+    };
+    // SAFETY: `set` is zeroed before use; `sched_setaffinity` with pid 0
+    // targets the calling thread.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        for cpu in start..=end {
+            libc::CPU_SET(cpu, &mut set);
+        }
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            warn!(
+                "failed to set slatedb-uring affinity to CPUs {}-{}: {}",
+                start,
+                end,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 impl WorkerHandle {
     fn spawn(direct_io: bool, worker_idx: usize) -> std::io::Result<Self> {
         let (tx, rx) = crossbeam_channel::unbounded::<WorkerOp>();
         let join = std::thread::Builder::new()
             .name(format!("slatedb-uring-{}", worker_idx))
             .spawn(move || {
+                pin_uring_thread();
                 if let Err(e) = run_worker(rx, direct_io, worker_idx) {
                     warn!(
                         "slatedb-uring worker {} exited with error: {:?}",
