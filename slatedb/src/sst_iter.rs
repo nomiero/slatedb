@@ -391,21 +391,21 @@ impl<'a> InternalSstIterator<'a> {
                     let blocks_end = self.next_block_idx_to_fetch + blocks_to_fetch;
                     // VERIFY: actual block fetch (not just the covered
                     // range). One line per block range physically read.
-                    if self.options.prefix.is_some() {
-                        tracing::info!(
-                            _no_suppress = true,
-                            sst_id = ?self.view.table_as_ref().sst.id,
-                            blocks = ?(blocks_start..blocks_end),
-                            // filter_len == 0 means this SST has no filter
-                            // block, so the recency scan can't prune it and
-                            // reads this data block unconditionally.
-                            // sst_blocks is a size proxy (small SSTs are
-                            // filterless when below `min_filter_keys`).
-                            filter_len = self.view.table_as_ref().sst.info.filter_len,
-                            sst_blocks = index.borrow().block_meta().len(),
-                            "prefix scan: fetching block(s) from disk"
-                        );
-                    }
+                    // if self.options.prefix.is_some() {
+                    //     tracing::info!(
+                    //         _no_suppress = true,
+                    //         sst_id = ?self.view.table_as_ref().sst.id,
+                    //         blocks = ?(blocks_start..blocks_end),
+                    //         // filter_len == 0 means this SST has no filter
+                    //         // block, so the recency scan can't prune it and
+                    //         // reads this data block unconditionally.
+                    //         // sst_blocks is a size proxy (small SSTs are
+                    //         // filterless when below `min_filter_keys`).
+                    //         filter_len = self.view.table_as_ref().sst.info.filter_len,
+                    //         sst_blocks = index.borrow().block_meta().len(),
+                    //         "prefix scan: fetching block(s) from disk"
+                    //     );
+                    // }
                     let index = index.clone();
                     let cache_blocks = self.options.cache_blocks;
                     self.fetch_tasks
@@ -569,34 +569,7 @@ impl<'a> InternalSstIterator<'a> {
                 self.view.start_key(),
                 self.view.end_key(),
             );
-            // VERIFY: prefix-scan block-range theory. A point/prefix scan
-            // should cover exactly one block; if it covers >1, log the
-            // leading block's first_key so we can see whether it belongs
-            // to a different (earlier) user key - i.e. a wasted leading
-            // block read. `start_key()` is the bare prefix; if the
-            // leading block's first_key sorts below it, that block has no
-            // in-range rows and the read is pure waste.
-            if self.options.prefix.is_some() {
-                let n_blocks = block_idx_range.end - block_idx_range.start;
-                if n_blocks > 1 {
-                    let index_view = index.borrow();
-                    let lead = index_view
-                        .block_meta()
-                        .get(block_idx_range.start)
-                        .first_key()
-                        .bytes();
-                    tracing::info!(
-                        _no_suppress = true,
-                        sst_id = ?self.view.table_as_ref().sst.id,
-                        block_range = ?block_idx_range,
-                        n_blocks,
-                        start_key = ?self.view.start_key(),
-                        end_key = ?self.view.end_key(),
-                        leading_block_first_key = ?Bytes::copy_from_slice(lead),
-                        "prefix scan covers >1 block (possible wasted leading-block read)"
-                    );
-                }
-            }
+
             self.block_idx_range = block_idx_range.clone();
             // For descending order, start from the end and work backwards
             self.next_block_idx_to_fetch = match self.options.order {
@@ -770,13 +743,11 @@ impl RowEntryIterator for InternalSstIterator<'_> {
                         next_key,
                     )
                 }
-                IterationOrder::Descending => {
-                    partitioned_keyspace::last_partition_including_key(
-                        &SsTableIndexKeySpace::new(&index.borrow()),
-                        next_key,
-                    )
-                    .unwrap_or(self.block_idx_range.start)
-                }
+                IterationOrder::Descending => partitioned_keyspace::last_partition_including_key(
+                    &SsTableIndexKeySpace::new(&index.borrow()),
+                    next_key,
+                )
+                .unwrap_or(self.block_idx_range.start),
             };
 
             // Check if block is in the already-fetched direction
