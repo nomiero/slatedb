@@ -396,6 +396,13 @@ impl<'a> InternalSstIterator<'a> {
                             _no_suppress = true,
                             sst_id = ?self.view.table_as_ref().sst.id,
                             blocks = ?(blocks_start..blocks_end),
+                            // filter_len == 0 means this SST has no filter
+                            // block, so the recency scan can't prune it and
+                            // reads this data block unconditionally.
+                            // sst_blocks is a size proxy (small SSTs are
+                            // filterless when below `min_filter_keys`).
+                            filter_len = self.view.table_as_ref().sst.info.filter_len,
+                            sst_blocks = index.borrow().block_meta().len(),
                             "prefix scan: fetching block(s) from disk"
                         );
                     }
