@@ -509,6 +509,20 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Create path resolver and table store
         let path_resolver = PathResolver::new_with_external_ssts(path.clone(), external_ssts);
+        // Single shared `DbCacheWrapper` for the foreground and compactor
+        // table stores. They must use the *same* wrapper instance: the
+        // wrapper stamps every key with a unique `scope_id`, so two
+        // wrappers over one cache form disjoint keyspaces. Compaction
+        // warms output filter+index through the compactor store and
+        // foreground readers look them up through the main store - those
+        // lookups only hit when both stores share the wrapper's scope.
+        let db_cache_wrapper: Option<Arc<dyn DbCache>> = self.db_cache.as_ref().map(|c| {
+            Arc::new(DbCacheWrapper::new(
+                c.clone(),
+                &recorder,
+                system_clock.clone(),
+            )) as Arc<dyn DbCache>
+        });
         let table_store = Arc::new(
             TableStore::new_with_fp_registry(
                 ObjectStores::new(
@@ -518,13 +532,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                 sst_format.clone(),
                 path_resolver.clone(),
                 self.fp_registry.clone(),
-                self.db_cache.as_ref().map(|c| {
-                    Arc::new(DbCacheWrapper::new(
-                        c.clone(),
-                        &recorder,
-                        system_clock.clone(),
-                    )) as Arc<dyn DbCache>
-                }),
+                db_cache_wrapper.clone(),
             )
             .with_cached_object_store(cached_object_store.clone())
             .with_prewarm_compacted_on_write(
@@ -635,6 +643,16 @@ impl<P: Into<Path>> DbBuilder<P> {
         // below. Net effect: foreground readers keep an uncontested
         // blocking pool while compaction outputs stay locally cached
         // for the next reader.
+        //
+        // The `db_cache` (in-memory filter/index meta cache) IS attached,
+        // and shares the *same* `db_cache_wrapper` as the foreground
+        // table store: `EncodedSsTableWriter::close()` warms each output
+        // SST's filter and index into it before returning the handle to
+        // the manifest writer, so readers (going through the foreground
+        // store) don't miss on freshly-compacted SSTs the instant the
+        // manifest commit makes them visible. Compaction's own input
+        // reads set `cache_blocks: false`, so attaching the cache does
+        // not pollute it with one-shot input blocks.
         let compactor_table_store = Arc::new(
             TableStore::new_with_fp_registry(
                 ObjectStores::new(
@@ -644,7 +662,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                 sst_format,
                 path_resolver.clone(),
                 self.fp_registry.clone(),
-                None,
+                db_cache_wrapper.clone(),
             )
             .with_cached_object_store(cached_object_store.clone())
             .with_prewarm_compacted_on_write(
