@@ -702,13 +702,6 @@ impl<P: Into<Path>> DbBuilder<P> {
         // Replay WAL
         inner.replay_wal(replay_range).await?;
 
-        // Preload cache if enabled
-        if let Some(cached_obj_store) = cached_object_store {
-            inner
-                .preload_cache(&cached_obj_store, &path_resolver)
-                .await?;
-        }
-
         // Create and return the Db instance
         Ok(Db {
             inner,
@@ -1462,10 +1455,6 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         )
         .await
         .map_err(crate::Error::from)?;
-
-        if let Some(cached) = &maybe_cached {
-            reader.preload_cache(cached, path).await?;
-        }
 
         Ok(reader)
     }

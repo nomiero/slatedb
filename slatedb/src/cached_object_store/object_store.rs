@@ -5,7 +5,7 @@ use crate::config::ObjectStoreCacheOptions;
 use crate::rand::DbRand;
 use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, stream, stream::BoxStream, StreamExt};
-use object_store::{path::Path, GetOptions, GetResult, ObjectMeta, ObjectStore, ObjectStoreExt};
+use object_store::{path::Path, GetOptions, GetResult, ObjectMeta, ObjectStore};
 use object_store::{
     Attributes, CopyOptions, GetRange, GetResultPayload, PutMultipartOptions, PutResult,
     RenameOptions,
@@ -20,9 +20,9 @@ use crate::single_flight::SingleFlight;
 use crate::cached_object_store::admission::AdmissionPicker;
 use crate::cached_object_store::storage::{LocalCacheStorage, PartID};
 use crate::error::SlateDBError;
+use crate::object_store_intent::{get_read_intent, get_write_intent, ReadKind, WriteKind};
 use log::warn;
 
-use crate::utils::build_concurrent;
 use slatedb_common::metrics::MetricsRecorderHelper;
 
 #[derive(Debug, Clone)]
@@ -109,68 +109,6 @@ impl CachedObjectStore {
         Ok(Some(cached))
     }
 
-    /// Load files into cache up to a maximum number of bytes.
-    /// This method fetches objects from the provided paths and stores them in the cache
-    /// until the specified max_bytes limit is reached.
-    pub(crate) async fn load_files_to_cache(
-        &self,
-        file_paths: Vec<Path>,
-        max_bytes: usize,
-    ) -> Result<(), SlateDBError> {
-        if file_paths.is_empty() || max_bytes == 0 {
-            return Ok(());
-        }
-
-        let mut remaining_bytes = max_bytes;
-        let mut files_to_load = Vec::with_capacity(file_paths.len());
-
-        // First pass: sequentially get metadata and select files that fit
-        // This is done sequentially because the head calls should be very quick compared to files loading
-        for path in file_paths {
-            match self.object_store.head(&path).await {
-                Ok(meta) => {
-                    let file_size = meta.size as usize;
-                    if remaining_bytes >= file_size {
-                        remaining_bytes -= file_size;
-                        files_to_load.push(path);
-                    } else {
-                        // We can't fit this file, so we stop here
-                        break;
-                    }
-                }
-                Err(e) => {
-                    // If file doesn't exist or can't be accessed, we stop here
-                    warn!("Failed to preload all SSTs to cache: {:?}", e);
-                    break;
-                }
-            }
-        }
-
-        // Second pass: load the selected files in bounded parallelism and cache them.
-        let degree_of_parallelism = 32;
-        let _result = build_concurrent(files_to_load.into_iter(), degree_of_parallelism, |path| {
-            let this = self.clone();
-            async move {
-                match this
-                    .maybe_prefetch_range(&path, GetOptions::default())
-                    .await
-                {
-                    Ok(_) => Ok(Some(())),
-                    Err(e) => {
-                        warn!(
-                            "Failed to prefetch file into cache [path={}, error={:?}]",
-                            path, e
-                        );
-                        Ok(None) // best-effort: skip errors
-                    }
-                }
-            }
-        })
-        .await;
-
-        Ok(())
-    }
-
     /// Returns the canonical cache key for a requested location.
     ///
     /// The key is `resolved_root + location` once root resolution succeeds.
@@ -179,6 +117,21 @@ impl CachedObjectStore {
     /// for early requests until successful GET/HEAD responses are observed.
     fn cache_location_for(&self, location: &Path) -> Option<Path> {
         cache_location_for(&self.resolved_root, location)
+    }
+
+    /// Drop any cached entry for `location`. Called from the read path
+    /// when the caller signals (via `ReadIntent.retry`) that a previous
+    /// read returned corrupt bytes — the cached copy is suspect and
+    /// must not be served again. No-op when the cache hasn't resolved
+    /// its root yet or `location` has no derivable cache key.
+    async fn evict_entry(&self, location: &Path) {
+        let Some(cache_location) = self.cache_location_for(location) else {
+            return;
+        };
+        let entry = self
+            .cache_storage
+            .entry(&cache_location, self.part_size_bytes);
+        entry.delete().await;
     }
 
     /// Lazily resolves the root prefix and validates the derived cache key.
@@ -254,7 +207,20 @@ impl CachedObjectStore {
         Some(Path::from(prefix.trim_end_matches('/')))
     }
 
+    #[cfg(test)]
     pub(crate) async fn cached_head(&self, location: &Path) -> object_store::Result<GetResult> {
+        self.cached_head_with_options(location, GetOptions::default().with_head(true))
+            .await
+    }
+
+    async fn cached_head_with_options(
+        &self,
+        location: &Path,
+        mut opts: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        opts.range = None;
+        opts.head = true;
+
         if let Some(cache_location) = self.cache_location_for(location) {
             let entry = self
                 .cache_storage
@@ -268,17 +234,7 @@ impl CachedObjectStore {
         let (meta, attributes) = self
             .head_flights
             .call(location.clone(), || async {
-                let result = self
-                    .object_store
-                    .get_opts(
-                        location,
-                        GetOptions {
-                            range: None,
-                            head: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
+                let result = self.object_store.get_opts(location, opts).await?;
                 let meta = result.meta.clone();
                 let attributes = result.attributes.clone();
                 if self.resolve_root(location, &meta.location) {
@@ -307,13 +263,16 @@ impl CachedObjectStore {
         let get_range = opts.range.clone();
         let range = self.canonicalize_range(get_range, meta.size)?;
         let parts = self.split_range_into_parts(range.clone());
+        let extensions = opts.extensions;
 
         // read parts, and concatenate them into a single stream. please note that
         // some of these part may not be cached, we'll still fallback to the object
         // store to get the missing parts.
         let futures = parts
             .into_iter()
-            .map(|(part_id, range_in_part)| self.read_part(location, part_id, range_in_part))
+            .map(|(part_id, range_in_part)| {
+                self.read_part(location, part_id, range_in_part, extensions.clone())
+            })
             .collect::<Vec<_>>();
         let result_stream = stream::iter(futures).then(|fut| fut).boxed();
 
@@ -331,8 +290,21 @@ impl CachedObjectStore {
         payload: object_store::PutPayload,
         opts: object_store::PutOptions,
     ) -> object_store::Result<PutResult> {
-        // Only cache if the cache_puts option is enabled
-        if !self.cache_puts {
+        // Only cache if the cache_puts option is enabled.
+        // Also skip caching for write intents that aren't worth admitting:
+        //   - Wal: short-lived, fenced and superseded by L0 flush.
+        //   - Manifest: small metadata, the cache would churn over rapid
+        //     manifest versions for no benefit.
+        //   - CompactionOutput: compactor produces large SSTs in bulk,
+        //     admitting them would evict hotter L0 entries.
+        // Flush (memtable to L0) and untagged puts fall through and are
+        // written to the upstream store and the cache, preserving the
+        // prior behavior for any caller that doesn't tag.
+        let skip_for_intent = matches!(
+            get_write_intent(&opts.extensions).map(|i| i.kind),
+            Some(WriteKind::Wal | WriteKind::Manifest | WriteKind::CompactionOutput)
+        );
+        if !self.cache_puts || skip_for_intent {
             // If caching is disabled, just write to the upstream object store without cloning
             return self.object_store.put_opts(location, payload, opts).await;
         }
@@ -524,6 +496,7 @@ impl CachedObjectStore {
         location: &Path,
         part_id: PartID,
         range_in_part: Range<usize>,
+        extensions: object_store::Extensions,
     ) -> BoxFuture<'static, object_store::Result<Bytes>> {
         let this = self.clone();
         let location = location.clone();
@@ -559,6 +532,7 @@ impl CachedObjectStore {
                             &location,
                             GetOptions {
                                 range: Some(GetRange::Bounded(part_range)),
+                                extensions: extensions.clone(),
                                 ..Default::default()
                             },
                         )
@@ -713,8 +687,30 @@ impl ObjectStore for CachedObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        // Head requests stay cache-first regardless of intent: they're
+        // small and frequently-accessed metadata reads where the cost of
+        // a HEAD is much higher than the cost of the cached bytes.
         if options.head {
-            return self.cached_head(location).await;
+            return self.cached_head_with_options(location, options).await;
+        }
+
+        // ReadIntent routing for non-head reads:
+        //   - CompactionInput: bypass the cache entirely. Compaction
+        //     scans are one-shot reads that would pollute the cache
+        //     with bytes that won't be re-read.
+        //   - retry = Some(..): the caller saw a recoverable decode
+        //     error (CRC mismatch / decompression / block-decode
+        //     failure) on a previous read. Drop our cached copy before
+        //     refetching from upstream so we don't serve the same
+        //     bytes again.
+        // Anything else (Foreground, Warmup, untagged) takes the
+        // existing cache-aware path unchanged.
+        let read_intent = get_read_intent(&options.extensions);
+        if matches!(read_intent.map(|i| i.kind), Some(ReadKind::CompactionInput)) {
+            return self.object_store.get_opts(location, options).await;
+        }
+        if read_intent.and_then(|i| i.retry).is_some() {
+            self.evict_entry(location).await;
         }
         self.cached_get_opts(location, options).await
     }
@@ -844,7 +840,9 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use object_store::{path::Path, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutPayload};
+    use object_store::{
+        path::Path, Attributes, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutPayload,
+    };
     use rand::Rng;
 
     use super::CachedObjectStore;
@@ -1534,104 +1532,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_preload_cache() {
-        let cache_dir = new_test_cache_folder();
-        let recorder = MetricsRecorderHelper::noop();
-        let stats = Arc::new(CachedObjectStoreStats::new(&recorder));
-        let cache_storage = Arc::new(FsCacheStorage::new(
-            cache_dir,
-            Some(10 * 1024 * 1024), // 10MB
-            None,
-            stats.clone(),
-            Arc::new(DefaultSystemClock::new()),
-            Arc::new(DbRand::default()),
-            1000,
-        ));
-
-        let object_store = Arc::new(object_store::memory::InMemory::new());
-
-        let cached_store =
-            CachedObjectStore::new(object_store.clone(), cache_storage, 1024, true, stats).unwrap();
-
-        // Create some test files to preload
-        let test_paths = vec![
-            Path::from("file1.sst"),
-            Path::from("file2.sst"),
-            Path::from("file3.sst"),
-        ];
-
-        let test_data = gen_rand_bytes(2048); // 2KB per file
-
-        // Put test files in object store
-        for path in &test_paths {
-            object_store
-                .put(path, PutPayload::from_bytes(test_data.clone()))
-                .await
-                .unwrap();
-        }
-
-        // Test preloading with max cache size
-        cached_store
-            .load_files_to_cache(test_paths.clone(), 10 * 1024) // 10KB limit
-            .await
-            .unwrap();
-
-        // Verify that files are cached by checking if we can read from cache
-        for path in &test_paths {
-            let entry = cached_store.cache_storage.entry(path, 1024);
-            let cached_parts = entry.cached_parts().await.unwrap();
-            assert_eq!(cached_parts.len(), 2); // 2KB = 2 parts of 1024 bytes
-        }
-    }
-
-    #[tokio::test]
-    async fn test_preload_cache_above_limit() {
-        let cache_dir = new_test_cache_folder();
-        let recorder = MetricsRecorderHelper::noop();
-        let stats = Arc::new(CachedObjectStoreStats::new(&recorder));
-        let cache_storage = Arc::new(FsCacheStorage::new(
-            cache_dir,
-            Some(10 * 1024 * 1024), // 10MB
-            None,
-            stats.clone(),
-            Arc::new(DefaultSystemClock::new()),
-            Arc::new(DbRand::default()),
-            1000,
-        ));
-
-        let object_store = Arc::new(object_store::memory::InMemory::new());
-
-        let cached_store =
-            CachedObjectStore::new(object_store.clone(), cache_storage, 1024, true, stats).unwrap();
-
-        // Create some test files
-        let test_paths = vec![Path::from("file1.sst"), Path::from("file2.sst")];
-
-        let test_data = gen_rand_bytes(2048); // 2KB per file
-
-        // Put test files in object store
-        for path in &test_paths {
-            object_store
-                .put(path, PutPayload::from_bytes(test_data.clone()))
-                .await
-                .unwrap();
-        }
-
-        // Test load_files_to_cache with 0 bytes limit (should load nothing)
-        cached_store
-            .load_files_to_cache(test_paths.clone(), 0)
-            .await
-            .unwrap();
-
-        // Verify that files are NOT cached since preloading was disabled
-        for path in &test_paths {
-            let entry = cached_store.cache_storage.entry(path, 1024);
-            let cached_parts = entry.cached_parts().await.unwrap();
-            assert_eq!(cached_parts.len(), 0); // No parts should be cached
-        }
-    }
-
     /// Helper to build a CachedObjectStore backed by an InstrumentedObjectStore so
     /// we can assert on the number of actual object-store requests made.
     fn build_instrumented_cached_store(
@@ -2132,5 +2032,327 @@ mod tests {
         let parts1 = entry1.cached_parts().await.unwrap();
         assert_eq!(parts1.len(), 0, "{parts1:?}");
         assert_eq!(cache_storage.file_handle_cache_population(), 3);
+    }
+
+    // ============================================================
+    // Intent protocol integration (RFC 0027)
+    // ============================================================
+
+    use crate::object_store_intent::testing::IntentRecorderObjectStore;
+    use crate::object_store_intent::{
+        put_options_with_intent, set_read_intent, ReadIntent, RetryReason, WriteIntent,
+    };
+
+    /// Build a `CachedObjectStore` with `cache_puts = true` for the
+    /// intent-protocol tests. `part_size = 1024` so a few-KiB payload
+    /// gets split across multiple parts without overflowing the in-memory
+    /// backend.
+    fn build_cached_store_with_puts(inner: Arc<dyn ObjectStore>) -> Arc<CachedObjectStore> {
+        let recorder = MetricsRecorderHelper::noop();
+        let stats = Arc::new(CachedObjectStoreStats::new(&recorder));
+        let cache_storage = Arc::new(FsCacheStorage::new(
+            new_test_cache_folder(),
+            None,
+            None,
+            stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        ));
+        CachedObjectStore::new(inner, cache_storage, 1024, true, stats).unwrap()
+    }
+
+    fn get_options_with_read_intent(intent: ReadIntent) -> GetOptions {
+        let mut opts = GetOptions::default();
+        set_read_intent(&mut opts.extensions, intent);
+        opts
+    }
+
+    /// `cache_location_for` returns `None` until a read or write through
+    /// the cache-aware path resolves the root prefix. The intent-protocol
+    /// tests need to inspect the cache directly, so prime the root with
+    /// an unrelated Foreground GET first.
+    async fn prime_cache_root(cached: &CachedObjectStore, inner: &Arc<dyn ObjectStore>) {
+        let warmup_path = Path::from("data/warmup_sentinel");
+        inner
+            .put(&warmup_path, PutPayload::from_bytes(gen_rand_bytes(256)))
+            .await
+            .unwrap();
+        cached
+            .get_opts(
+                &warmup_path,
+                get_options_with_read_intent(ReadIntent::foreground()),
+            )
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+    }
+
+    /// `WriteIntent::wal()` short-circuits the cache write-through even
+    /// when `cache_puts: true`. The upstream write still succeeds.
+    #[tokio::test]
+    async fn put_with_wal_intent_skips_cache() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let cached = build_cached_store_with_puts(inner.clone());
+        prime_cache_root(&cached, &inner).await;
+
+        let path = Path::from("data/wal_skipped.sst");
+        let payload = gen_rand_bytes(2048);
+        cached
+            .put_opts(
+                &path,
+                PutPayload::from_bytes(payload.clone()),
+                put_options_with_intent(WriteIntent::wal()),
+            )
+            .await
+            .unwrap();
+
+        // Upstream got the payload.
+        let upstream = inner.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(upstream, payload);
+
+        // Cache stayed empty for this path.
+        let cache_location = cached.cache_location_for(&path).unwrap();
+        let entry = cached
+            .cache_storage
+            .entry(&cache_location, cached.part_size_bytes);
+        let parts = entry.cached_parts().await.unwrap();
+        assert!(parts.is_empty(), "expected no parts cached for Wal put");
+    }
+
+    /// `WriteIntent::manifest()` skips the cache write-through too.
+    #[tokio::test]
+    async fn put_with_manifest_intent_skips_cache() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let cached = build_cached_store_with_puts(inner.clone());
+        prime_cache_root(&cached, &inner).await;
+
+        let path = Path::from("manifest/00000000000000000001.manifest");
+        let payload = gen_rand_bytes(2048);
+        cached
+            .put_opts(
+                &path,
+                PutPayload::from_bytes(payload.clone()),
+                put_options_with_intent(WriteIntent::manifest()),
+            )
+            .await
+            .unwrap();
+
+        let cache_location = cached.cache_location_for(&path).unwrap();
+        let entry = cached
+            .cache_storage
+            .entry(&cache_location, cached.part_size_bytes);
+        let parts = entry.cached_parts().await.unwrap();
+        assert!(
+            parts.is_empty(),
+            "expected no parts cached for Manifest put"
+        );
+    }
+
+    /// `WriteIntent::flush()` keeps the legacy cache-on-write behavior.
+    #[tokio::test]
+    async fn put_with_flush_intent_caches() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let cached = build_cached_store_with_puts(inner.clone());
+        prime_cache_root(&cached, &inner).await;
+
+        let path = Path::from("data/l0_cached.sst");
+        let payload = gen_rand_bytes(2048);
+        cached
+            .put_opts(
+                &path,
+                PutPayload::from_bytes(payload.clone()),
+                put_options_with_intent(WriteIntent::flush()),
+            )
+            .await
+            .unwrap();
+
+        let cache_location = cached.cache_location_for(&path).unwrap();
+        let entry = cached
+            .cache_storage
+            .entry(&cache_location, cached.part_size_bytes);
+        let parts = entry.cached_parts().await.unwrap();
+        assert!(
+            !parts.is_empty(),
+            "expected Flush put to be cached after write-through"
+        );
+    }
+
+    /// `ReadIntent::compaction_input()` bypasses the cache entirely:
+    /// the response comes from upstream and no parts are admitted, even
+    /// after several reads.
+    #[tokio::test]
+    async fn read_with_compaction_input_intent_bypasses_cache() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let cached = build_cached_store_with_puts(inner.clone());
+        prime_cache_root(&cached, &inner).await;
+
+        let path = Path::from("data/compaction_input.sst");
+        let payload = gen_rand_bytes(2048);
+        inner
+            .put(&path, PutPayload::from_bytes(payload.clone()))
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            let result = cached
+                .get_opts(
+                    &path,
+                    get_options_with_read_intent(ReadIntent::compaction_input()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.bytes().await.unwrap(), payload);
+        }
+
+        // No admission happened.
+        let cache_location = cached.cache_location_for(&path).unwrap();
+        let entry = cached
+            .cache_storage
+            .entry(&cache_location, cached.part_size_bytes);
+        let parts = entry.cached_parts().await.unwrap();
+        assert!(
+            parts.is_empty(),
+            "expected no parts cached for CompactionInput reads, found {parts:?}"
+        );
+    }
+
+    /// When `CachedObjectStore` is stacked above another intent-aware
+    /// wrapper, its internal upstream HEAD miss should preserve the
+    /// original read intent.
+    #[tokio::test]
+    async fn head_miss_preserves_read_intent_to_inner_store() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (recorder, log) = IntentRecorderObjectStore::new(inner.clone());
+        let cached = build_cached_store_with_puts(recorder as Arc<dyn ObjectStore>);
+
+        let path = Path::from("data/head_miss.sst");
+        inner
+            .put(&path, PutPayload::from_bytes(gen_rand_bytes(2048)))
+            .await
+            .unwrap();
+
+        let mut opts = get_options_with_read_intent(ReadIntent::warmup());
+        opts.head = true;
+        cached.get_opts(&path, opts).await.unwrap();
+
+        let calls = log.lock().unwrap();
+        let head_call = calls
+            .iter()
+            .find(|c| c.method == "get_opts[head]")
+            .expect("expected inner head miss call");
+        assert_eq!(head_call.read_intent, Some(ReadIntent::warmup()));
+        assert_eq!(head_call.write_intent, None);
+    }
+
+    /// If metadata is cached but a data part is missing, the internal
+    /// ranged part fetch should also preserve the original read intent
+    /// for any wrapper stacked under `CachedObjectStore`.
+    #[tokio::test]
+    async fn part_miss_preserves_read_intent_to_inner_store() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (recorder, log) = IntentRecorderObjectStore::new(inner.clone());
+        let cached = build_cached_store_with_puts(recorder as Arc<dyn ObjectStore>);
+
+        let path = Path::from("data/part_miss.sst");
+        let payload = gen_rand_bytes(2048);
+        inner
+            .put(&path, PutPayload::from_bytes(payload.clone()))
+            .await
+            .unwrap();
+
+        // Resolve the cache root, then seed only the target head. We
+        // deliberately do not read the target through `cached_head`,
+        // because some object_store backends return bytes for
+        // head-shaped `get_opts` calls.
+        prime_cache_root(&cached, &inner).await;
+        let meta = inner.head(&path).await.unwrap();
+        let cache_location = cached.cache_location_for(&path).unwrap();
+        let entry = cached
+            .cache_storage
+            .entry(&cache_location, cached.part_size_bytes);
+        entry
+            .save_head((&meta, &Attributes::default()))
+            .await
+            .unwrap();
+        log.lock().unwrap().clear();
+
+        let mut range_opts = get_options_with_read_intent(ReadIntent::warmup());
+        range_opts.range = Some(GetRange::Bounded(0..512));
+        let result = cached.get_opts(&path, range_opts).await.unwrap();
+        assert_eq!(result.bytes().await.unwrap(), payload.slice(0..512));
+
+        let calls = log.lock().unwrap();
+        let range_call = calls
+            .iter()
+            .find(|c| c.method.starts_with("get_opts"))
+            .unwrap_or_else(|| panic!("expected inner ranged part miss call, saw {calls:?}"));
+        assert_eq!(range_call.read_intent, Some(ReadIntent::warmup()));
+        assert_eq!(range_call.write_intent, None);
+    }
+
+    /// A retry-tagged read evicts the cached entry first, then takes
+    /// the normal cached path which refetches from upstream and admits
+    /// the fresh bytes. We verify by warming the cache with the OLD
+    /// upstream contents, mutating upstream, and confirming a retry-
+    /// tagged read returns the NEW contents (cache eviction worked).
+    #[tokio::test]
+    async fn retry_tagged_read_evicts_cached_entry() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let cached = build_cached_store_with_puts(inner.clone());
+
+        let path = Path::from("data/decoded_then_corrupted.sst");
+        let original = gen_rand_bytes(2048);
+        inner
+            .put(&path, PutPayload::from_bytes(original.clone()))
+            .await
+            .unwrap();
+
+        // Warm the cache with the original payload via a normal Foreground read.
+        let warm = cached
+            .get_opts(
+                &path,
+                get_options_with_read_intent(ReadIntent::foreground()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(warm.bytes().await.unwrap(), original);
+
+        // Sanity check: cache now has parts for this path.
+        let cache_location = cached.cache_location_for(&path).unwrap();
+        let entry = cached
+            .cache_storage
+            .entry(&cache_location, cached.part_size_bytes);
+        let pre_parts = entry.cached_parts().await.unwrap();
+        assert!(
+            !pre_parts.is_empty(),
+            "expected cache populated after warm read"
+        );
+
+        // Replace the upstream object behind the cache's back. Without
+        // eviction, a follow-up read would still serve the stale parts.
+        let replacement = gen_rand_bytes(2048);
+        inner
+            .put(&path, PutPayload::from_bytes(replacement.clone()))
+            .await
+            .unwrap();
+
+        // Retry-tagged read: must evict + refetch + return new bytes.
+        let retried = cached
+            .get_opts(
+                &path,
+                get_options_with_read_intent(
+                    ReadIntent::foreground().with_retry(RetryReason::CrcMismatch),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            retried.bytes().await.unwrap(),
+            replacement,
+            "retry-tagged read should have refetched fresh bytes from upstream"
+        );
     }
 }

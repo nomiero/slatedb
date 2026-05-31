@@ -57,10 +57,13 @@ pub(crate) async fn warm_sst_impl(
     if targets.is_empty() {
         return Ok(());
     }
-    if table_store.cache().is_none() {
-        warn!("warm_sst called on a Db without a block cache configured");
-        return Ok(());
-    }
+    // When no block cache is configured, the read paths below still flow
+    // through the main object store, so any intent, aware disk cache wrapper
+    // (e.g. CachedObjectStore) gets admitted bytes as a side effect. The
+    // block, cache write inside read_filters / read_index / read_stats /
+    // read_blocks_using_index is a no, op when self.cache is None, so this
+    // path is safe with no cache, with a block cache only, with a disk
+    // cache only, or with both.
 
     // Reuse the handle embedded in the manifest view instead of calling
     // `open_sst`, which would issue an extra object_store GET for info+version.

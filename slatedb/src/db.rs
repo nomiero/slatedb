@@ -45,7 +45,6 @@ use std::time::Duration;
 use crate::batch::WriteBatch;
 use crate::batch_write::{WriteBatchMessage, WRITE_BATCH_TASK_NAME};
 use crate::bytes_range::BytesRange;
-use crate::cached_object_store::CachedObjectStore;
 use crate::clock::MonotonicClock;
 use crate::config::{
     FlushOptions, FlushType, MergeOptions, PutOptions, ReadOptions, ScanOptions, Settings,
@@ -62,7 +61,6 @@ use crate::memtable_flusher::{FlushResult, FlushTarget, MemtableFlusher};
 use crate::merge_operator::{instrument_merge_operator, MergeOperatorType};
 use crate::object_store_intent::ReadIntent;
 use crate::oracle::{DbOracle, Oracle};
-use crate::paths::PathResolver;
 use crate::prefix_extractor::PrefixExtractor;
 use crate::rand::DbRand;
 use crate::reader::{Reader, ScanContext};
@@ -595,23 +593,6 @@ impl DbInner {
         }
 
         Ok(())
-    }
-
-    async fn preload_cache(
-        &self,
-        cached_obj_store: &CachedObjectStore,
-        path_resolver: &PathResolver,
-    ) -> Result<(), SlateDBError> {
-        let state = self.state.read().state();
-        let cache_opts = &self.settings.object_store_cache_options;
-        crate::utils::preload_cache_from_manifest(
-            &state.manifest.value.core,
-            cached_obj_store,
-            path_resolver,
-            cache_opts.preload_disk_cache_on_startup,
-            cache_opts.max_cache_size_bytes.unwrap_or(usize::MAX),
-        )
-        .await
     }
 
     /// Returns the latest database status snapshot.
@@ -3576,17 +3557,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_with_object_store_cache_put_caching_enabled() {
+        // After the intent-protocol integration, `cache_puts: true` only
+        // admits writes tagged `Flush` or untagged legacy writes. WAL writes
+        // (`WriteIntent::wal()`) and manifest writes
+        // (`WriteIntent::manifest()`, set by `ManifestStore`) skip the
+        // cache regardless of `cache_puts` because their access patterns
+        // do not benefit from local caching.
+        //
+        // Manifest READS go through the normal cache-aware path
+        // with `ReadIntent::foreground()`. This is why
+        // `manifest/00000000000000000002` still has one part: it is
+        // the post-fence_writers refresh read, not a manifest write.
         let expected_cache_parts =
             vec![
-            // not cached because this manifest is put before the root is resolved, which is when
-            // `cache_puts_enabled` starts taking effect.
             ("tmp/test_kv_store_with_put_cache_enabled/manifest/00000000000000000001.manifest", 0),
-            // 1 part is cached because fence_writers refreshes the manifest after writing the fence.
             ("tmp/test_kv_store_with_put_cache_enabled/manifest/00000000000000000002.manifest", 1),
-            // The startup fence WAL is zero bytes, so replay does not cache any object parts.
+            // WAL writes are tagged `Wal` and skipped; WAL reads from
+            // an empty/fence WAL also yield no cached parts.
             ("tmp/test_kv_store_with_put_cache_enabled/wal/00000000000000000001.sst", 0),
-            // 1 part is cached because the put with cache_puts enabled should cache the test_key put
-            ("tmp/test_kv_store_with_put_cache_enabled/wal/00000000000000000002.sst", 1),
+            // The `test_key` put goes into the WAL with `WriteIntent::wal()`
+            // and is no longer admitted to the cache.
+            ("tmp/test_kv_store_with_put_cache_enabled/wal/00000000000000000002.sst", 0),
         ];
 
         let (_cached_object_store, kv_store) = test_object_store_cache_helper(

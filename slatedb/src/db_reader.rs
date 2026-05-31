@@ -1,5 +1,4 @@
 use crate::bytes_range::BytesRange;
-use crate::cached_object_store::CachedObjectStore;
 use crate::clock::MonotonicClock;
 use crate::config::{CheckpointOptions, DbReaderOptions, ReadOptions, ScanOptions};
 use crate::db_cache_manager::{self, CacheTarget};
@@ -15,7 +14,6 @@ use crate::mem_table::{ImmutableMemtable, KVTable};
 use crate::merge_operator::MergeOperatorType;
 use crate::object_store_intent::ReadIntent;
 use crate::oracle::DbReaderOracle;
-use crate::paths::PathResolver;
 use crate::rand::DbRand;
 use crate::reader::{DbStateReader, Reader, ScanContext};
 use crate::sst_iter::SstIteratorOptions;
@@ -633,26 +631,6 @@ impl DbReader {
             });
         }
         Ok(())
-    }
-
-    /// Preload the disk cache from the current manifest state.
-    pub(crate) async fn preload_cache(
-        &self,
-        cached_obj_store: &CachedObjectStore,
-        path: object_store::path::Path,
-    ) -> Result<(), SlateDBError> {
-        let state = Arc::clone(&self.inner.state.read());
-        let external_ssts = state.manifest.external_ssts();
-        let path_resolver = PathResolver::new_with_external_ssts(path, external_ssts);
-        let cache_opts = &self.inner.options.object_store_cache_options;
-        crate::utils::preload_cache_from_manifest(
-            &state.manifest.core,
-            cached_obj_store,
-            &path_resolver,
-            cache_opts.preload_disk_cache_on_startup,
-            cache_opts.max_cache_size_bytes.unwrap_or(usize::MAX),
-        )
-        .await
     }
 
     /// Creates a database reader that can read the contents of a database (but cannot write any
