@@ -9,7 +9,8 @@ use log::{debug, error, warn};
 use object_store::path::Path;
 use object_store::Error::AlreadyExists;
 use object_store::{
-    Error, GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
+    Error, Extensions, GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+    UpdateVersion,
 };
 use parking_lot::Mutex;
 use std::collections::Bound;
@@ -32,6 +33,10 @@ pub struct ObjectStoreSequencedStorageProtocol<T> {
     codec: Box<dyn ObjectCodec<T>>,
     file_suffix: &'static str,
     boundary: Arc<dyn BoundaryObject>,
+    /// Cloned into the `extensions` slot on every internal `put_opts`.
+    put_extensions: Extensions,
+    /// Cloned into the `extensions` slot on every internal `get_opts`.
+    get_extensions: Extensions,
 }
 
 impl<T> ObjectStoreSequencedStorageProtocol<T> {
@@ -42,18 +47,60 @@ impl<T> ObjectStoreSequencedStorageProtocol<T> {
         file_suffix: &'static str,
         codec: Box<dyn ObjectCodec<T>>,
     ) -> Self {
-        let boundary = Arc::new(ObjectStoreBoundaryObject::new(
+        Self::new_with_extensions(
+            root_path,
+            object_store,
+            subdir,
+            file_suffix,
+            codec,
+            Extensions::default(),
+        )
+    }
+
+    pub fn new_with_extensions(
+        root_path: &Path,
+        object_store: Arc<dyn ObjectStore>,
+        subdir: &str,
+        file_suffix: &'static str,
+        codec: Box<dyn ObjectCodec<T>>,
+        extensions: Extensions,
+    ) -> Self {
+        Self::new_with_read_write_extensions(
+            root_path,
+            object_store,
+            subdir,
+            file_suffix,
+            codec,
+            extensions.clone(),
+            extensions,
+        )
+    }
+
+    pub fn new_with_read_write_extensions(
+        root_path: &Path,
+        object_store: Arc<dyn ObjectStore>,
+        subdir: &str,
+        file_suffix: &'static str,
+        codec: Box<dyn ObjectCodec<T>>,
+        put_extensions: Extensions,
+        get_extensions: Extensions,
+    ) -> Self {
+        let boundary = Arc::new(ObjectStoreBoundaryObject::new_with_read_write_extensions(
             root_path,
             object_store.clone(),
             subdir,
+            put_extensions.clone(),
+            get_extensions.clone(),
         ));
-        Self::new_with_boundary(
+        Self::new_with_boundary_and_read_write_extensions(
             root_path,
             object_store,
             subdir,
             file_suffix,
             codec,
             boundary,
+            put_extensions,
+            get_extensions,
         )
     }
 
@@ -65,6 +112,48 @@ impl<T> ObjectStoreSequencedStorageProtocol<T> {
         codec: Box<dyn ObjectCodec<T>>,
         boundary: Arc<dyn BoundaryObject>,
     ) -> Self {
+        Self::new_with_boundary_and_extensions(
+            root_path,
+            object_store,
+            subdir,
+            file_suffix,
+            codec,
+            boundary,
+            Extensions::default(),
+        )
+    }
+
+    pub fn new_with_boundary_and_extensions(
+        root_path: &Path,
+        object_store: Arc<dyn ObjectStore>,
+        subdir: &str,
+        file_suffix: &'static str,
+        codec: Box<dyn ObjectCodec<T>>,
+        boundary: Arc<dyn BoundaryObject>,
+        extensions: Extensions,
+    ) -> Self {
+        Self::new_with_boundary_and_read_write_extensions(
+            root_path,
+            object_store,
+            subdir,
+            file_suffix,
+            codec,
+            boundary,
+            extensions.clone(),
+            extensions,
+        )
+    }
+
+    pub fn new_with_boundary_and_read_write_extensions(
+        root_path: &Path,
+        object_store: Arc<dyn ObjectStore>,
+        subdir: &str,
+        file_suffix: &'static str,
+        codec: Box<dyn ObjectCodec<T>>,
+        boundary: Arc<dyn BoundaryObject>,
+        put_extensions: Extensions,
+        get_extensions: Extensions,
+    ) -> Self {
         Self {
             object_store: Box::new(::object_store::prefix::PrefixStore::new(
                 object_store,
@@ -73,11 +162,27 @@ impl<T> ObjectStoreSequencedStorageProtocol<T> {
             codec,
             file_suffix,
             boundary,
+            put_extensions,
+            get_extensions,
         }
     }
 
     fn path_for(&self, id: MonotonicId) -> Path {
         Path::from(format!("{:020}.{}", id.id(), self.file_suffix))
+    }
+
+    fn put_options(&self, mode: PutMode) -> PutOptions {
+        PutOptions {
+            extensions: self.put_extensions.clone(),
+            ..PutOptions::from(mode)
+        }
+    }
+
+    fn get_options(&self) -> GetOptions {
+        GetOptions {
+            extensions: self.get_extensions.clone(),
+            ..GetOptions::default()
+        }
     }
 
     fn parse_id(&self, path: &Path) -> Result<MonotonicId, TransactionalObjectError> {
@@ -112,10 +217,39 @@ pub struct ObjectStoreBoundaryObject {
     /// Caches the last observed boundary and object-store version metadata for
     /// conditional reads.
     cache: Mutex<Option<(MonotonicId, UpdateVersion)>>,
+    /// Cloned into the `extensions` slot on every internal `put_opts`.
+    put_extensions: Extensions,
+    /// Cloned into the `extensions` slot on every internal `get_opts`.
+    get_extensions: Extensions,
 }
 
 impl ObjectStoreBoundaryObject {
     pub fn new(root_path: &Path, object_store: Arc<dyn ObjectStore>, name: &str) -> Self {
+        Self::new_with_extensions(root_path, object_store, name, Extensions::default())
+    }
+
+    pub fn new_with_extensions(
+        root_path: &Path,
+        object_store: Arc<dyn ObjectStore>,
+        name: &str,
+        extensions: Extensions,
+    ) -> Self {
+        Self::new_with_read_write_extensions(
+            root_path,
+            object_store,
+            name,
+            extensions.clone(),
+            extensions,
+        )
+    }
+
+    pub fn new_with_read_write_extensions(
+        root_path: &Path,
+        object_store: Arc<dyn ObjectStore>,
+        name: &str,
+        put_extensions: Extensions,
+        get_extensions: Extensions,
+    ) -> Self {
         Self {
             object_store: Box::new(::object_store::prefix::PrefixStore::new(
                 object_store,
@@ -123,6 +257,23 @@ impl ObjectStoreBoundaryObject {
             )),
             filepath: Path::from(format!("{name}.boundary")),
             cache: Mutex::new(None),
+            put_extensions,
+            get_extensions,
+        }
+    }
+
+    fn put_options(&self, mode: PutMode) -> PutOptions {
+        PutOptions {
+            extensions: self.put_extensions.clone(),
+            ..PutOptions::from(mode)
+        }
+    }
+
+    fn get_options_with_etag(&self, if_none_match: Option<String>) -> GetOptions {
+        GetOptions {
+            if_none_match,
+            extensions: self.get_extensions.clone(),
+            ..GetOptions::default()
         }
     }
 
@@ -160,12 +311,11 @@ impl ObjectStoreBoundaryObject {
         &self,
     ) -> Result<(MonotonicId, Option<UpdateVersion>), TransactionalObjectError> {
         let cached = self.cache.lock().clone();
-        let opts = GetOptions {
-            if_none_match: cached
+        let opts = self.get_options_with_etag(
+            cached
                 .as_ref()
                 .and_then(|(_, version)| version.e_tag.clone()),
-            ..GetOptions::default()
-        };
+        );
 
         match self.object_store.get_opts(&self.filepath, opts).await {
             Ok(result) => {
@@ -269,7 +419,7 @@ impl BoundaryObject for ObjectStoreBoundaryObject {
                         .put_opts(
                             &self.filepath,
                             PutPayload::from(boundary.id().to_string()),
-                            PutOptions::from(PutMode::Update(version)),
+                            self.put_options(PutMode::Update(version)),
                         )
                         .await
                 }
@@ -278,7 +428,7 @@ impl BoundaryObject for ObjectStoreBoundaryObject {
                         .put_opts(
                             &self.filepath,
                             PutPayload::from(boundary.id().to_string()),
-                            PutOptions::from(PutMode::Create),
+                            self.put_options(PutMode::Create),
                         )
                         .await
                 }
@@ -326,7 +476,7 @@ impl<T: Send + Sync> SequencedStorageProtocol<T> for ObjectStoreSequencedStorage
             .put_opts(
                 &path,
                 PutPayload::from_bytes(self.codec.encode(new_value)),
-                PutOptions::from(PutMode::Create),
+                self.put_options(PutMode::Create),
             )
             .await
             .map_err(|err| {
@@ -373,7 +523,7 @@ impl<T: Send + Sync> SequencedStorageProtocol<T> for ObjectStoreSequencedStorage
         id: MonotonicId,
     ) -> Result<Option<T>, TransactionalObjectError> {
         let path = self.path_for(id);
-        match self.object_store.get(&path).await {
+        match self.object_store.get_opts(&path, self.get_options()).await {
             Ok(obj) => match obj.bytes().await {
                 Ok(bytes) => self.codec.decode(&bytes).map(Some).map_err(CallbackError),
                 Err(e) => Err(TransactionalObjectError::from(e)),
@@ -445,9 +595,9 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::{
-        CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload,
-        ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload,
-        PutResult, Result as ObjectStoreResult, UpdateVersion,
+        CopyOptions, Error as ObjectStoreError, Extensions, GetOptions, GetResult, ListResult,
+        MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions,
+        PutPayload, PutResult, Result as ObjectStoreResult, UpdateVersion,
     };
     use std::collections::Bound::{Excluded, Included, Unbounded};
     use std::fmt;
@@ -917,6 +1067,8 @@ mod tests {
                 flaky_store.clone(),
                 "test",
             )),
+            put_extensions: Extensions::default(),
+            get_extensions: Extensions::default(),
         };
 
         let latest = store.try_read_latest().await.unwrap().unwrap();
@@ -925,6 +1077,240 @@ mod tests {
         assert!(
             flaky_store.list_calls.load(Ordering::SeqCst) >= 2,
             "expected try_read_latest to retry after a missing read"
+        );
+    }
+
+    /// Wraps an inner `ObjectStore` and records, per put_opts/get_opts
+    /// call, whether the seen `Extensions` carried a typed marker. Used
+    /// to verify that `ObjectStoreSequencedStorageProtocol::new_with_extensions`
+    /// actually threads the caller's extensions to every internal call.
+    struct ExtensionsRecorderStore {
+        inner: Arc<dyn ObjectStore>,
+        put_marker_count: AtomicUsize,
+        get_marker_count: AtomicUsize,
+        write_marker_on_put_count: AtomicUsize,
+        write_marker_on_get_count: AtomicUsize,
+        read_marker_on_put_count: AtomicUsize,
+        read_marker_on_get_count: AtomicUsize,
+    }
+
+    /// A typed marker we can stuff into `Extensions` from the test
+    /// and look for on the wrapper side.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct TestMarker(u32);
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct WriteOnlyMarker;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct ReadOnlyMarker;
+
+    impl ExtensionsRecorderStore {
+        fn new(inner: Arc<dyn ObjectStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                put_marker_count: AtomicUsize::new(0),
+                get_marker_count: AtomicUsize::new(0),
+                write_marker_on_put_count: AtomicUsize::new(0),
+                write_marker_on_get_count: AtomicUsize::new(0),
+                read_marker_on_put_count: AtomicUsize::new(0),
+                read_marker_on_get_count: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl fmt::Display for ExtensionsRecorderStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "ExtensionsRecorderStore({})", self.inner)
+        }
+    }
+
+    impl fmt::Debug for ExtensionsRecorderStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("ExtensionsRecorderStore").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ExtensionsRecorderStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            if opts.extensions.get::<TestMarker>().is_some() {
+                self.put_marker_count.fetch_add(1, Ordering::SeqCst);
+            }
+            if opts.extensions.get::<WriteOnlyMarker>().is_some() {
+                self.write_marker_on_put_count
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            if opts.extensions.get::<ReadOnlyMarker>().is_some() {
+                self.read_marker_on_put_count.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            if options.extensions.get::<TestMarker>().is_some() {
+                self.get_marker_count.fetch_add(1, Ordering::SeqCst);
+            }
+            if options.extensions.get::<WriteOnlyMarker>().is_some() {
+                self.write_marker_on_get_count
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            if options.extensions.get::<ReadOnlyMarker>().is_some() {
+                self.read_marker_on_get_count.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Verifies that the `Extensions` passed at construction reach the
+    /// underlying `ObjectStore` on every internal call: protocol writes
+    /// (`write_unchecked`), protocol reads (`try_read_unchecked`), and
+    /// boundary writes (`advance`). This is the cross-crate contract
+    /// SlateDB depends on for tagging manifest and compactions writes.
+    #[tokio::test]
+    async fn test_extensions_flow_through_protocol_and_boundary() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let recorder = ExtensionsRecorderStore::new(inner);
+        let store_arc = Arc::clone(&recorder) as Arc<dyn ObjectStore>;
+
+        let mut extensions = Extensions::default();
+        extensions.insert(TestMarker(42));
+        let store = ObjectStoreSequencedStorageProtocol::<TestVal>::new_with_extensions(
+            &Path::from("/root"),
+            store_arc,
+            "test",
+            "val",
+            Box::new(TestValCodec),
+            extensions,
+        );
+
+        // Protocol write -> put_opts with extensions.
+        let id = store
+            .write(
+                None,
+                &TestVal {
+                    epoch: 0,
+                    payload: 7,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Protocol read by id -> get_opts with extensions.
+        let _ = store.try_read_unchecked(id).await.unwrap();
+
+        // Boundary advance -> put_opts to gc/test.boundary, with
+        // extensions. Also triggers a boundary read on conflict
+        // resolution but only via the same recorder.
+        store.advance(id).await.unwrap();
+
+        assert!(
+            recorder.put_marker_count.load(Ordering::SeqCst) >= 2,
+            "expected at least 2 put_opts calls carrying the marker \
+             (one for write_unchecked, one for boundary advance), got {}",
+            recorder.put_marker_count.load(Ordering::SeqCst)
+        );
+        assert!(
+            recorder.get_marker_count.load(Ordering::SeqCst) >= 1,
+            "expected at least 1 get_opts call carrying the marker \
+             (from try_read_unchecked), got {}",
+            recorder.get_marker_count.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_write_extensions_are_separated() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let recorder = ExtensionsRecorderStore::new(inner);
+        let store_arc = Arc::clone(&recorder) as Arc<dyn ObjectStore>;
+
+        let mut write_extensions = Extensions::default();
+        write_extensions.insert(WriteOnlyMarker);
+        let mut read_extensions = Extensions::default();
+        read_extensions.insert(ReadOnlyMarker);
+
+        let store = ObjectStoreSequencedStorageProtocol::<TestVal>::new_with_read_write_extensions(
+            &Path::from("/root"),
+            store_arc,
+            "test",
+            "val",
+            Box::new(TestValCodec),
+            write_extensions,
+            read_extensions,
+        );
+
+        let id = store
+            .write(
+                None,
+                &TestVal {
+                    epoch: 0,
+                    payload: 7,
+                },
+            )
+            .await
+            .unwrap();
+        let _ = store.try_read_unchecked(id).await.unwrap();
+        store.advance(id).await.unwrap();
+
+        assert!(
+            recorder.write_marker_on_put_count.load(Ordering::SeqCst) >= 2,
+            "expected write marker on version and boundary puts"
+        );
+        assert_eq!(
+            recorder.write_marker_on_get_count.load(Ordering::SeqCst),
+            0,
+            "write marker must not appear on get_opts"
+        );
+        assert!(
+            recorder.read_marker_on_get_count.load(Ordering::SeqCst) >= 1,
+            "expected read marker on get_opts"
+        );
+        assert_eq!(
+            recorder.read_marker_on_put_count.load(Ordering::SeqCst),
+            0,
+            "read marker must not appear on put_opts"
         );
     }
 }
