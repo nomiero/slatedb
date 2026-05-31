@@ -16,7 +16,6 @@ pub(crate) trait StoreProvider: Send + Sync {
 pub(crate) struct DefaultStoreProvider {
     pub(crate) path: Path,
     pub(crate) object_store: Arc<dyn ObjectStore>,
-    pub(crate) manifest_object_store: Arc<dyn ObjectStore>,
     pub(crate) wal_object_store: Option<Arc<dyn ObjectStore>>,
     pub(crate) block_cache: Option<Arc<dyn DbCache>>,
     pub(crate) block_transformer: Option<Arc<dyn BlockTransformer>>,
@@ -44,7 +43,7 @@ impl StoreProvider for DefaultStoreProvider {
     fn manifest_store(&self) -> Arc<ManifestStore> {
         Arc::new(ManifestStore::new(
             &self.path,
-            Arc::clone(&self.manifest_object_store),
+            Arc::clone(&self.object_store),
         ))
     }
 }
