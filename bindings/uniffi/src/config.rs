@@ -187,7 +187,6 @@ impl From<ReaderOptions> for slatedb::config::DbReaderOptions {
             checkpoint_lifetime: Duration::from_millis(value.checkpoint_lifetime_ms),
             max_memtable_bytes: value.max_memtable_bytes,
             skip_wal_replay: value.skip_wal_replay,
-            ..Default::default()
         }
     }
 }

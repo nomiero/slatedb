@@ -117,7 +117,6 @@ use tokio::runtime::Handle;
 use crate::admin::Admin;
 use crate::batch_write::WriteBatchEventHandler;
 use crate::batch_write::WRITE_BATCH_TASK_NAME;
-use crate::cached_object_store::CachedObjectStore;
 use crate::clone::{SegmentFilterFn, SegmentProjectionFn};
 #[cfg(feature = "compaction_filters")]
 use crate::compaction_filter::CompactionFilterSupplier;
@@ -420,30 +419,13 @@ impl<P: Into<Path>> DbBuilder<P> {
             .unwrap_or_else(|| Arc::new(DefaultSystemClock::new()));
 
         let recorder = MetricsRecorderHelper::new(self.metrics_recorder, MetricLevel::default());
-        // Layering, innermost to outermost:
-        //   1. The user, passed store.
-        //   2. CachedObjectStore from object_store_cache_options.root_folder
-        //      if that convenience config is set. (This convenience is removed
-        //      in a follow, up commit when ObjectStoreCacheOptions moves out
-        //      of Settings.)
-        //   3. InstrumentedObjectStore + RetryingObjectStore.
-        // The intent protocol on each call lets the cache wrapper (if
-        // present) route, admit, or bypass per its own policy.
-        let user_main_store = self.main_object_store.clone();
-        let cached_main = CachedObjectStore::from_config(
-            user_main_store.clone(),
-            &self.settings.object_store_cache_options,
-            &recorder,
-            system_clock.clone(),
-            rand.clone(),
-        )
-        .await?;
-        let main_inner: Arc<dyn ObjectStore> = match cached_main {
-            Some(cached) => cached,
-            None => user_main_store,
-        };
+        // The user, supplied store is wrapped with instrumentation and
+        // retry on the outside. The user is responsible for any caching
+        // (e.g. by passing a CachedObjectStore or a custom intent, aware
+        // wrapper). The intent protocol on each call lets that wrapper
+        // route, admit, or bypass per its own policy.
         let main_object_store = instrumented_retrying_object_store(
-            main_inner,
+            self.main_object_store,
             &recorder,
             ObjectStoreComponent::Db,
             ObjectStoreType::Main,
@@ -1370,22 +1352,12 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         // TODO: proper URI generation, for now it works just as a flag
         let wal_object_store_uri = self.wal_object_store.as_ref().map(|_| String::new());
 
-        // Layering, innermost to outermost (same as DbBuilder):
-        let user_object_store = self.object_store.clone();
-        let cached_main = CachedObjectStore::from_config(
-            user_object_store.clone(),
-            &self.options.object_store_cache_options,
-            &self.recorder,
-            self.system_clock.clone(),
-            self.rand.clone(),
-        )
-        .await?;
-        let main_inner: Arc<dyn ObjectStore> = match cached_main {
-            Some(cached) => cached,
-            None => user_object_store,
-        };
+        // The user, supplied store is wrapped with instrumentation and
+        // retry on the outside. The user is responsible for any caching
+        // (e.g. by passing a CachedObjectStore or a custom intent, aware
+        // wrapper).
         let main_object_store = instrumented_retrying_object_store(
-            main_inner,
+            self.object_store,
             &self.recorder,
             ObjectStoreComponent::Reader,
             ObjectStoreType::Main,

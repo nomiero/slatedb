@@ -2471,6 +2471,8 @@ mod tests {
 
     #[tokio::test]
     async fn should_populate_disk_cache_on_read() {
+        use crate::cached_object_store::CachedObjectStore;
+
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_db_reader_disk_cache");
 
@@ -2484,20 +2486,25 @@ mod tests {
         db.flush().await.unwrap();
         db.close().await.unwrap();
 
-        // Open a DbReader with disk caching enabled
+        // Open a DbReader with disk caching enabled by constructing the
+        // CachedObjectStore explicitly and handing it to the reader.
         let cache_dir = tempfile::Builder::new()
             .prefix("dbreader_cache_test_")
             .tempdir()
             .unwrap();
         let cache_path = cache_dir.keep();
 
-        let mut reader_opts = DbReaderOptions::default();
-        reader_opts.object_store_cache_options.root_folder = Some(cache_path.clone());
-        reader_opts.object_store_cache_options.part_size_bytes = 1024;
-
-        let reader = DbReader::open(path.clone(), Arc::clone(&object_store), None, reader_opts)
+        let cached_store = CachedObjectStore::builder(Arc::clone(&object_store))
+            .root_folder(cache_path.clone())
+            .part_size_bytes(1024)
+            .build()
             .await
             .unwrap();
+
+        let reader =
+            DbReader::open(path.clone(), cached_store, None, DbReaderOptions::default())
+                .await
+                .unwrap();
 
         // Read data to populate the cache
         let val = reader.get(b"key1").await.unwrap();

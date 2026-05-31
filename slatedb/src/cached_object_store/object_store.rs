@@ -1,7 +1,7 @@
 use crate::cached_object_store::stats::CachedObjectStoreStats;
 use crate::cached_object_store::storage_fs::FsCacheStorage;
 use crate::cached_object_store::LocalCacheEntry;
-use crate::config::ObjectStoreCacheOptions;
+use crate::cached_object_store::options::ObjectStoreCacheOptions;
 use crate::rand::DbRand;
 use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, stream, stream::BoxStream, StreamExt};
@@ -26,7 +26,7 @@ use log::warn;
 use slatedb_common::metrics::MetricsRecorderHelper;
 
 #[derive(Debug, Clone)]
-pub(crate) struct CachedObjectStore {
+pub struct CachedObjectStore {
     object_store: Arc<dyn ObjectStore>,
     pub(crate) part_size_bytes: usize, // expected to be aligned with mb or kb
     pub(crate) cache_storage: Arc<dyn LocalCacheStorage>,
@@ -72,6 +72,23 @@ impl CachedObjectStore {
 
     pub(crate) async fn start_evictor(&self) {
         self.cache_storage.start_evictor().await;
+    }
+
+    /// Start building a `CachedObjectStore` over `object_store`. The
+    /// returned [`CachedObjectStoreBuilder`] requires `.root_folder(..)`
+    /// before `.build()`; everything else has a sensible default.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let cache = CachedObjectStore::builder(backend)
+    ///     .root_folder("/var/cache/slatedb")
+    ///     .build()
+    ///     .await?;
+    /// let db = Db::builder(path, cache).build().await?;
+    /// ```
+    pub fn builder(object_store: Arc<dyn ObjectStore>) -> CachedObjectStoreBuilder {
+        CachedObjectStoreBuilder::new(object_store)
     }
 
     /// Build a `CachedObjectStore` from `ObjectStoreCacheOptions`, returning `None`
@@ -648,6 +665,136 @@ impl CachedObjectStore {
         Range {
             start: start_aligned,
             end: end_aligned,
+        }
+    }
+}
+
+/// Builder for [`CachedObjectStore`]. Returned by
+/// [`CachedObjectStore::builder`]. `root_folder` is required;
+/// everything else has a sensible default. Internal SlateDB types
+/// (metrics recorder, system clock, RNG) default to
+/// `MetricsRecorderHelper::noop()`, a real wall-clock, and a fresh
+/// `DbRand` respectively; callers only need to override them for
+/// tests or to share state with the rest of a SlateDB instance.
+pub struct CachedObjectStoreBuilder {
+    object_store: Arc<dyn ObjectStore>,
+    options: ObjectStoreCacheOptions,
+    recorder: Option<MetricsRecorderHelper>,
+    clock: Option<Arc<dyn SystemClock>>,
+    rand: Option<Arc<DbRand>>,
+}
+
+impl CachedObjectStoreBuilder {
+    fn new(object_store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            object_store,
+            options: ObjectStoreCacheOptions::default(),
+            recorder: None,
+            clock: None,
+            rand: None,
+        }
+    }
+
+    /// Required. Root directory under which part files are written.
+    pub fn root_folder(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.options.root_folder = Some(path.into());
+        self
+    }
+
+    /// Whether to write through PUTs to the local cache. Default `false`
+    /// (cache populates on read miss only).
+    pub fn cache_puts(mut self, enabled: bool) -> Self {
+        self.options.cache_puts = enabled;
+        self
+    }
+
+    /// Size of each on, disk part file. Must be a multiple of 1 KB.
+    /// Default 4 MB.
+    pub fn part_size_bytes(mut self, bytes: usize) -> Self {
+        self.options.part_size_bytes = bytes;
+        self
+    }
+
+    /// Hard cap on local cache size, in bytes. Default 16 GB on 64, bit
+    /// systems, 4 GB on 32, bit systems.
+    pub fn max_cache_size_bytes(mut self, bytes: usize) -> Self {
+        self.options.max_cache_size_bytes = Some(bytes);
+        self
+    }
+
+    /// How often the evictor scans the cache directory to rebuild its
+    /// in, memory map. `None` scans once at startup only. Default
+    /// `Some(1 hour)`.
+    pub fn scan_interval(mut self, interval: Option<std::time::Duration>) -> Self {
+        self.options.scan_interval = interval;
+        self
+    }
+
+    /// Maximum open file handles for cache parts. Default 1000.
+    pub fn max_open_file_handles(mut self, n: usize) -> Self {
+        self.options.max_open_file_handles = n;
+        self
+    }
+
+    /// Replace the full options struct in one go. Convenient when the
+    /// caller already has an `ObjectStoreCacheOptions` (for example,
+    /// parsed from external config). Setter methods called after this
+    /// override individual fields.
+    pub fn options(mut self, options: ObjectStoreCacheOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Override the metrics recorder. Defaults to
+    /// `MetricsRecorderHelper::noop()`. Override only if you want the
+    /// cache's stats to feed a specific recorder (e.g. the same one
+    /// passed to `Db::builder`).
+    pub fn metrics_recorder(mut self, recorder: MetricsRecorderHelper) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
+    /// Override the system clock. Defaults to `DefaultSystemClock`.
+    /// Tests use this to plug in a mock clock.
+    pub fn system_clock(mut self, clock: Arc<dyn SystemClock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Override the random number generator. Defaults to
+    /// `DbRand::default()`. Tests use this for deterministic seeding.
+    pub fn rand(mut self, rand: Arc<DbRand>) -> Self {
+        self.rand = Some(rand);
+        self
+    }
+
+    /// Construct the [`CachedObjectStore`]. Errors if `root_folder` is
+    /// not set, or if the part size is invalid.
+    pub async fn build(self) -> Result<Arc<CachedObjectStore>, crate::Error> {
+        if self.options.root_folder.is_none() {
+            return Err(crate::Error::invalid(
+                "CachedObjectStore::builder() requires root_folder".to_string(),
+            ));
+        }
+        let recorder = self.recorder.unwrap_or_else(MetricsRecorderHelper::noop);
+        let clock = self
+            .clock
+            .unwrap_or_else(|| Arc::new(slatedb_common::clock::DefaultSystemClock::new()));
+        let rand = self.rand.unwrap_or_else(|| Arc::new(DbRand::default()));
+        match CachedObjectStore::from_config(
+            self.object_store,
+            &self.options,
+            &recorder,
+            clock,
+            rand,
+        )
+        .await
+        .map_err(crate::Error::from)?
+        {
+            Some(cache) => Ok(cache),
+            None => Err(crate::Error::invalid(
+                "CachedObjectStore::builder() requires root_folder".to_string(),
+            )),
         }
     }
 }
