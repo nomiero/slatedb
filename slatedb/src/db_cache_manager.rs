@@ -10,6 +10,7 @@ use crate::db_state::{SsTableHandle, SsTableId};
 use crate::error::SlateDBError;
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::manifest::VersionedManifest;
+use crate::object_store_intent::ReadIntent;
 use crate::partitioned_keyspace::partitions_covering_range;
 use crate::tablestore::TableStore;
 
@@ -164,7 +165,13 @@ async fn warm_data(
             continue;
         }
         table_store
-            .read_blocks_using_index(handle, index.clone(), block_range, true)
+            .read_blocks_using_index(
+                handle,
+                index.clone(),
+                block_range,
+                true,
+                ReadIntent::warmup(),
+            )
             .await?;
     }
     Ok(())
@@ -188,7 +195,9 @@ async fn warm_filters(
     if handle.info.filter_len == 0 {
         return Ok(());
     }
-    table_store.read_filters(handle, true).await?;
+    table_store
+        .read_filters(handle, true, ReadIntent::warmup())
+        .await?;
     Ok(())
 }
 
@@ -201,7 +210,9 @@ async fn warm_stats(
     if handle.info.stats_len == 0 {
         return Ok(());
     }
-    table_store.read_stats(handle, true).await?;
+    table_store
+        .read_stats(handle, true, ReadIntent::warmup())
+        .await?;
     Ok(())
 }
 
@@ -211,7 +222,11 @@ async fn ensure_index(
     index_cell: &OnceCell<Result<Arc<SsTableIndexOwned>, SlateDBError>>,
 ) -> Result<Arc<SsTableIndexOwned>, SlateDBError> {
     let result: &Result<Arc<SsTableIndexOwned>, SlateDBError> = index_cell
-        .get_or_init(|| async { table_store.read_index(handle, true).await })
+        .get_or_init(|| async {
+            table_store
+                .read_index(handle, true, ReadIntent::warmup())
+                .await
+        })
         .await;
     match result {
         Ok(index) => Ok(index.clone()),
@@ -252,7 +267,7 @@ mod tests {
     async fn cached_block_mask(table_store: &Arc<TableStore>, sst_id: SsTableId) -> Vec<bool> {
         let handle = table_store.open_sst(&sst_id).await.expect("open_sst");
         let index = table_store
-            .read_index(&handle, false)
+            .read_index(&handle, false, ReadIntent::foreground())
             .await
             .expect("read_index");
         let cache = table_store.cache().expect("cache configured").clone();
@@ -269,7 +284,7 @@ mod tests {
     async fn is_key_cached(table_store: &Arc<TableStore>, sst_id: SsTableId, key: &[u8]) -> bool {
         let handle = table_store.open_sst(&sst_id).await.expect("open_sst");
         let index = table_store
-            .read_index(&handle, false)
+            .read_index(&handle, false, ReadIntent::foreground())
             .await
             .expect("read_index");
         let block_idx =

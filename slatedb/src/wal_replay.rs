@@ -281,6 +281,7 @@ mod tests {
     use crate::iter::{IterationOrder, RowEntryIterator};
     use crate::manifest::ManifestCore;
     use crate::mem_table::WritableKVTable;
+    use crate::object_store_intent::WriteIntent;
     use crate::object_stores::ObjectStores;
     use crate::proptest_util::{rng, sample};
     use crate::tablestore::TableStore;
@@ -368,7 +369,12 @@ mod tests {
         builder.add(row.clone()).await.unwrap();
         let encoded_sst = builder.build().await.unwrap();
         table_store
-            .write_sst(&SsTableId::Wal(2), &encoded_sst, false)
+            .write_sst(
+                &SsTableId::Wal(2),
+                &encoded_sst,
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
 
@@ -500,7 +506,12 @@ mod tests {
             }
             let encoded_sst = builder.build().await.unwrap();
             table_store
-                .write_sst(&SsTableId::Wal(wal_id as u64 + 1), &encoded_sst, false)
+                .write_sst(
+                    &SsTableId::Wal(wal_id as u64 + 1),
+                    &encoded_sst,
+                    false,
+                    WriteIntent::flush(),
+                )
                 .await
                 .unwrap();
         }
@@ -567,7 +578,12 @@ mod tests {
         }
         let encoded_sst = builder.build().await.unwrap();
         table_store
-            .write_sst(&SsTableId::Wal(1), &encoded_sst, false)
+            .write_sst(
+                &SsTableId::Wal(1),
+                &encoded_sst,
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
 
@@ -626,7 +642,12 @@ mod tests {
         }
         let encoded_sst = builder.build().await.unwrap();
         table_store
-            .write_sst(&SsTableId::Wal(1), &encoded_sst, false)
+            .write_sst(
+                &SsTableId::Wal(1),
+                &encoded_sst,
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
 
@@ -818,7 +839,7 @@ mod tests {
         max_entries: usize,
         table_store: Arc<TableStore>,
     ) -> Result<u64, SlateDBError> {
-        let mut writer = table_store.table_writer(SsTableId::Wal(wal_id));
+        let mut writer = table_store.table_writer(SsTableId::Wal(wal_id), WriteIntent::flush());
         let mut next_seq = next_seq;
         while next_seq < next_seq + (max_entries as u64) {
             let Some((key, value)) = entries.next() else {

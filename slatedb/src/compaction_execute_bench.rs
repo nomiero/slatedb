@@ -27,6 +27,7 @@ use crate::db_state::{SsTableHandle, SsTableId, SsTableView};
 use crate::error::SlateDBError;
 use crate::format::sst::SsTableFormat;
 use crate::manifest::store::{ManifestStore, StoredManifest};
+use crate::object_store_intent::WriteIntent;
 use crate::object_stores::ObjectStores;
 use crate::rand::DbRand;
 use crate::tablestore::TableStore;
@@ -167,7 +168,10 @@ impl CompactionExecuteBench {
         suffix.put_u32(i);
         let mut key_gen =
             OrderedBytesGenerator::new_with_suffix(suffix.as_ref(), key_start.as_slice());
-        let mut sst_writer = table_store.table_writer(CompactionExecuteBench::sst_id(i));
+        let mut sst_writer = table_store.table_writer(
+            CompactionExecuteBench::sst_id(i),
+            WriteIntent::compaction_output(),
+        );
         for _ in 0..num_keys {
             let mut val = vec![0u8; val_bytes];
             rand.rng().fill_bytes(val.as_mut_slice());

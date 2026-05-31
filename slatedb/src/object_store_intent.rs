@@ -1,4 +1,4 @@
-//! Intent protocol for object store calls (RFC 0026, PR #1653).
+//! Intent protocol for object store calls (RFC 0027, PR #1653).
 //!
 //! Two pieces:
 //!
@@ -237,8 +237,8 @@ pub mod testing {
         pub write_intent: Option<WriteIntent>,
     }
 
-    /// Wraps an inner `ObjectStore` and records the method name + path
-    /// + extracted intent (if any) for every call. The MultipartUpload
+    /// Wraps an inner `ObjectStore` and records the method name, path,
+    /// and extracted intent (if any) for every call. The MultipartUpload
     /// returned by `put_multipart_opts` is also wrapped so that
     /// `put_part` and `complete` are recorded, with no intent (the
     /// intent only attaches to the init call).
@@ -667,7 +667,7 @@ mod tests {
     /// paths in its stream. There is no Extensions slot to populate.
     /// The wrapper receives the delete with no intent attached.
     ///
-    /// For RFC 0026, this is not a problem: the cache wrapper only needs
+    /// For RFC 0027, this is not a problem: the cache wrapper only needs
     /// to know that a delete happened so it can evict its local copy.
     /// No semantic intent is needed.
     #[tokio::test]
@@ -875,6 +875,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn metadata_store_reads_carry_read_intent_not_write_intent() {
+        let (store, log) = make_recorder();
+        let manifest_store = Arc::new(crate::manifest::store::ManifestStore::new(
+            &Path::from("tmp/test_metadata_intents"),
+            store,
+        ));
+        crate::manifest::store::StoredManifest::create_new_db(
+            Arc::clone(&manifest_store),
+            crate::manifest::ManifestCore::new(),
+            Arc::new(slatedb_common::clock::DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+
+        log.lock().unwrap().clear();
+        let _ = crate::manifest::store::StoredManifest::load(
+            manifest_store,
+            Arc::new(slatedb_common::clock::DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+
+        let get_calls: Vec<_> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.method.starts_with("get_opts"))
+            .cloned()
+            .collect();
+        assert!(
+            get_calls
+                .iter()
+                .any(|c| c.read_intent == Some(ReadIntent::foreground())),
+            "expected metadata GETs to carry a read intent, saw {:?}",
+            get_calls
+        );
+        assert!(
+            get_calls.iter().all(|c| c.write_intent.is_none()),
+            "metadata GETs must not carry WriteIntent::manifest(), saw {:?}",
+            get_calls
+        );
+    }
+
     /// Forcing a memtable flush writes an L0 SST through `BufWriter`.
     /// Whether that put carries `WriteIntent::flush()` depends on which
     /// `BufWriter` branch it lands on:
@@ -943,13 +987,11 @@ mod tests {
         // Find the L0 SST in the inner store, overwrite with garbage so
         // any subsequent decode fails CRC.
         let mut listing = inner.list(Some(&ObjPath::from("tmp/test_e2e_retry/compacted/")));
-        let mut sst_path: Option<ObjPath> = None;
-        while let Some(meta) = listing.next().await {
-            let m = meta.unwrap();
-            sst_path = Some(m.location);
-            break;
-        }
-        let sst_path = sst_path.expect("expected at least one L0 SST");
+        let sst_path = listing
+            .next()
+            .await
+            .map(|m| m.unwrap().location)
+            .expect("expected at least one L0 SST");
         inner
             .put(&sst_path, PutPayload::from(vec![0xFFu8; 4096]))
             .await

@@ -8,6 +8,7 @@ use crate::error::SlateDBError;
 use crate::format::sst::{SST_FORMAT_VERSION, SST_FORMAT_VERSION_V2};
 use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::manifest::ManifestCore;
+use crate::object_store_intent::ReadIntent;
 use crate::paths::PathResolver;
 use crate::tablestore::TableStore;
 use bytes::{Buf, BufMut, Bytes};
@@ -145,14 +146,22 @@ pub(crate) async fn last_written_key_and_seq(
     table_store: Arc<TableStore>,
     output_sst: &SsTableHandle,
 ) -> Result<Option<(Bytes, u64)>, SlateDBError> {
-    let index = table_store.read_index(output_sst, false).await?;
+    let index = table_store
+        .read_index(output_sst, false, ReadIntent::foreground())
+        .await?;
     let num_blocks = index.borrow().block_meta().len();
     if num_blocks == 0 {
         return Ok(None);
     }
     let last_block_idx = num_blocks - 1;
     let mut blocks = table_store
-        .read_blocks_using_index(output_sst, index, last_block_idx..last_block_idx + 1, false)
+        .read_blocks_using_index(
+            output_sst,
+            index,
+            last_block_idx..last_block_idx + 1,
+            false,
+            ReadIntent::foreground(),
+        )
         .await?;
     let Some(block) = blocks.pop_front() else {
         return Ok(None);
@@ -788,6 +797,7 @@ impl<T> Clone for SafeSender<T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::object_store_intent::WriteIntent;
     use rstest::rstest;
     use slatedb_common::MockSystemClock;
 
@@ -1109,7 +1119,12 @@ mod tests {
             .unwrap();
         let encoded_sst = sst_builder.build().await.unwrap();
         let _sst1 = table_store
-            .write_sst(&SsTableId::Compacted(Ulid::new()), &encoded_sst, false)
+            .write_sst(
+                &SsTableId::Compacted(Ulid::new()),
+                &encoded_sst,
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
 
@@ -1124,7 +1139,12 @@ mod tests {
             .unwrap();
         let encoded_sst = sst_builder.build().await.unwrap();
         let sst2 = table_store
-            .write_sst(&SsTableId::Compacted(Ulid::new()), &encoded_sst, false)
+            .write_sst(
+                &SsTableId::Compacted(Ulid::new()),
+                &encoded_sst,
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
 
@@ -1162,7 +1182,12 @@ mod tests {
             .unwrap();
         let encoded_sst = sst_builder.build().await.unwrap();
         let sst = table_store
-            .write_sst(&SsTableId::Compacted(Ulid::new()), &encoded_sst, false)
+            .write_sst(
+                &SsTableId::Compacted(Ulid::new()),
+                &encoded_sst,
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
 

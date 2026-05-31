@@ -13,6 +13,7 @@ use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
 use crate::mem_table::{ImmutableMemtable, KVTable};
 use crate::merge_operator::MergeOperatorType;
+use crate::object_store_intent::ReadIntent;
 use crate::oracle::DbReaderOracle;
 use crate::paths::PathResolver;
 use crate::rand::DbRand;
@@ -468,6 +469,7 @@ impl DbReaderInner {
             order: IterationOrder::Ascending,
             prefix: None,
             filter_context: None,
+            read_intent: ReadIntent::foreground(),
         };
 
         let (mut replay_after_wal_id, mut last_committed_seq) =
@@ -1212,6 +1214,7 @@ mod tests {
     use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
     use crate::mem_table::{ImmutableMemtable, WritableKVTable};
     use crate::merge_operator::MergeOperatorType;
+    use crate::object_store_intent::WriteIntent;
     use crate::object_stores::ObjectStores;
     use crate::oracle::DbReaderOracle;
     use crate::paths::PathResolver;
@@ -2110,7 +2113,7 @@ mod tests {
         wal_id: u64,
         entries: Vec<RowEntry>,
     ) -> Result<(), SlateDBError> {
-        let mut writer = table_store.table_writer(SsTableId::Wal(wal_id));
+        let mut writer = table_store.table_writer(SsTableId::Wal(wal_id), WriteIntent::flush());
         for entry in entries {
             writer.add(entry).await?;
         }

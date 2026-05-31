@@ -6,6 +6,7 @@ use crate::error::SlateDBError::{
 };
 use crate::flatbuffer_types::FlatBufferManifestCodec;
 use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
+use crate::object_store_intent::{set_read_intent, set_write_intent, ReadIntent, WriteIntent};
 use chrono::Utc;
 use log::debug;
 use object_store::path::Path;
@@ -463,14 +464,24 @@ pub(crate) struct ManifestStore {
 
 impl ManifestStore {
     pub(crate) fn new(root_path: &Path, object_store: Arc<dyn ObjectStore>) -> Self {
-        let inner: Arc<dyn SequencedStorageProtocol<Manifest>> =
-            Arc::new(ObjectStoreSequencedStorageProtocol::<Manifest>::new(
+        // Manifest writes are metadata writes; manifest reads are normal
+        // cache-aware reads. Keep the two extension payloads separate so
+        // wrappers never see a WriteIntent on get_opts.
+        let mut write_extensions = object_store::Extensions::new();
+        set_write_intent(&mut write_extensions, WriteIntent::manifest());
+        let mut read_extensions = object_store::Extensions::new();
+        set_read_intent(&mut read_extensions, ReadIntent::foreground());
+        let inner: Arc<dyn SequencedStorageProtocol<Manifest>> = Arc::new(
+            ObjectStoreSequencedStorageProtocol::<Manifest>::new_with_read_write_extensions(
                 root_path,
                 object_store,
                 "manifest",
                 "manifest",
                 Box::new(FlatBufferManifestCodec {}),
-            ));
+                write_extensions,
+                read_extensions,
+            ),
+        );
         Self { inner }
     }
 

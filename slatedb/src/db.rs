@@ -60,6 +60,7 @@ use crate::iter::IterationOrder;
 use crate::manifest::{Manifest, VersionedManifest};
 use crate::memtable_flusher::{FlushResult, FlushTarget, MemtableFlusher};
 use crate::merge_operator::{instrument_merge_operator, MergeOperatorType};
+use crate::object_store_intent::ReadIntent;
 use crate::oracle::{DbOracle, Oracle};
 use crate::paths::PathResolver;
 use crate::prefix_extractor::PrefixExtractor;
@@ -517,6 +518,7 @@ impl DbInner {
             order: IterationOrder::Ascending,
             prefix: None,
             filter_context: None,
+            read_intent: ReadIntent::foreground(),
         };
 
         let replay_options = WalReplayOptions {
@@ -3307,7 +3309,7 @@ mod tests {
         let index = db
             .inner
             .table_store
-            .read_index(&view.sst, true)
+            .read_index(&view.sst, true, ReadIntent::foreground())
             .await
             .unwrap();
         assert!(!index.borrow().block_meta().is_empty());

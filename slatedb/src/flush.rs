@@ -6,6 +6,7 @@ use crate::format::sst::EncodedSsTable;
 use crate::iter::RowEntryIterator;
 use crate::mem_table::KVTable;
 use crate::merge_operator::{MergeOperatorIterator, MergeOperatorRequiredIterator};
+use crate::object_store_intent::WriteIntent;
 use crate::oracle::Oracle;
 use crate::reader::DbStateReader;
 use crate::retention_iterator::RetentionIterator;
@@ -152,7 +153,7 @@ impl DbInner {
     ) -> Result<SsTableHandle, SlateDBError> {
         let handle = self
             .table_store
-            .write_sst(id, encoded_sst, write_cache)
+            .write_sst(id, encoded_sst, write_cache, WriteIntent::flush())
             .await?;
 
         self.mono_clock
@@ -255,6 +256,7 @@ mod tests {
     use crate::mem_table::WritableKVTable;
     use crate::merge_operator::{MERGE_OPERATOR_FLUSH_PATH, MERGE_OPERATOR_READ_PATH};
     use crate::object_store::memory::InMemory;
+    use crate::object_store_intent::ReadIntent;
     use crate::test_utils::{
         lookup_merge_operator_operands, FixedThreeBytePrefixExtractor, StringConcatMergeOperator,
     };
@@ -292,7 +294,7 @@ mod tests {
         let index = db
             .inner
             .table_store
-            .read_index(sst_handle, true)
+            .read_index(sst_handle, true, ReadIntent::foreground())
             .await
             .unwrap();
         let block_count = index.borrow().block_meta().len();

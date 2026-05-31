@@ -8,6 +8,7 @@ use crate::iter::RowEntryIterator;
 use crate::manifest::{ManifestCore, Segment};
 use crate::mem_table::{ImmutableMemtable, KVTable};
 use crate::merge_operator::{instrument_merge_operator, MergeOperatorType};
+use crate::object_store_intent::ReadIntent;
 use crate::oracle::Oracle;
 use crate::segment_iterator::{build_segment_iter, SegmentScanContext};
 use crate::sorted_run_iterator::SortedRunIterator;
@@ -295,6 +296,7 @@ impl Reader {
             order: options.order,
             prefix: ctx.prefix,
             filter_context: options.filter_context.clone(),
+            read_intent: ReadIntent::foreground(),
         };
 
         let IteratorSources {
@@ -361,6 +363,7 @@ impl Reader {
             order: options.order,
             prefix: Some(prefix),
             filter_context: options.filter_context.clone(),
+            read_intent: ReadIntent::foreground(),
         };
 
         // Cross-segment recency is not well-defined: walking segment A's
@@ -440,6 +443,7 @@ mod tests {
     use crate::merge_operator::{
         MergeOperator, MergeOperatorError, MERGE_OPERATOR_FLUSH_PATH, MERGE_OPERATOR_READ_PATH,
     };
+    use crate::object_store_intent::WriteIntent;
     use crate::test_utils::lookup_merge_operator_operands;
     use crate::types::{RowEntry, ValueDeletable};
     use bytes::Bytes;
@@ -602,7 +606,9 @@ mod tests {
 
             let encoded = builder.build().await?;
             let id = SsTableId::Compacted(Ulid::new());
-            self.table_store.write_sst(&id, &encoded, false).await
+            self.table_store
+                .write_sst(&id, &encoded, false, WriteIntent::flush())
+                .await
         }
     }
 

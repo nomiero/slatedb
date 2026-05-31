@@ -15,6 +15,7 @@ use crate::db_stats::DbStats;
 use crate::db_status::ClosedResultWriter;
 use crate::dispatcher::{MessageFactory, MessageHandler, MessageHandlerExecutor};
 use crate::error::SlateDBError;
+use crate::object_store_intent::WriteIntent;
 use crate::oracle::{DbOracle, Oracle};
 use crate::tablestore::TableStore;
 use crate::types::RowEntry;
@@ -386,7 +387,12 @@ impl WalBufferManager {
 
         let encoded_sst = sst_builder.build().await?;
         self.table_store
-            .write_sst(&SsTableId::Wal(wal_id), &encoded_sst, false)
+            .write_sst(
+                &SsTableId::Wal(wal_id),
+                &encoded_sst,
+                false,
+                WriteIntent::wal(),
+            )
             .await?;
 
         self.mono_clock.fetch_max_last_durable_tick(last_tick);
