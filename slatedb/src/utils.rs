@@ -1,18 +1,15 @@
 use crate::block_iterator::BlockIterator;
 use crate::block_iterator_v2::BlockIteratorV2;
-use crate::cached_object_store::CachedObjectStore;
-use crate::config::PreloadLevel;
 use crate::db_state::SortedRun;
 use crate::db_state::SsTableHandle;
 use crate::error::SlateDBError;
 use crate::format::sst::{SST_FORMAT_VERSION, SST_FORMAT_VERSION_V2};
 use crate::iter::{IterationOrder, RowEntryIterator};
-use crate::manifest::ManifestCore;
-use crate::paths::PathResolver;
+use crate::object_store_intent::ReadIntent;
 use crate::tablestore::TableStore;
 use bytes::{Buf, BufMut, Bytes};
 use futures::FutureExt;
-use log::{error, warn};
+use log::error;
 use rand::{Rng, RngCore};
 use slatedb_common::clock::SystemClock;
 use std::any::Any;
@@ -145,14 +142,22 @@ pub(crate) async fn last_written_key_and_seq(
     table_store: Arc<TableStore>,
     output_sst: &SsTableHandle,
 ) -> Result<Option<(Bytes, u64)>, SlateDBError> {
-    let index = table_store.read_index(output_sst, false).await?;
+    let index = table_store
+        .read_index(output_sst, false, ReadIntent::foreground())
+        .await?;
     let num_blocks = index.borrow().block_meta().len();
     if num_blocks == 0 {
         return Ok(None);
     }
     let last_block_idx = num_blocks - 1;
     let mut blocks = table_store
-        .read_blocks_using_index(output_sst, index, last_block_idx..last_block_idx + 1, false)
+        .read_blocks_using_index(
+            output_sst,
+            index,
+            last_block_idx..last_block_idx + 1,
+            false,
+            ReadIntent::foreground(),
+        )
         .await?;
     let Some(block) = blocks.pop_front() else {
         return Ok(None);
@@ -650,51 +655,6 @@ pub(crate) fn varint_len(mut value: u32) -> usize {
     len
 }
 
-/// Preload SST files into the disk cache based on the configured [`PreloadLevel`].
-pub(crate) async fn preload_cache_from_manifest(
-    core: &ManifestCore,
-    cached_obj_store: &CachedObjectStore,
-    path_resolver: &PathResolver,
-    preload_level: Option<PreloadLevel>,
-    max_cache_size: usize,
-) -> Result<(), SlateDBError> {
-    match preload_level {
-        Some(PreloadLevel::AllSst) => {
-            let all_sst_paths: Vec<object_store::path::Path> = core
-                .all_sst_views()
-                .map(|view| path_resolver.table_path(&view.sst.id))
-                .collect();
-            if !all_sst_paths.is_empty() {
-                if let Err(e) = cached_obj_store
-                    .load_files_to_cache(all_sst_paths, max_cache_size)
-                    .await
-                {
-                    warn!("Failed to preload all SSTs to cache: {:?}", e);
-                }
-            }
-        }
-        Some(PreloadLevel::L0Sst) => {
-            let l0_sst_paths: Vec<object_store::path::Path> = core
-                .trees()
-                .flat_map(|tree| tree.l0.iter())
-                .map(|view| path_resolver.table_path(&view.sst.id))
-                .collect();
-            if !l0_sst_paths.is_empty() {
-                if let Err(e) = cached_obj_store
-                    .load_files_to_cache(l0_sst_paths, max_cache_size)
-                    .await
-                {
-                    warn!("Failed to preload L0 SSTs to cache: {:?}", e);
-                }
-            }
-        }
-        None => {
-            // No preloading
-        }
-    }
-    Ok(())
-}
-
 /// A channel sender that checks the DB's closed result when the underlying
 /// channel is closed, converting the raw channel error into the appropriate
 /// [`SlateDBError`].
@@ -788,6 +748,7 @@ impl<T> Clone for SafeSender<T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::object_store_intent::WriteIntent;
     use rstest::rstest;
     use slatedb_common::MockSystemClock;
 
@@ -1109,7 +1070,12 @@ mod tests {
             .unwrap();
         let encoded_sst = sst_builder.build().await.unwrap();
         let _sst1 = table_store
-            .write_sst(&SsTableId::Compacted(Ulid::new()), &encoded_sst, false)
+            .write_sst(
+                &SsTableId::Compacted(Ulid::new()),
+                &encoded_sst,
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
 
@@ -1124,7 +1090,12 @@ mod tests {
             .unwrap();
         let encoded_sst = sst_builder.build().await.unwrap();
         let sst2 = table_store
-            .write_sst(&SsTableId::Compacted(Ulid::new()), &encoded_sst, false)
+            .write_sst(
+                &SsTableId::Compacted(Ulid::new()),
+                &encoded_sst,
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
 
@@ -1162,7 +1133,12 @@ mod tests {
             .unwrap();
         let encoded_sst = sst_builder.build().await.unwrap();
         let sst = table_store
-            .write_sst(&SsTableId::Compacted(Ulid::new()), &encoded_sst, false)
+            .write_sst(
+                &SsTableId::Compacted(Ulid::new()),
+                &encoded_sst,
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
 

@@ -6,6 +6,7 @@ use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableView};
 use crate::error::SlateDBError;
 use crate::format::row::SstRowCodecV0;
 use crate::iter::{IterationOrder, RowEntryIterator};
+use crate::object_store_intent::WriteIntent;
 use crate::tablestore::TableStore;
 use crate::types::{KeyValue, RowEntry, ValueDeletable};
 use async_trait::async_trait;
@@ -309,7 +310,8 @@ pub(crate) async fn write_ssts(
     }
 
     let mut output_ssts = Vec::new();
-    let mut writer = table_store.table_writer(SsTableId::Compacted(Ulid::new()));
+    let mut writer =
+        table_store.table_writer(SsTableId::Compacted(Ulid::new()), WriteIntent::flush());
     let mut bytes_written = 0usize;
 
     for (index, entry) in entries.iter().cloned().enumerate() {
@@ -322,7 +324,8 @@ pub(crate) async fn write_ssts(
             bytes_written = 0;
 
             if index + 1 < entries.len() {
-                writer = table_store.table_writer(SsTableId::Compacted(Ulid::new()));
+                writer = table_store
+                    .table_writer(SsTableId::Compacted(Ulid::new()), WriteIntent::flush());
             } else {
                 return output_ssts;
             }

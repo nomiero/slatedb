@@ -65,12 +65,6 @@
 //! max_compaction_sources = "8"
 //! include_size_threshold = "4.0"
 //!
-//! [object_store_cache_options]
-//! root_folder = "/tmp/slatedb-cache"
-//! max_cache_size_bytes = 17179869184
-//! part_size_bytes = 4194304
-//! scan_interval = "3600s"
-//!
 //! [garbage_collector_options.manifest_options]
 //! interval = "300s"
 //! min_age = "86400s"
@@ -114,12 +108,6 @@
 //!    }
 //!  },
 //!  "compression_codec": null,
-//!  "object_store_cache_options": {
-//!    "root_folder": "/tmp/slatedb-cache",
-//!    "max_cache_size_bytes": 17179869184,
-//!    "part_size_bytes": 4194304,
-//!    "scan_interval": "3600s"
-//!  },
 //!  "garbage_collector_options": {
 //!    "manifest_options": {
 //!      "interval": "300s",
@@ -164,11 +152,6 @@
 //!     max_compaction_sources: "8"
 //!     include_size_threshold: "4.0"
 //! compression_codec: null
-//! object_store_cache_options:
-//!   root_folder: /tmp/slatedb-cache
-//!   max_cache_size_bytes: 17179869184
-//!   part_size_bytes: 4194304
-//!   scan_interval: '3600s'
 //! garbage_collector_options:
 //!   manifest_options:
 //!     interval: '300s'
@@ -199,15 +182,6 @@ use uuid::Uuid;
 use crate::error::SlateDBError;
 
 use crate::garbage_collector::{DEFAULT_INTERVAL, DEFAULT_MIN_AGE};
-
-/// Enum representing different levels of cache preloading on startup
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
-pub enum PreloadLevel {
-    /// Preload only L0 SSTs (most recently written files)
-    L0Sst,
-    /// Preload all SSTs (both L0 and compacted levels)
-    AllSst,
-}
 
 /// Enum representing valid SST block sizes
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Default)]
@@ -725,9 +699,6 @@ pub struct Settings {
     /// The compression algorithm to use for SSTables.
     pub compression_codec: Option<CompressionCodec>,
 
-    /// The object store cache options.
-    pub object_store_cache_options: ObjectStoreCacheOptions,
-
     /// Configuration options for the garbage collector.
     pub garbage_collector_options: Option<GarbageCollectorOptions>,
 
@@ -769,10 +740,6 @@ impl std::fmt::Debug for Settings {
             .field("l0_flush_parallelism", &self.l0_flush_parallelism)
             .field("compactor_options", &self.compactor_options)
             .field("compression_codec", &self.compression_codec)
-            .field(
-                "object_store_cache_options",
-                &self.object_store_cache_options,
-            )
             .field("garbage_collector_options", &self.garbage_collector_options)
             .field("default_ttl", &self.default_ttl);
         data.finish()
@@ -968,7 +935,6 @@ impl Default for Settings {
             l0_flush_parallelism: 4,
             compactor_options: Some(CompactorOptions::default()),
             compression_codec: None,
-            object_store_cache_options: ObjectStoreCacheOptions::default(),
             garbage_collector_options: Some(GarbageCollectorOptions::default()),
             default_ttl: None,
             #[cfg(test)]
@@ -995,11 +961,6 @@ pub struct DbReaderOptions {
     /// Defaults to 64MB
     pub max_memtable_bytes: u64,
 
-    /// Options for the local disk cache. If `root_folder` is set, the reader
-    /// will wrap its object store in a `CachedObjectStore` backed by the
-    /// local filesystem, mirroring the behaviour of `Db`.
-    pub object_store_cache_options: ObjectStoreCacheOptions,
-
     /// When true, skip WAL replay entirely. The reader will only see data that has been
     /// compacted into L0 or lower levels. This is useful for read-heavy workloads that
     /// don't need to see the most recent uncommitted writes and want to minimize the
@@ -1020,7 +981,6 @@ impl Default for DbReaderOptions {
             manifest_poll_interval: Duration::from_secs(10),
             checkpoint_lifetime: Duration::from_secs(10 * 60),
             max_memtable_bytes: 64 * 1024 * 1024,
-            object_store_cache_options: ObjectStoreCacheOptions::default(),
             skip_wal_replay: false,
         }
     }
@@ -1408,68 +1368,6 @@ impl Default for GarbageCollectorOptions {
     }
 }
 
-/// Options for the object store cache. This cache is not enabled unless an explicit cache
-/// root folder is set. The object store cache will split an object into align-sized parts
-/// in the local, and save them into the local cache storage.
-///
-/// The local cache default uses file system as storage, it can also be extended to use other
-/// like RocksDB, Redis, etc. in the future.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ObjectStoreCacheOptions {
-    /// The root folder where the cache files are stored. If not set, the cache will be
-    /// disabled.
-    pub root_folder: Option<std::path::PathBuf>,
-
-    /// The limit of the cache size in bytes, the default value is 16gb on 64 bit systems and
-    /// 4gb on 32 bit systems.
-    pub max_cache_size_bytes: Option<usize>,
-
-    /// The size of each part file, the part size is expected to be aligned with 1kb,
-    /// its default value is 4mb.
-    pub part_size_bytes: usize,
-
-    /// Whether to cache PUT operations to disk. When enabled, data written via PUT operations
-    /// will be cached locally for faster subsequent reads. Default is false.
-    pub cache_puts: bool,
-
-    /// Whether to preload SST files into cache during database startup. When enabled,
-    /// the database will load SST files into the cache up to the cache size limit
-    /// to warm up the cache for faster access. Default is None (no preloading).
-    pub preload_disk_cache_on_startup: Option<PreloadLevel>,
-
-    /// Interval to scan the cache directory to rebuild the in-memory map for evictor.
-    /// The default value is 1 hour. If set to None, the cache directory will be only
-    /// scanned once on start up.
-    #[serde(deserialize_with = "deserialize_option_duration")]
-    #[serde(
-        serialize_with = "serialize_option_duration",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub scan_interval: Option<Duration>,
-
-    /// The maximum number of file handles to keep open in the file handle cache.
-    /// When the limit is reached, the least recently used handle is closed.
-    /// Default is 1000.
-    pub max_open_file_handles: usize,
-}
-
-impl Default for ObjectStoreCacheOptions {
-    fn default() -> Self {
-        Self {
-            root_folder: None,
-            #[cfg(target_pointer_width = "32")]
-            max_cache_size_bytes: Some(usize::MAX),
-            #[cfg(not(target_pointer_width = "32"))]
-            max_cache_size_bytes: Some(16 * 1024 * 1024 * 1024),
-            part_size_bytes: 4 * 1024 * 1024,
-            cache_puts: false,
-            preload_disk_cache_on_startup: None,
-            scan_interval: Some(Duration::from_secs(3600)),
-            max_open_file_handles: 1000,
-        }
-    }
-}
-
 // Custom serializer for Duration
 fn serialize_duration<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -1504,7 +1402,6 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::path::PathBuf;
 
     use super::*;
 
@@ -1512,17 +1409,14 @@ mod tests {
     fn test_db_options_load_from_env() {
         figment::Jail::expect_with(|jail| {
             jail.set_env("SLATEDB_FLUSH_INTERVAL", "1s");
-            jail.set_env(
-                "SLATEDB_OBJECT_STORE_CACHE_OPTIONS.ROOT_FOLDER",
-                "/tmp/slatedb-root",
-            );
+            jail.set_env("SLATEDB_COMPACTOR_OPTIONS.POLL_INTERVAL", "7s");
 
             let options =
                 Settings::from_env("SLATEDB_").expect("failed to load db options from environment");
             assert_eq!(Some(Duration::from_secs(1)), options.flush_interval);
             assert_eq!(
-                Some(PathBuf::from("/tmp/slatedb-root")),
-                options.object_store_cache_options.root_folder
+                Some(Duration::from_secs(7)),
+                options.compactor_options.map(|c| c.poll_interval)
             );
 
             Ok(())
@@ -1537,8 +1431,8 @@ mod tests {
                 r#"
 {
     "flush_interval": "1s",
-    "object_store_cache_options": {
-        "root_folder": "/tmp/slatedb-root"
+    "compactor_options": {
+        "poll_interval": "7s"
     }
 }
 "#,
@@ -1549,8 +1443,8 @@ mod tests {
                 .expect("failed to load db options from environment");
             assert_eq!(Some(Duration::from_secs(1)), options.flush_interval);
             assert_eq!(
-                Some(PathBuf::from("/tmp/slatedb-root")),
-                options.object_store_cache_options.root_folder
+                Some(Duration::from_secs(7)),
+                options.compactor_options.map(|c| c.poll_interval)
             );
             Ok(())
         });
@@ -1581,8 +1475,8 @@ mod tests {
                 "config.toml",
                 r#"
 flush_interval = "1s"
-[object_store_cache_options]
-root_folder = "/tmp/slatedb-root"
+[compactor_options]
+poll_interval = "7s"
 "#,
             )
             .expect("failed to create db options config file");
@@ -1591,8 +1485,8 @@ root_folder = "/tmp/slatedb-root"
                 .expect("failed to load db options from environment");
             assert_eq!(Some(Duration::from_secs(1)), options.flush_interval);
             assert_eq!(
-                Some(PathBuf::from("/tmp/slatedb-root")),
-                options.object_store_cache_options.root_folder
+                Some(Duration::from_secs(7)),
+                options.compactor_options.map(|c| c.poll_interval)
             );
             Ok(())
         });
@@ -1605,8 +1499,8 @@ root_folder = "/tmp/slatedb-root"
                 "config.yaml",
                 r#"
 flush_interval: "1s"
-object_store_cache_options:
-    root_folder: "/tmp/slatedb-root"
+compactor_options:
+    poll_interval: "7s"
 "#,
             )
             .expect("failed to create db options config file");
@@ -1615,8 +1509,8 @@ object_store_cache_options:
                 .expect("failed to load db options from environment");
             assert_eq!(Some(Duration::from_secs(1)), options.flush_interval);
             assert_eq!(
-                Some(PathBuf::from("/tmp/slatedb-root")),
-                options.object_store_cache_options.root_folder
+                Some(Duration::from_secs(7)),
+                options.compactor_options.map(|c| c.poll_interval)
             );
             Ok(())
         });
@@ -1630,8 +1524,8 @@ object_store_cache_options:
             jail.create_file(
                 "SlateDb.yaml",
                 r#"
-object_store_cache_options:
-    root_folder: "/tmp/slatedb-root"
+compactor_options:
+    poll_interval: "7s"
 "#,
             )
             .expect("failed to create db options config file");
@@ -1639,8 +1533,8 @@ object_store_cache_options:
             let options = Settings::load().expect("failed to load db options from environment");
             assert_eq!(Some(Duration::from_secs(1)), options.flush_interval);
             assert_eq!(
-                Some(PathBuf::from("/tmp/slatedb-root")),
-                options.object_store_cache_options.root_folder
+                Some(Duration::from_secs(7)),
+                options.compactor_options.map(|c| c.poll_interval)
             );
             Ok(())
         });

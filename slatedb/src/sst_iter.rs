@@ -16,6 +16,9 @@ use crate::error::SlateDBError;
 use crate::filter_policy::{FilterContext, FilterQuery, NamedFilter};
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::block::Block;
+use crate::object_store_intent::ReadIntent;
+#[cfg(test)]
+use crate::object_store_intent::WriteIntent;
 use crate::prefix_extractor::PrefixTarget;
 use crate::{
     iter::{IterationOrder, RowEntryIterator},
@@ -38,6 +41,11 @@ pub(crate) struct SstIteratorOptions {
     pub(crate) order: IterationOrder,
     pub(crate) prefix: Option<Bytes>,
     pub(crate) filter_context: Option<FilterContext>,
+    /// Intent attached to every object store read this iterator issues.
+    /// Defaults to `Foreground`. Compactor sets this to
+    /// `CompactionInput` so a cache wrapper can apply different
+    /// admission policy.
+    pub(crate) read_intent: ReadIntent,
 }
 
 impl Default for SstIteratorOptions {
@@ -50,6 +58,7 @@ impl Default for SstIteratorOptions {
             order: IterationOrder::Ascending,
             prefix: None,
             filter_context: None,
+            read_intent: ReadIntent::foreground(),
         }
     }
 }
@@ -387,6 +396,7 @@ impl<'a> InternalSstIterator<'a> {
                     let blocks_end = self.next_block_idx_to_fetch + blocks_to_fetch;
                     let index = index.clone();
                     let cache_blocks = self.options.cache_blocks;
+                    let intent = self.options.read_intent;
                     self.fetch_tasks
                         .push_back(FetchTask::InFlight(tokio::spawn(async move {
                             table_store
@@ -395,6 +405,7 @@ impl<'a> InternalSstIterator<'a> {
                                     index,
                                     blocks_start..blocks_end,
                                     cache_blocks,
+                                    intent,
                                 )
                                 .await
                         })));
@@ -416,6 +427,7 @@ impl<'a> InternalSstIterator<'a> {
                     let blocks_start = blocks_end - blocks_to_fetch;
                     let index = index.clone();
                     let cache_blocks = self.options.cache_blocks;
+                    let intent = self.options.read_intent;
                     self.fetch_tasks
                         .push_back(FetchTask::InFlight(tokio::spawn(async move {
                             table_store
@@ -424,6 +436,7 @@ impl<'a> InternalSstIterator<'a> {
                                     index,
                                     blocks_start..blocks_end,
                                     cache_blocks,
+                                    intent,
                                 )
                                 .await
                         })));
@@ -541,7 +554,11 @@ impl<'a> InternalSstIterator<'a> {
         if self.index.is_none() {
             let index = self
                 .table_store
-                .read_index(&self.view.table_as_ref().sst, self.options.cache_blocks)
+                .read_index(
+                    &self.view.table_as_ref().sst,
+                    self.options.cache_blocks,
+                    self.options.read_intent,
+                )
                 .await?;
             let block_idx_range = partitioned_keyspace::partitions_covering_range(
                 &index.borrow(),
@@ -790,6 +807,7 @@ impl RowEntryIterator for FilterIterator<'_> {
                 .read_filters(
                     &self.inner.view().table_as_ref().sst,
                     self.inner.options.cache_blocks,
+                    self.inner.options.read_intent,
                 )
                 .await?;
             self.filter.evaluate(&filters).await;
@@ -1105,11 +1123,14 @@ mod tests {
             .unwrap();
         let encoded = builder.build().await.unwrap();
         table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded, false, WriteIntent::flush())
             .await
             .unwrap();
         let sst_handle = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
-        let index = table_store.read_index(&sst_handle, true).await.unwrap();
+        let index = table_store
+            .read_index(&sst_handle, true, ReadIntent::foreground())
+            .await
+            .unwrap();
         assert_eq!(index.borrow().block_meta().len(), 1);
 
         let sst_iter_options = SstIteratorOptions {
@@ -1262,7 +1283,7 @@ mod tests {
         let sst_handle = build_single_block_sst(&table_store, &existing_keys).await;
 
         let filters = table_store
-            .read_filters(&sst_handle.sst, true)
+            .read_filters(&sst_handle.sst, true, ReadIntent::foreground())
             .await
             .expect("filter read should succeed");
         assert!(!filters.is_empty(), "filter should exist");
@@ -1349,6 +1370,7 @@ mod tests {
                 &SsTableId::Compacted(ulid::Ulid::new()),
                 &builder.build().await.unwrap(),
                 false,
+                WriteIntent::flush(),
             )
             .await
             .unwrap();
@@ -1439,7 +1461,12 @@ mod tests {
         }
         let encoded = builder.build().await.unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
-        SsTableView::identity(table_store.write_sst(&id, &encoded, false).await.unwrap())
+        SsTableView::identity(
+            table_store
+                .write_sst(&id, &encoded, false, WriteIntent::flush())
+                .await
+                .unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -1477,11 +1504,14 @@ mod tests {
 
         let encoded = builder.build().await.unwrap();
         table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded, false, WriteIntent::flush())
             .await
             .unwrap();
         let sst_handle = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
-        let index = table_store.read_index(&sst_handle, true).await.unwrap();
+        let index = table_store
+            .read_index(&sst_handle, true, ReadIntent::foreground())
+            .await
+            .unwrap();
         assert_eq!(index.borrow().block_meta().len(), 8);
 
         let sst_iter_options = SstIteratorOptions {
@@ -1695,8 +1725,12 @@ mod tests {
 
         let encoded = builder.build().await.unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
-        let sst_handle =
-            SsTableView::identity(table_store.write_sst(&id, &encoded, false).await.unwrap());
+        let sst_handle = SsTableView::identity(
+            table_store
+                .write_sst(&id, &encoded, false, WriteIntent::flush())
+                .await
+                .unwrap(),
+        );
 
         // Initialize iterator in descending order with full range
         let mut iter = SstIterator::new_borrowed_initialized(
@@ -1767,6 +1801,7 @@ mod tests {
                 order: IterationOrder::Ascending,
                 prefix: None,
                 filter_context: None,
+                read_intent: ReadIntent::foreground(),
             },
         )
         .await
@@ -1785,6 +1820,7 @@ mod tests {
                 order: IterationOrder::Ascending,
                 prefix: None,
                 filter_context: None,
+                read_intent: ReadIntent::foreground(),
             },
         )
         .await
@@ -1818,7 +1854,7 @@ mod tests {
         mut key_gen: OrderedBytesGenerator,
         mut val_gen: OrderedBytesGenerator,
     ) -> (SsTableView, usize) {
-        let mut writer = ts.table_writer(SsTableId::Wal(0));
+        let mut writer = ts.table_writer(SsTableId::Wal(0), WriteIntent::flush());
         let mut nkeys = 0usize;
         while writer.blocks_written() < n {
             let entry = RowEntry::new_value(key_gen.next().as_ref(), val_gen.next().as_ref(), 0);
@@ -1876,7 +1912,10 @@ mod tests {
             .unwrap();
         let encoded = builder.build().await.unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
-        table_store.write_sst(&id, &encoded, false).await.unwrap();
+        table_store
+            .write_sst(&id, &encoded, false, WriteIntent::flush())
+            .await
+            .unwrap();
         let sst_handle = table_store.open_sst(&id).await.unwrap();
 
         let sst_iter_options = SstIteratorOptions {
@@ -1955,7 +1994,12 @@ mod tests {
         }
         let encoded = builder.build().await.unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
-        SsTableView::identity(table_store.write_sst(&id, &encoded, false).await.unwrap())
+        SsTableView::identity(
+            table_store
+                .write_sst(&id, &encoded, false, WriteIntent::flush())
+                .await
+                .unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -2089,8 +2133,12 @@ mod tests {
 
         let encoded = builder.build().await.unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
-        let sst_handle =
-            SsTableView::identity(table_store.write_sst(&id, &encoded, false).await.unwrap());
+        let sst_handle = SsTableView::identity(
+            table_store
+                .write_sst(&id, &encoded, false, WriteIntent::flush())
+                .await
+                .unwrap(),
+        );
 
         // when: iterating over all keys
         let sst_iter_options = SstIteratorOptions {
@@ -2152,10 +2200,16 @@ mod tests {
 
         let encoded = builder.build().await.unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
-        let sst_handle = table_store.write_sst(&id, &encoded, false).await.unwrap();
+        let sst_handle = table_store
+            .write_sst(&id, &encoded, false, WriteIntent::flush())
+            .await
+            .unwrap();
 
         // Verify we have multiple blocks
-        let index = table_store.read_index(&sst_handle, true).await.unwrap();
+        let index = table_store
+            .read_index(&sst_handle, true, ReadIntent::foreground())
+            .await
+            .unwrap();
         assert!(
             index.borrow().block_meta().len() > 1,
             "Expected multiple blocks but got {}",
@@ -2219,8 +2273,12 @@ mod tests {
 
         let encoded = builder.build().await.unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
-        let sst_handle =
-            SsTableView::identity(table_store.write_sst(&id, &encoded, false).await.unwrap());
+        let sst_handle = SsTableView::identity(
+            table_store
+                .write_sst(&id, &encoded, false, WriteIntent::flush())
+                .await
+                .unwrap(),
+        );
 
         // when: searching for a non-existent key (odd number)
         let mut iter = SstIterator::for_key_with_stats_initialized(
@@ -2271,8 +2329,12 @@ mod tests {
 
         let encoded = builder.build().await.unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
-        let sst_handle =
-            SsTableView::identity(table_store.write_sst(&id, &encoded, false).await.unwrap());
+        let sst_handle = SsTableView::identity(
+            table_store
+                .write_sst(&id, &encoded, false, WriteIntent::flush())
+                .await
+                .unwrap(),
+        );
 
         // when: seeking past the last key
         let iter = SstIterator::new_borrowed_initialized(
@@ -2331,10 +2393,16 @@ mod tests {
         }
         let encoded = builder.build().await.unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
-        table_store.write_sst(&id, &encoded, false).await.unwrap();
+        table_store
+            .write_sst(&id, &encoded, false, WriteIntent::flush())
+            .await
+            .unwrap();
         let sst_handle = table_store.open_sst(&id).await.unwrap();
 
-        let index = table_store.read_index(&sst_handle, true).await.unwrap();
+        let index = table_store
+            .read_index(&sst_handle, true, ReadIntent::foreground())
+            .await
+            .unwrap();
         let num_blocks = index.borrow().block_meta().len();
         assert!(
             num_blocks >= 4,
@@ -2358,6 +2426,7 @@ mod tests {
             order,
             prefix: None,
             filter_context: None,
+            read_intent: ReadIntent::foreground(),
         };
         let mut iter = SstIterator::new_owned_initialized(
             BytesRange::from_slice(start_key.as_ref()..=end_key.as_ref()),
@@ -2467,10 +2536,16 @@ mod tests {
         }
         let encoded = builder.build().await.unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
-        table_store.write_sst(&id, &encoded, false).await.unwrap();
+        table_store
+            .write_sst(&id, &encoded, false, WriteIntent::flush())
+            .await
+            .unwrap();
         let sst_handle = table_store.open_sst(&id).await.unwrap();
 
-        let index = table_store.read_index(&sst_handle, true).await.unwrap();
+        let index = table_store
+            .read_index(&sst_handle, true, ReadIntent::foreground())
+            .await
+            .unwrap();
         let num_blocks = index.borrow().block_meta().len();
         assert!(
             num_blocks >= 2,
@@ -2521,7 +2596,7 @@ mod tests {
             None,
         ));
 
-        let mut writer = table_store.table_writer(SsTableId::Wal(0));
+        let mut writer = table_store.table_writer(SsTableId::Wal(0), WriteIntent::flush());
         writer
             .add(RowEntry::new_value(b"key_a", b"value_100", 100))
             .await
@@ -2619,7 +2694,7 @@ mod tests {
 
         // Keys spaced by 10: key_000, key_010, key_020, ..., key_190.
         // Gaps like key_035 don't exist.
-        let mut writer = table_store.table_writer(SsTableId::Wal(0));
+        let mut writer = table_store.table_writer(SsTableId::Wal(0), WriteIntent::flush());
         for i in 0..20 {
             let key = format!("key_{:03}", i * 10);
             let val = format!("val_{:03}", i * 10);
@@ -2644,6 +2719,7 @@ mod tests {
                 order: IterationOrder::Ascending,
                 prefix: None,
                 filter_context: None,
+                read_intent: ReadIntent::foreground(),
             },
         )
         .await

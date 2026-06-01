@@ -10,6 +10,7 @@ use crate::db_state::{SsTableHandle, SsTableId};
 use crate::error::SlateDBError;
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::manifest::VersionedManifest;
+use crate::object_store_intent::ReadIntent;
 use crate::partitioned_keyspace::partitions_covering_range;
 use crate::tablestore::TableStore;
 
@@ -56,10 +57,13 @@ pub(crate) async fn warm_sst_impl(
     if targets.is_empty() {
         return Ok(());
     }
-    if table_store.cache().is_none() {
-        warn!("warm_sst called on a Db without a block cache configured");
-        return Ok(());
-    }
+    // When no block cache is configured, the read paths below still flow
+    // through the main object store, so any intent, aware disk cache wrapper
+    // (e.g. CachedObjectStore) gets admitted bytes as a side effect. The
+    // block, cache write inside read_filters / read_index / read_stats /
+    // read_blocks_using_index is a no, op when self.cache is None, so this
+    // path is safe with no cache, with a block cache only, with a disk
+    // cache only, or with both.
 
     // Reuse the handle embedded in the manifest view instead of calling
     // `open_sst`, which would issue an extra object_store GET for info+version.
@@ -164,7 +168,13 @@ async fn warm_data(
             continue;
         }
         table_store
-            .read_blocks_using_index(handle, index.clone(), block_range, true)
+            .read_blocks_using_index(
+                handle,
+                index.clone(),
+                block_range,
+                true,
+                ReadIntent::warmup(),
+            )
             .await?;
     }
     Ok(())
@@ -188,7 +198,9 @@ async fn warm_filters(
     if handle.info.filter_len == 0 {
         return Ok(());
     }
-    table_store.read_filters(handle, true).await?;
+    table_store
+        .read_filters(handle, true, ReadIntent::warmup())
+        .await?;
     Ok(())
 }
 
@@ -201,7 +213,9 @@ async fn warm_stats(
     if handle.info.stats_len == 0 {
         return Ok(());
     }
-    table_store.read_stats(handle, true).await?;
+    table_store
+        .read_stats(handle, true, ReadIntent::warmup())
+        .await?;
     Ok(())
 }
 
@@ -211,7 +225,11 @@ async fn ensure_index(
     index_cell: &OnceCell<Result<Arc<SsTableIndexOwned>, SlateDBError>>,
 ) -> Result<Arc<SsTableIndexOwned>, SlateDBError> {
     let result: &Result<Arc<SsTableIndexOwned>, SlateDBError> = index_cell
-        .get_or_init(|| async { table_store.read_index(handle, true).await })
+        .get_or_init(|| async {
+            table_store
+                .read_index(handle, true, ReadIntent::warmup())
+                .await
+        })
         .await;
     match result {
         Ok(index) => Ok(index.clone()),
@@ -252,7 +270,7 @@ mod tests {
     async fn cached_block_mask(table_store: &Arc<TableStore>, sst_id: SsTableId) -> Vec<bool> {
         let handle = table_store.open_sst(&sst_id).await.expect("open_sst");
         let index = table_store
-            .read_index(&handle, false)
+            .read_index(&handle, false, ReadIntent::foreground())
             .await
             .expect("read_index");
         let cache = table_store.cache().expect("cache configured").clone();
@@ -269,7 +287,7 @@ mod tests {
     async fn is_key_cached(table_store: &Arc<TableStore>, sst_id: SsTableId, key: &[u8]) -> bool {
         let handle = table_store.open_sst(&sst_id).await.expect("open_sst");
         let index = table_store
-            .read_index(&handle, false)
+            .read_index(&handle, false, ReadIntent::foreground())
             .await
             .expect("read_index");
         let block_idx =

@@ -45,7 +45,6 @@ use std::time::Duration;
 use crate::batch::WriteBatch;
 use crate::batch_write::{WriteBatchMessage, WRITE_BATCH_TASK_NAME};
 use crate::bytes_range::BytesRange;
-use crate::cached_object_store::CachedObjectStore;
 use crate::clock::MonotonicClock;
 use crate::config::{
     FlushOptions, FlushType, MergeOptions, PutOptions, ReadOptions, ScanOptions, Settings,
@@ -60,8 +59,8 @@ use crate::iter::IterationOrder;
 use crate::manifest::{Manifest, VersionedManifest};
 use crate::memtable_flusher::{FlushResult, FlushTarget, MemtableFlusher};
 use crate::merge_operator::{instrument_merge_operator, MergeOperatorType};
+use crate::object_store_intent::ReadIntent;
 use crate::oracle::{DbOracle, Oracle};
-use crate::paths::PathResolver;
 use crate::prefix_extractor::PrefixExtractor;
 use crate::rand::DbRand;
 use crate::reader::{Reader, ScanContext};
@@ -517,6 +516,7 @@ impl DbInner {
             order: IterationOrder::Ascending,
             prefix: None,
             filter_context: None,
+            read_intent: ReadIntent::foreground(),
         };
 
         let replay_options = WalReplayOptions {
@@ -593,23 +593,6 @@ impl DbInner {
         }
 
         Ok(())
-    }
-
-    async fn preload_cache(
-        &self,
-        cached_obj_store: &CachedObjectStore,
-        path_resolver: &PathResolver,
-    ) -> Result<(), SlateDBError> {
-        let state = self.state.read().state();
-        let cache_opts = &self.settings.object_store_cache_options;
-        crate::utils::preload_cache_from_manifest(
-            &state.manifest.value.core,
-            cached_obj_store,
-            path_resolver,
-            cache_opts.preload_disk_cache_on_startup,
-            cache_opts.max_cache_size_bytes.unwrap_or(usize::MAX),
-        )
-        .await
     }
 
     /// Returns the latest database status snapshot.
@@ -2061,8 +2044,7 @@ mod tests {
     use crate::config::DurabilityLevel::{Memory, Remote};
     use crate::config::{
         CheckpointOptions, CompactorOptions, GarbageCollectorDirectoryOptions,
-        GarbageCollectorOptions, ObjectStoreCacheOptions, PutOptions, ScanOptions, Settings, Ttl,
-        WriteOptions,
+        GarbageCollectorOptions, PutOptions, ScanOptions, Settings, Ttl, WriteOptions,
     };
     use crate::db::builder::GarbageCollectorBuilder;
     use crate::db_stats::IMMUTABLE_MEMTABLE_FLUSHES;
@@ -3307,7 +3289,7 @@ mod tests {
         let index = db
             .inner
             .table_store
-            .read_index(&view.sst, true)
+            .read_index(&view.sst, true, ReadIntent::foreground())
             .await
             .unwrap();
         assert!(!index.borrow().block_meta().is_empty());
@@ -3321,25 +3303,31 @@ mod tests {
     #[tokio::test]
     async fn test_get_with_object_store_cache_metrics() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let mut opts = test_db_options(0, 1024, None);
+        let opts = test_db_options(0, 1024, None);
         let temp_dir = tempfile::Builder::new()
             .prefix("objstore_cache_test_")
             .tempdir()
             .unwrap();
 
-        opts.object_store_cache_options.root_folder = Some(temp_dir.keep());
-        opts.object_store_cache_options.part_size_bytes = 1024;
         let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
-        let kv_store = Db::builder(
-            "/tmp/test_kv_store_with_cache_metrics",
-            object_store.clone(),
-        )
-        .with_settings(opts)
-        .with_db_cache_disabled()
-        .with_metrics_recorder(metrics_recorder.clone())
-        .build()
-        .await
-        .unwrap();
+        let helper = MetricsRecorderHelper::new(
+            metrics_recorder.clone(),
+            slatedb_common::metrics::MetricLevel::default(),
+        );
+        let cached_store = CachedObjectStore::builder(object_store.clone())
+            .root_folder(temp_dir.keep())
+            .part_size_bytes(1024)
+            .metrics_recorder(helper)
+            .build()
+            .await
+            .unwrap();
+        let kv_store = Db::builder("/tmp/test_kv_store_with_cache_metrics", cached_store)
+            .with_settings(opts)
+            .with_db_cache_disabled()
+            .with_metrics_recorder(metrics_recorder.clone())
+            .build()
+            .await
+            .unwrap();
 
         let access_count0 = lookup_metric(&metrics_recorder, PART_ACCESS_COUNT).unwrap();
         let key = b"test_key";
@@ -3362,22 +3350,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_db_records_remote_object_store_reads_but_not_cache_hits() {
+        async fn build_cached_db(
+            path: &str,
+            object_store: Arc<dyn ObjectStore>,
+            cache_dir: std::path::PathBuf,
+            metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
+        ) -> Db {
+            let opts = test_db_options(0, 1024, None);
+            let mut cache_builder = CachedObjectStore::builder(object_store)
+                .root_folder(cache_dir)
+                .part_size_bytes(1024);
+            if let Some(r) = &metrics_recorder {
+                let helper = MetricsRecorderHelper::new(
+                    r.clone(),
+                    slatedb_common::metrics::MetricLevel::default(),
+                );
+                cache_builder = cache_builder.metrics_recorder(helper);
+            }
+            let cached_store = cache_builder.build().await.unwrap();
+            let mut builder = Db::builder(path, cached_store).with_settings(opts);
+            if let Some(r) = metrics_recorder {
+                builder = builder.with_metrics_recorder(r);
+            }
+            builder.build().await.unwrap()
+        }
+
         // given:
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let mut opts = test_db_options(0, 1024, None);
         let temp_dir = tempfile::Builder::new()
             .prefix("objstore_metrics_test_")
             .tempdir()
             .unwrap();
-
-        opts.object_store_cache_options.root_folder = Some(temp_dir.keep());
-        opts.object_store_cache_options.part_size_bytes = 1024;
         let path = "/tmp/test_db_records_remote_object_store_reads_but_not_cache_hits";
-        let kv_store = Db::builder(path, object_store.clone())
-            .with_settings(opts)
-            .build()
-            .await
-            .unwrap();
+        let kv_store = build_cached_db(path, object_store.clone(), temp_dir.keep(), None).await;
 
         kv_store.put(b"test_key", b"test_value").await.unwrap();
         kv_store.flush().await.unwrap();
@@ -3389,20 +3394,18 @@ mod tests {
             .unwrap();
         kv_store.close().await.unwrap();
 
-        let mut reopen_opts = test_db_options(0, 1024, None);
         let reopen_temp_dir = tempfile::Builder::new()
             .prefix("objstore_metrics_reopen_")
             .tempdir()
             .unwrap();
-        reopen_opts.object_store_cache_options.root_folder = Some(reopen_temp_dir.keep());
-        reopen_opts.object_store_cache_options.part_size_bytes = 1024;
         let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
-        let reopened = Db::builder(path, object_store)
-            .with_settings(reopen_opts)
-            .with_metrics_recorder(metrics_recorder.clone())
-            .build()
-            .await
-            .unwrap();
+        let reopened = build_cached_db(
+            path,
+            object_store,
+            reopen_temp_dir.keep(),
+            Some(metrics_recorder.clone()),
+        )
+        .await;
 
         let requests_before =
             lookup_object_store_op_request_count(&metrics_recorder, "db", "main", "get");
@@ -3574,17 +3577,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_with_object_store_cache_put_caching_enabled() {
+        // After the intent-protocol integration, `cache_puts: true` only
+        // admits writes tagged `Flush` or untagged legacy writes. WAL writes
+        // (`WriteIntent::wal()`) and manifest writes
+        // (`WriteIntent::manifest()`, set by `ManifestStore`) skip the
+        // cache regardless of `cache_puts` because their access patterns
+        // do not benefit from local caching.
+        //
+        // Manifest READS go through the normal cache-aware path
+        // with `ReadIntent::foreground()`. This is why
+        // `manifest/00000000000000000002` still has one part: it is
+        // the post-fence_writers refresh read, not a manifest write.
         let expected_cache_parts =
             vec![
-            // not cached because this manifest is put before the root is resolved, which is when
-            // `cache_puts_enabled` starts taking effect.
             ("tmp/test_kv_store_with_put_cache_enabled/manifest/00000000000000000001.manifest", 0),
-            // 1 part is cached because fence_writers refreshes the manifest after writing the fence.
             ("tmp/test_kv_store_with_put_cache_enabled/manifest/00000000000000000002.manifest", 1),
-            // The startup fence WAL is zero bytes, so replay does not cache any object parts.
+            // WAL writes are tagged `Wal` and skipped; WAL reads from
+            // an empty/fence WAL also yield no cached parts.
             ("tmp/test_kv_store_with_put_cache_enabled/wal/00000000000000000001.sst", 0),
-            // 1 part is cached because the put with cache_puts enabled should cache the test_key put
-            ("tmp/test_kv_store_with_put_cache_enabled/wal/00000000000000000002.sst", 1),
+            // The `test_key` put goes into the WAL with `WriteIntent::wal()`
+            // and is no longer admitted to the cache.
+            ("tmp/test_kv_store_with_put_cache_enabled/wal/00000000000000000002.sst", 0),
         ];
 
         let (_cached_object_store, kv_store) = test_object_store_cache_helper(
@@ -6908,7 +6921,6 @@ mod tests {
             max_wal_flushes_before_l0_flush: 4096,
             compactor_options,
             compression_codec: None,
-            object_store_cache_options: ObjectStoreCacheOptions::default(),
             garbage_collector_options: None,
             default_ttl: ttl,
             block_format: None,

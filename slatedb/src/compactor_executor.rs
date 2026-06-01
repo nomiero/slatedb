@@ -25,6 +25,7 @@ use crate::merge_operator::{
     instrument_merge_operator, MergeOperatorIterator, MergeOperatorRequiredIterator,
     MergeOperatorType,
 };
+use crate::object_store_intent::{ReadIntent, WriteIntent};
 use crate::peeking_iterator::PeekingIterator;
 use crate::rand::DbRand;
 use crate::retention_iterator::RetentionIterator;
@@ -284,6 +285,7 @@ impl TokioCompactionExecutorInner {
             order: IterationOrder::Ascending,
             prefix: None,
             filter_context: None,
+            read_intent: ReadIntent::compaction_input(),
         };
 
         let max_parallel = compute_max_parallel(job_args.sst_views.len(), &job_args.sorted_runs, 4);
@@ -402,9 +404,10 @@ impl TokioCompactionExecutorInner {
         debug!("executing compaction [job_args={:?}]", args);
         let mut all_iter = self.load_iterators(&args).await?;
         let mut output_ssts = args.output_ssts.clone();
-        let mut current_writer = self.table_store.table_writer(SsTableId::Compacted(
-            self.rand.rng().gen_ulid(self.clock.as_ref()),
-        ));
+        let mut current_writer = self.table_store.table_writer(
+            SsTableId::Compacted(self.rand.rng().gen_ulid(self.clock.as_ref())),
+            WriteIntent::compaction_output(),
+        );
         let mut bytes_written = 0usize;
         let mut last_progress_report = self.clock.now();
         // Estimate bytes processed before the resume point, if any.
@@ -428,9 +431,10 @@ impl TokioCompactionExecutorInner {
             if bytes_written > self.options.max_sst_size {
                 let finished_writer = mem::replace(
                     &mut current_writer,
-                    self.table_store.table_writer(SsTableId::Compacted(
-                        self.rand.rng().gen_ulid(self.clock.as_ref()),
-                    )),
+                    self.table_store.table_writer(
+                        SsTableId::Compacted(self.rand.rng().gen_ulid(self.clock.as_ref())),
+                        WriteIntent::compaction_output(),
+                    ),
                 );
                 let sst = finished_writer.close().await?;
 
@@ -551,6 +555,7 @@ mod tests {
     use crate::bytes_range::BytesRange;
     use crate::format::sst::SsTableFormat;
     use crate::manifest::ManifestCore;
+    use crate::object_store_intent::WriteIntent;
     use crate::object_stores::ObjectStores;
     use crate::proptest_util::arbitrary;
     use crate::sst_iter::SstView;
@@ -584,7 +589,8 @@ mod tests {
         // Write entries into one or more SSTs, splitting on the same block-size
         // accounting used by the compactor's output writer.
         let mut output_ssts = Vec::new();
-        let mut writer = table_store.table_writer(SsTableId::Compacted(Ulid::new()));
+        let mut writer =
+            table_store.table_writer(SsTableId::Compacted(Ulid::new()), WriteIntent::flush());
         let mut bytes_written = 0usize;
 
         for (index, entry) in entries.iter().cloned().enumerate() {
@@ -597,7 +603,8 @@ mod tests {
                 bytes_written = 0;
 
                 if index + 1 < entries.len() {
-                    writer = table_store.table_writer(SsTableId::Compacted(Ulid::new()));
+                    writer = table_store
+                        .table_writer(SsTableId::Compacted(Ulid::new()), WriteIntent::flush());
                 } else {
                     return output_ssts;
                 }
@@ -1475,7 +1482,7 @@ mod tests {
         let encoded_sst = sst_builder.build().await.unwrap();
         let id = SsTableId::Compacted(Ulid::new());
         let l0 = table_store
-            .write_sst(&id, &encoded_sst, false)
+            .write_sst(&id, &encoded_sst, false, WriteIntent::flush())
             .await
             .unwrap();
         let retention_min_seq_num = 2;
@@ -1620,7 +1627,7 @@ mod tests {
         let encoded_sst = sst_builder.build().await.unwrap();
         let id = SsTableId::Compacted(Ulid::new());
         let l0 = table_store
-            .write_sst(&id, &encoded_sst, false)
+            .write_sst(&id, &encoded_sst, false, WriteIntent::flush())
             .await
             .unwrap();
 
@@ -1721,7 +1728,7 @@ mod tests {
         let encoded_sst = sst_builder.build().await.unwrap();
         let id = SsTableId::Compacted(Ulid::new());
         let l0 = table_store
-            .write_sst(&id, &encoded_sst, false)
+            .write_sst(&id, &encoded_sst, false, WriteIntent::flush())
             .await
             .unwrap();
 
@@ -1787,7 +1794,7 @@ mod tests {
         let encoded_sst = sst_builder.build().await.unwrap();
         let id = SsTableId::Compacted(Ulid::new());
         let l0 = table_store
-            .write_sst(&id, &encoded_sst, false)
+            .write_sst(&id, &encoded_sst, false, WriteIntent::flush())
             .await
             .unwrap();
 

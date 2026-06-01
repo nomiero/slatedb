@@ -241,6 +241,7 @@ mod tests {
     use crate::bytes_generator::OrderedBytesGenerator;
     use crate::db_state::{SsTableHandle, SsTableId};
     use crate::format::sst::SsTableFormat;
+    use crate::object_store_intent::WriteIntent;
     use crate::proptest_util;
     use crate::proptest_util::sample;
     use crate::test_utils::assert_kv;
@@ -285,7 +286,10 @@ mod tests {
             .unwrap();
         let encoded = builder.build().await.unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
-        let handle = table_store.write_sst(&id, &encoded, false).await.unwrap();
+        let handle = table_store
+            .write_sst(&id, &encoded, false, WriteIntent::flush())
+            .await
+            .unwrap();
         let sr = SortedRun {
             id: 0,
             sst_views: vec![SsTableView::identity(handle)],
@@ -338,7 +342,10 @@ mod tests {
             .unwrap();
         let encoded = builder.build().await.unwrap();
         let id1 = SsTableId::Compacted(ulid::Ulid::new());
-        let handle1 = table_store.write_sst(&id1, &encoded, false).await.unwrap();
+        let handle1 = table_store
+            .write_sst(&id1, &encoded, false, WriteIntent::flush())
+            .await
+            .unwrap();
         let mut builder = table_store.table_builder();
         builder
             .add_value(b"key3", b"value3", Some(3), None)
@@ -346,7 +353,10 @@ mod tests {
             .unwrap();
         let encoded = builder.build().await.unwrap();
         let id2 = SsTableId::Compacted(ulid::Ulid::new());
-        let handle2 = table_store.write_sst(&id2, &encoded, false).await.unwrap();
+        let handle2 = table_store
+            .write_sst(&id2, &encoded, false, WriteIntent::flush())
+            .await
+            .unwrap();
         let sr = SortedRun {
             id: 0,
             sst_views: vec![
@@ -563,7 +573,10 @@ mod tests {
 
             let encoded = builder.build().await.unwrap();
             let id = SsTableId::Compacted(ulid::Ulid::new());
-            let handle = table_store.write_sst(&id, &encoded, false).await.unwrap();
+            let handle = table_store
+                .write_sst(&id, &encoded, false, WriteIntent::flush())
+                .await
+                .unwrap();
             ssts.push(SsTableView::identity(handle));
         }
 
@@ -582,7 +595,10 @@ mod tests {
     ) -> SortedRun {
         let mut ssts = Vec::<SsTableView>::new();
         for _ in 0..n {
-            let mut writer = table_store.table_writer(SsTableId::Compacted(ulid::Ulid::new()));
+            let mut writer = table_store.table_writer(
+                SsTableId::Compacted(ulid::Ulid::new()),
+                WriteIntent::flush(),
+            );
             for _ in 0..keys_per_sst {
                 let entry =
                     RowEntry::new_value(key_gen.next().as_ref(), val_gen.next().as_ref(), 0);
@@ -613,7 +629,10 @@ mod tests {
             }
             let encoded = builder.build().await.unwrap();
             let id = SsTableId::Compacted(ulid::Ulid::new());
-            table_store.write_sst(&id, &encoded, false).await.unwrap()
+            table_store
+                .write_sst(&id, &encoded, false, WriteIntent::flush())
+                .await
+                .unwrap()
         }
 
         async fn build_sst_v2(
@@ -627,7 +646,10 @@ mod tests {
             }
             let encoded = builder.build().await.unwrap();
             let id = SsTableId::Compacted(ulid::Ulid::new());
-            table_store.write_sst(&id, &encoded, false).await.unwrap()
+            table_store
+                .write_sst(&id, &encoded, false, WriteIntent::flush())
+                .await
+                .unwrap()
         }
 
         #[tokio::test]

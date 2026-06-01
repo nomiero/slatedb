@@ -57,6 +57,7 @@ use crate::db_cache::DbCache;
 use crate::db_state::{SsTableHandle, SsTableId, SsTableInfo};
 use crate::format::sst::{BlockTransformer, SsTableFormat};
 use crate::iter::IterationOrder;
+use crate::object_store_intent::ReadIntent;
 use crate::object_stores::ObjectStores;
 use crate::sst_stats::SstStats;
 use crate::tablestore::{SstFileMetadata, TableStore};
@@ -181,7 +182,7 @@ impl SstFile {
     /// Returns an error if there is an issue reading from object storage.
     pub async fn stats(&self) -> Result<Option<SstStats>, crate::Error> {
         self.table_store
-            .read_stats(&self.handle, true)
+            .read_stats(&self.handle, true, ReadIntent::foreground())
             .await
             .map_err(Into::into)
     }
@@ -196,7 +197,10 @@ impl SstFile {
     ///
     /// Returns an error if there is an issue reading from object storage.
     pub async fn index(&self) -> Result<Vec<(u64, Bytes)>, crate::Error> {
-        let index = self.table_store.read_index(&self.handle, true).await?;
+        let index = self
+            .table_store
+            .read_index(&self.handle, true, ReadIntent::foreground())
+            .await?;
         let borrowed = index.borrow();
         let block_meta = borrowed.block_meta();
         let result: Vec<(u64, Bytes)> = (0..block_meta.len())
@@ -224,7 +228,10 @@ impl SstFile {
     /// Returns an error if `block` is out of range for this SST, or if there
     /// is an issue reading or decoding the block.
     pub async fn read_block(&self, block: usize) -> Result<Vec<RowEntry>, crate::Error> {
-        let index = self.table_store.read_index(&self.handle, true).await?;
+        let index = self
+            .table_store
+            .read_index(&self.handle, true, ReadIntent::foreground())
+            .await?;
         let num_blocks = index.borrow().block_meta().len();
         if block >= num_blocks {
             return Err(crate::Error::invalid(format!(
@@ -233,7 +240,13 @@ impl SstFile {
         }
         let mut blocks = self
             .table_store
-            .read_blocks_using_index(&self.handle, index, block..block + 1, true)
+            .read_blocks_using_index(
+                &self.handle,
+                index,
+                block..block + 1,
+                true,
+                ReadIntent::foreground(),
+            )
             .await?;
         let block = blocks
             .pop_front()

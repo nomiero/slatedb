@@ -425,6 +425,7 @@ mod tests {
     use crate::db_state::{SsTableId, SsTableView};
     use crate::filter_policy::{BloomFilterPolicy, FilterQuery};
     use crate::format::block::Block;
+    use crate::object_store_intent::{ReadIntent, WriteIntent};
     use crate::object_stores::ObjectStores;
     use crate::prefix_extractor::PrefixExtractor;
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
@@ -658,7 +659,12 @@ mod tests {
 
         // write sst and validate that the handle returned has the correct content.
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(wal_id), &encoded, false)
+            .write_sst(
+                &SsTableId::Wal(wal_id),
+                &encoded,
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
         assert_eq!(encoded_info, sst_handle.info);
@@ -673,7 +679,7 @@ mod tests {
         let sst_handle_from_store = table_store.open_sst(&SsTableId::Wal(wal_id)).await.unwrap();
         assert_eq!(encoded_info, sst_handle_from_store.info);
         let index = table_store
-            .read_index(&sst_handle_from_store, true)
+            .read_index(&sst_handle_from_store, true, ReadIntent::foreground())
             .await
             .unwrap();
         let sst_info_from_store = sst_handle_from_store.info;
@@ -730,12 +736,18 @@ mod tests {
         let encoded = builder.build().await.unwrap();
         let encoded_info = encoded.info.clone();
         table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded, false, WriteIntent::flush())
             .await
             .unwrap();
         let sst_handle = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
-        let index = table_store.read_index(&sst_handle, true).await.unwrap();
-        let filters = table_store.read_filters(&sst_handle, true).await.unwrap();
+        let index = table_store
+            .read_index(&sst_handle, true, ReadIntent::foreground())
+            .await
+            .unwrap();
+        let filters = table_store
+            .read_filters(&sst_handle, true, ReadIntent::foreground())
+            .await
+            .unwrap();
         assert!(!filters.is_empty());
         let filter = &filters[0].filter;
 
@@ -797,7 +809,7 @@ mod tests {
         let encoded = builder.build().await.unwrap();
         let encoded_info = encoded.info.clone();
         table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded, false, WriteIntent::flush())
             .await
             .unwrap();
 
@@ -813,8 +825,14 @@ mod tests {
             None,
         );
         let sst_handle = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
-        let index = table_store.read_index(&sst_handle, true).await.unwrap();
-        let filters = table_store.read_filters(&sst_handle, true).await.unwrap();
+        let index = table_store
+            .read_index(&sst_handle, true, ReadIntent::foreground())
+            .await
+            .unwrap();
+        let filters = table_store
+            .read_filters(&sst_handle, true, ReadIntent::foreground())
+            .await
+            .unwrap();
         assert!(!filters.is_empty());
         let filter = &filters[0].filter;
 
@@ -936,7 +954,7 @@ mod tests {
 
         // write sst and validate that the handle returned has the correct content.
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded, false, WriteIntent::flush())
             .await
             .unwrap();
         assert_eq!(encoded_info, sst_handle.info);
@@ -951,7 +969,7 @@ mod tests {
         let sst_handle_from_store = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
         assert_eq!(encoded_info, sst_handle_from_store.info);
         let index = table_store
-            .read_index(&sst_handle_from_store, true)
+            .read_index(&sst_handle_from_store, true, ReadIntent::foreground())
             .await
             .unwrap();
 
@@ -1053,9 +1071,12 @@ mod tests {
         let encoded = builder.build().await?;
 
         let sst_id = SsTableId::Wal(0);
-        let sst_handle =
-            SsTableView::identity(table_store.write_sst(&sst_id, &encoded, false).await?)
-                .with_visible_range(BytesRange::from_ref("c"..="f"));
+        let sst_handle = SsTableView::identity(
+            table_store
+                .write_sst(&sst_id, &encoded, false, WriteIntent::flush())
+                .await?,
+        )
+        .with_visible_range(BytesRange::from_ref("c"..="f"));
 
         let expected_entries = vec![
             RowEntry::new_value(b"c", b"value", 0),
@@ -1177,13 +1198,19 @@ mod tests {
         let encoded = builder.build().await.unwrap();
         let encoded_info = encoded.info.clone();
         table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded, false, WriteIntent::flush())
             .await
             .unwrap();
 
         let sst_handle = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
-        let index = table_store.read_index(&sst_handle, true).await.unwrap();
-        let filters = table_store.read_filters(&sst_handle, true).await.unwrap();
+        let index = table_store
+            .read_index(&sst_handle, true, ReadIntent::foreground())
+            .await
+            .unwrap();
+        let filters = table_store
+            .read_filters(&sst_handle, true, ReadIntent::foreground())
+            .await
+            .unwrap();
         assert!(!filters.is_empty());
         let filter = &filters[0].filter;
 
@@ -1231,12 +1258,15 @@ mod tests {
             .unwrap();
         let encoded = builder.build().await.unwrap();
         table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded, false, WriteIntent::flush())
             .await
             .unwrap();
 
         let sst_handle = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
-        let index = table_store.read_index(&sst_handle, true).await.unwrap();
+        let index = table_store
+            .read_index(&sst_handle, true, ReadIntent::foreground())
+            .await
+            .unwrap();
 
         assert_eq!(1, index.borrow().block_meta().len());
         assert_eq!(
@@ -1324,7 +1354,7 @@ mod tests {
         }
         let encoded = builder.build().await.unwrap();
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded, false, WriteIntent::flush())
             .await
             .unwrap();
 
@@ -1388,7 +1418,7 @@ mod tests {
         }
         let encoded = builder.build().await.unwrap();
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(1), &encoded, false)
+            .write_sst(&SsTableId::Wal(1), &encoded, false, WriteIntent::flush())
             .await
             .unwrap();
 
@@ -1485,11 +1515,11 @@ mod tests {
 
         let encoded = builder.build().await.unwrap();
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded, false, WriteIntent::flush())
             .await
             .unwrap();
         let stats = table_store
-            .read_stats(&sst_handle, true)
+            .read_stats(&sst_handle, true, ReadIntent::foreground())
             .await
             .unwrap()
             .expect("stats should be present");
@@ -1554,11 +1584,11 @@ mod tests {
             .unwrap();
         let encoded = builder.build().await.unwrap();
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded, false, WriteIntent::flush())
             .await
             .unwrap();
         let stats = table_store
-            .read_stats(&sst_handle, true)
+            .read_stats(&sst_handle, true, ReadIntent::foreground())
             .await
             .unwrap()
             .expect("stats should be present");
@@ -1596,11 +1626,11 @@ mod tests {
             .unwrap();
         let encoded = builder.build().await.unwrap();
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded, false, WriteIntent::flush())
             .await
             .unwrap();
         let stats = table_store
-            .read_stats(&sst_handle, true)
+            .read_stats(&sst_handle, true, ReadIntent::foreground())
             .await
             .unwrap()
             .expect("stats should be present");
@@ -1661,11 +1691,11 @@ mod tests {
 
         let encoded = builder.build().await.unwrap();
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded, false, WriteIntent::flush())
             .await
             .unwrap();
         let stats = table_store
-            .read_stats(&sst_handle, true)
+            .read_stats(&sst_handle, true, ReadIntent::foreground())
             .await
             .unwrap()
             .expect("stats should be present");
@@ -1739,13 +1769,16 @@ mod tests {
         }
         let encoded = builder.build().await.unwrap();
         table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded, false, WriteIntent::flush())
             .await
             .unwrap();
         let handle = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
 
         // --- Both sub-filters decoded correctly ---
-        let filters = table_store.read_filters(&handle, false).await.unwrap();
+        let filters = table_store
+            .read_filters(&handle, false, ReadIntent::foreground())
+            .await
+            .unwrap();
         assert_eq!(
             filters.len(),
             2,
@@ -1785,7 +1818,7 @@ mod tests {
         );
         let handle_partial = store_partial.open_sst(&SsTableId::Wal(0)).await.unwrap();
         let partial = store_partial
-            .read_filters(&handle_partial, false)
+            .read_filters(&handle_partial, false, ReadIntent::foreground())
             .await
             .unwrap();
         assert_eq!(

@@ -1,5 +1,4 @@
 use crate::bytes_range::BytesRange;
-use crate::cached_object_store::CachedObjectStore;
 use crate::clock::MonotonicClock;
 use crate::config::{CheckpointOptions, DbReaderOptions, ReadOptions, ScanOptions};
 use crate::db_cache_manager::{self, CacheTarget};
@@ -13,8 +12,8 @@ use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
 use crate::mem_table::{ImmutableMemtable, KVTable};
 use crate::merge_operator::MergeOperatorType;
+use crate::object_store_intent::ReadIntent;
 use crate::oracle::DbReaderOracle;
-use crate::paths::PathResolver;
 use crate::rand::DbRand;
 use crate::reader::{DbStateReader, Reader, ScanContext};
 use crate::sst_iter::SstIteratorOptions;
@@ -468,6 +467,7 @@ impl DbReaderInner {
             order: IterationOrder::Ascending,
             prefix: None,
             filter_context: None,
+            read_intent: ReadIntent::foreground(),
         };
 
         let (mut replay_after_wal_id, mut last_committed_seq) =
@@ -631,26 +631,6 @@ impl DbReader {
             });
         }
         Ok(())
-    }
-
-    /// Preload the disk cache from the current manifest state.
-    pub(crate) async fn preload_cache(
-        &self,
-        cached_obj_store: &CachedObjectStore,
-        path: object_store::path::Path,
-    ) -> Result<(), SlateDBError> {
-        let state = Arc::clone(&self.inner.state.read());
-        let external_ssts = state.manifest.external_ssts();
-        let path_resolver = PathResolver::new_with_external_ssts(path, external_ssts);
-        let cache_opts = &self.inner.options.object_store_cache_options;
-        crate::utils::preload_cache_from_manifest(
-            &state.manifest.core,
-            cached_obj_store,
-            &path_resolver,
-            cache_opts.preload_disk_cache_on_startup,
-            cache_opts.max_cache_size_bytes.unwrap_or(usize::MAX),
-        )
-        .await
     }
 
     /// Creates a database reader that can read the contents of a database (but cannot write any
@@ -1212,6 +1192,7 @@ mod tests {
     use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
     use crate::mem_table::{ImmutableMemtable, WritableKVTable};
     use crate::merge_operator::MergeOperatorType;
+    use crate::object_store_intent::WriteIntent;
     use crate::object_stores::ObjectStores;
     use crate::oracle::DbReaderOracle;
     use crate::paths::PathResolver;
@@ -2110,7 +2091,7 @@ mod tests {
         wal_id: u64,
         entries: Vec<RowEntry>,
     ) -> Result<(), SlateDBError> {
-        let mut writer = table_store.table_writer(SsTableId::Wal(wal_id));
+        let mut writer = table_store.table_writer(SsTableId::Wal(wal_id), WriteIntent::flush());
         for entry in entries {
             writer.add(entry).await?;
         }
@@ -2490,6 +2471,8 @@ mod tests {
 
     #[tokio::test]
     async fn should_populate_disk_cache_on_read() {
+        use crate::cached_object_store::CachedObjectStore;
+
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_db_reader_disk_cache");
 
@@ -2503,18 +2486,22 @@ mod tests {
         db.flush().await.unwrap();
         db.close().await.unwrap();
 
-        // Open a DbReader with disk caching enabled
+        // Open a DbReader with disk caching enabled by constructing the
+        // CachedObjectStore explicitly and handing it to the reader.
         let cache_dir = tempfile::Builder::new()
             .prefix("dbreader_cache_test_")
             .tempdir()
             .unwrap();
         let cache_path = cache_dir.keep();
 
-        let mut reader_opts = DbReaderOptions::default();
-        reader_opts.object_store_cache_options.root_folder = Some(cache_path.clone());
-        reader_opts.object_store_cache_options.part_size_bytes = 1024;
+        let cached_store = CachedObjectStore::builder(Arc::clone(&object_store))
+            .root_folder(cache_path.clone())
+            .part_size_bytes(1024)
+            .build()
+            .await
+            .unwrap();
 
-        let reader = DbReader::open(path.clone(), Arc::clone(&object_store), None, reader_opts)
+        let reader = DbReader::open(path.clone(), cached_store, None, DbReaderOptions::default())
             .await
             .unwrap();
 

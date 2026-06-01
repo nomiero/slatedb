@@ -9,7 +9,7 @@ use futures::{future::join_all, StreamExt};
 use log::{debug, warn};
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
+use object_store::{Extensions, ObjectStore, ObjectStoreExt, PutMode};
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
@@ -22,6 +22,10 @@ use crate::filter_policy::NamedFilter;
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::block::Block;
 use crate::format::sst::{EncodedSsTable, SsTableFormat};
+use crate::object_store_intent::{
+    get_options_with_intent, head_options_with_intent, put_options_with_intent_and_mode,
+    range_options_with_intent, set_write_intent, ReadIntent, RetryReason, WriteIntent,
+};
 use crate::object_stores::{ObjectStoreType, ObjectStores};
 use crate::paths::PathResolver;
 use crate::sst_builder::EncodedSsTableBuilder;
@@ -37,26 +41,55 @@ pub(crate) struct TableStore {
     fp_registry: Arc<FailPointRegistry>,
     /// In-memory cache for data blocks, indices, and filters
     cache: Option<Arc<dyn DbCache>>,
+    /// Override for the underlying `BufWriter` capacity used by SST
+    /// writes. `None` defers to `BufWriter::new` (10 MiB default).
+    /// Tests can set a small value to force every SST write through
+    /// the multipart path so that extensions (intent tags) reach the
+    /// wrapper. See `bufwriter_capacity_override_forces_tagged_writes`.
+    bufwriter_capacity: Option<usize>,
 }
 
 struct ReadOnlyObject {
     object_store: Arc<dyn ObjectStore>,
     path: Path,
+    intent: ReadIntent,
+}
+
+impl ReadOnlyObject {
+    fn new(object_store: Arc<dyn ObjectStore>, path: Path, intent: ReadIntent) -> Self {
+        Self {
+            object_store,
+            path,
+            intent,
+        }
+    }
 }
 
 impl ReadOnlyBlob for ReadOnlyObject {
     async fn len(&self) -> Result<u64, SlateDBError> {
-        let object_metadata = self.object_store.head(&self.path).await?;
+        let object_metadata = self
+            .object_store
+            .get_opts(&self.path, head_options_with_intent(self.intent))
+            .await?
+            .meta;
         Ok(object_metadata.size)
     }
 
     async fn read_range(&self, range: Range<u64>) -> Result<Bytes, SlateDBError> {
-        let bytes = self.object_store.get_range(&self.path, range).await?;
+        let bytes = self
+            .object_store
+            .get_opts(&self.path, range_options_with_intent(self.intent, range))
+            .await?
+            .bytes()
+            .await?;
         Ok(bytes)
     }
 
     async fn read(&self) -> Result<Bytes, SlateDBError> {
-        let file = self.object_store.get(&self.path).await?;
+        let file = self
+            .object_store
+            .get_opts(&self.path, get_options_with_intent(self.intent))
+            .await?;
         let bytes = file.bytes().await?;
         Ok(bytes)
     }
@@ -103,6 +136,33 @@ impl TableStore {
             path_resolver,
             fp_registry,
             cache,
+            bufwriter_capacity: None,
+        }
+    }
+
+    /// Test-only constructor that overrides the underlying `BufWriter`
+    /// capacity. Setting a small capacity forces SST writes through the
+    /// multipart path, which is the only branch where the upstream
+    /// `BufWriter` correctly forwards extensions
+    /// (<https://github.com/apache/arrow-rs-object-store/issues/735>).
+    /// Use this to drive end-to-end tests that need to assert intents
+    /// arrive at a wrapper without depending on the size of the test
+    /// payload.
+    #[cfg(test)]
+    pub(crate) fn new_with_bufwriter_capacity<P: Into<Path>>(
+        object_stores: ObjectStores,
+        sst_format: SsTableFormat,
+        root_path: P,
+        block_cache: Option<Arc<dyn DbCache>>,
+        bufwriter_capacity: usize,
+    ) -> Self {
+        Self {
+            object_stores,
+            sst_format,
+            path_resolver: PathResolver::new(root_path),
+            fp_registry: Arc::new(FailPointRegistry::new()),
+            cache: block_cache,
+            bufwriter_capacity: Some(bufwriter_capacity),
         }
     }
 
@@ -274,13 +334,23 @@ impl TableStore {
         Ok(self.last_seen_wal_id(wal_id_last_compacted).await? + 1)
     }
 
-    pub(crate) fn table_writer(&self, id: SsTableId) -> EncodedSsTableWriter<'_> {
+    /// Test-only shim that picks a sensible default intent so existing
+    pub(crate) fn table_writer(
+        &self,
+        id: SsTableId,
+        intent: WriteIntent,
+    ) -> EncodedSsTableWriter<'_> {
         let object_store = self.object_stores.store_for(&id);
         let path = self.path(&id);
         EncodedSsTableWriter {
             id,
             builder: self.sst_format.table_builder(),
-            writer: BufWriter::new(object_store, path),
+            writer: new_intent_tagged_bufwriter(
+                object_store,
+                path,
+                intent,
+                self.bufwriter_capacity,
+            ),
             table_store: self,
             #[cfg(test)]
             blocks_written: 0,
@@ -300,6 +370,7 @@ impl TableStore {
         id: &SsTableId,
         encoded_sst: &EncodedSsTable,
         write_cache: bool,
+        intent: WriteIntent,
     ) -> Result<SsTableHandle, SlateDBError> {
         fail_point!(
             self.fp_registry.clone(),
@@ -318,15 +389,21 @@ impl TableStore {
         let path = self.path(id);
         match id {
             SsTableId::Compacted(_) => {
-                write_sst_streaming_in_object_store(object_store.clone(), &path, encoded_sst)
-                    .await?;
+                write_sst_streaming_in_object_store(
+                    object_store.clone(),
+                    &path,
+                    encoded_sst,
+                    intent,
+                    self.bufwriter_capacity,
+                )
+                .await?;
             }
             // WAL SSTs rely on PutMode::Create for fencing. The generic
             // object_store multipart API cannot express that condition, so WALs
             // stay on the conditional single-PUT path for now.
             SsTableId::Wal(_) => {
                 let data = encoded_sst.remaining_as_bytes();
-                write_sst_in_object_store(object_store.clone(), id, &path, &data).await?;
+                write_sst_in_object_store(object_store.clone(), id, &path, &data, intent).await?;
             }
         }
 
@@ -375,6 +452,7 @@ impl TableStore {
             &id,
             &self.path(&id),
             &Bytes::new(),
+            WriteIntent::wal(),
         )
         .await
     }
@@ -450,7 +528,10 @@ impl TableStore {
     pub(crate) async fn metadata(&self, id: &SsTableId) -> Result<SstFileMetadata, SlateDBError> {
         let object_store = self.object_stores.store_for(id);
         let path = self.path(id);
-        let metadata = object_store.head(&path).await?;
+        let metadata = object_store
+            .get_opts(&path, head_options_with_intent(ReadIntent::foreground()))
+            .await?
+            .meta;
         Ok(SstFileMetadata {
             id: *id,
             location: path,
@@ -511,7 +592,7 @@ impl TableStore {
     pub(crate) async fn open_sst(&self, id: &SsTableId) -> Result<SsTableHandle, SlateDBError> {
         let object_store = self.object_stores.store_for(id);
         let path = self.path(id);
-        let obj = ReadOnlyObject { object_store, path };
+        let obj = ReadOnlyObject::new(object_store, path, ReadIntent::foreground());
         let (info, version) = self
             .sst_format
             .read_info_and_version(&obj)
@@ -524,7 +605,7 @@ impl TableStore {
     pub(crate) async fn read_sst_version(&self, id: &SsTableId) -> Result<u16, SlateDBError> {
         let object_store = self.object_stores.store_for(id);
         let path = self.path(id);
-        let obj = ReadOnlyObject { object_store, path };
+        let obj = ReadOnlyObject::new(object_store, path, ReadIntent::foreground());
         let (_, version) = self
             .sst_format
             .read_info_and_version(&obj)
@@ -534,14 +615,13 @@ impl TableStore {
     }
 
     /// Reads the filters of an SSTable. Every returned entry is decoded.
-    ///
-    /// ## Arguments
-    /// - `handle`: The handle of the SSTable to read the filters from.
-    /// - `cache_blocks`: Whether to cache the filters after reading them.
+    /// The `intent` flows down to the object store call so the wrapper
+    /// can apply policy per call kind.
     pub(crate) async fn read_filters(
         &self,
         handle: &SsTableHandle,
         cache_blocks: bool,
+        intent: ReadIntent,
     ) -> Result<Arc<[NamedFilter]>, SlateDBError> {
         // No filter exists for this SST (either no policies configured, or the
         // SST was built below `min_filter_keys`). Return an empty slice without
@@ -562,7 +642,7 @@ impl TableStore {
                 cache
                     .fetch_filter(
                         cache_key.clone(),
-                        self.read_loader(handle, CacheTarget::Filters),
+                        self.read_loader(handle, CacheTarget::Filters, intent),
                     )
                     .await
                     .ok()
@@ -583,21 +663,21 @@ impl TableStore {
         }
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
-        let obj = ReadOnlyObject { object_store, path };
-        self.sst_format
-            .read_filters(&handle.info, &obj)
-            .await
-            .map_err(|e| e.with_path(&obj.path))
+        let sst_format = &self.sst_format;
+        let info = &handle.info;
+        read_with_retry(object_store, path, intent, |obj| async move {
+            sst_format.read_filters(info, &obj).await
+        })
+        .await
     }
 
-    /// Reads the stats block of an SSTable.
-    ///
-    /// ## Arguments
-    /// - `handle`: The handle of the SSTable to read the stats from.
+    /// Reads the stats block of an SSTable, tagging the underlying
+    /// object store call with `intent`.
     pub(crate) async fn read_stats(
         &self,
         handle: &SsTableHandle,
         cache_blocks: bool,
+        intent: ReadIntent,
     ) -> Result<Option<SstStats>, SlateDBError> {
         if handle.info.stats_len == 0 {
             return Ok(None);
@@ -607,7 +687,10 @@ impl TableStore {
             // See `read_filters` for the rationale on the fall-through path.
             let entry = if cache_blocks {
                 cache
-                    .fetch_stats(cache_key, self.read_loader(handle, CacheTarget::Stats))
+                    .fetch_stats(
+                        cache_key,
+                        self.read_loader(handle, CacheTarget::Stats, intent),
+                    )
                     .await
                     .ok()
             } else {
@@ -619,29 +702,31 @@ impl TableStore {
         }
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
-        let obj = ReadOnlyObject { object_store, path };
-        self.sst_format
-            .read_stats(&handle.info, &obj)
-            .await
-            .map_err(|e| e.with_path(&obj.path))
+        let sst_format = &self.sst_format;
+        let info = &handle.info;
+        read_with_retry(object_store, path, intent, |obj| async move {
+            sst_format.read_stats(info, &obj).await
+        })
+        .await
     }
 
-    /// Reads the index of an SSTable.
-    ///
-    /// ## Arguments
-    /// - `handle`: The handle of the SSTable to read the index from.
-    /// - `cache_blocks`: Whether to cache the index blocks after reading them.
+    /// Reads the index of an SSTable, tagging the underlying object
+    /// store call with `intent`.
     pub(crate) async fn read_index(
         &self,
         handle: &SsTableHandle,
         cache_blocks: bool,
+        intent: ReadIntent,
     ) -> Result<Arc<SsTableIndexOwned>, SlateDBError> {
         let cache_key = (handle.id, handle.info.index_offset).into();
         if let Some(ref cache) = self.cache {
             // See `read_filters` for the rationale on the fall-through path.
             let entry = if cache_blocks {
                 cache
-                    .fetch_index(cache_key, self.read_loader(handle, CacheTarget::Index))
+                    .fetch_index(
+                        cache_key,
+                        self.read_loader(handle, CacheTarget::Index, intent),
+                    )
                     .await
                     .ok()
             } else {
@@ -653,13 +738,13 @@ impl TableStore {
         }
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
-        let obj = ReadOnlyObject { object_store, path };
-        Ok(Arc::new(
-            self.sst_format
-                .read_index(&handle.info, &obj)
-                .await
-                .map_err(|e| e.with_path(&obj.path))?,
-        ))
+        let sst_format = &self.sst_format;
+        let info = &handle.info;
+        let index = read_with_retry(object_store, path, intent, |obj| async move {
+            sst_format.read_index(info, &obj).await
+        })
+        .await?;
+        Ok(Arc::new(index))
     }
 
     /// Build a [`CacheLoader`] for a section-level cache entry (filter, stats,
@@ -669,14 +754,19 @@ impl TableStore {
     /// Builds a fresh boxed closure on every call, even when the cache hits and
     /// the loader is never invoked; revisit if cache-hit allocations show up in
     /// profiles.
-    fn read_loader(&self, handle: &SsTableHandle, target: CacheTarget) -> CacheLoader {
+    fn read_loader(
+        &self,
+        handle: &SsTableHandle,
+        target: CacheTarget,
+        intent: ReadIntent,
+    ) -> CacheLoader {
         let info = handle.info.clone();
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
         let sst_format = self.sst_format.clone();
         Box::new(move || {
             Box::pin(async move {
-                let obj = ReadOnlyObject { object_store, path };
+                let obj = ReadOnlyObject::new(object_store, path, intent);
                 match target {
                     CacheTarget::Filters => {
                         let filters = sst_format
@@ -720,6 +810,7 @@ impl TableStore {
         handle: &SsTableHandle,
         index: Arc<SsTableIndexOwned>,
         block_num: usize,
+        intent: ReadIntent,
     ) -> CacheLoader {
         let info = handle.info.clone();
         let object_store = self.object_stores.store_for(&handle.id);
@@ -727,7 +818,7 @@ impl TableStore {
         let sst_format = self.sst_format.clone();
         Box::new(move || {
             Box::pin(async move {
-                let obj = ReadOnlyObject { object_store, path };
+                let obj = ReadOnlyObject::new(object_store, path, intent);
                 let block = sst_format
                     .read_block(&info, &index, block_num, &obj)
                     .await
@@ -745,7 +836,7 @@ impl TableStore {
     ) -> Result<VecDeque<Block>, SlateDBError> {
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
-        let obj = ReadOnlyObject { object_store, path };
+        let obj = ReadOnlyObject::new(object_store, path, ReadIntent::foreground());
         let index = self
             .sst_format
             .read_index(&handle.info, &obj)
@@ -757,18 +848,15 @@ impl TableStore {
             .map_err(|e| e.with_path(&obj.path))
     }
 
-    /// Reads specified blocks from an SSTable using the provided index.
-    ///
-    /// This function attempts to read blocks from the cache if available
-    /// and falls back to reading from storage for uncached blocks
-    /// using an async fetch for each contiguous range that blocks are not cached.
-    /// It can optionally cache newly read blocks.
+    /// Reads specified blocks from an SSTable using the provided index,
+    /// tagging the underlying object store call(s) with `intent`.
     pub(crate) async fn read_blocks_using_index(
         &self,
         handle: &SsTableHandle,
         index: Arc<SsTableIndexOwned>,
         blocks: Range<usize>,
         cache_blocks: bool,
+        intent: ReadIntent,
     ) -> Result<VecDeque<Arc<Block>>, SlateDBError> {
         // Single-block reads (point-gets via SstIterator::for_key, SstFile::read_block,
         // etc.) take a dedup-aware fast-path: concurrent callers for the same block
@@ -781,7 +869,7 @@ impl TableStore {
                 let block_num = blocks.start;
                 let offset = index.borrow().block_meta().get(block_num).offset();
                 let cache_key: CachedKey = (handle.id, offset).into();
-                let loader = self.block_loader(handle, index.clone(), block_num);
+                let loader = self.block_loader(handle, index.clone(), block_num, intent);
                 if let Ok(entry) = cache.fetch_block(cache_key, loader).await {
                     if let Some(block) = entry.block() {
                         let mut result = VecDeque::with_capacity(1);
@@ -795,7 +883,7 @@ impl TableStore {
         // Create a ReadOnlyObject for accessing the SSTable file
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
-        let obj = ReadOnlyObject { object_store, path };
+        let obj = ReadOnlyObject::new(object_store, path, intent);
         // Initialize the result vector and a vector to track uncached ranges
         let mut blocks_read = VecDeque::with_capacity(blocks.end - blocks.start);
         let mut uncached_ranges = Vec::new();
@@ -890,7 +978,7 @@ impl TableStore {
     ) -> Result<Block, SlateDBError> {
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
-        let obj = ReadOnlyObject { object_store, path };
+        let obj = ReadOnlyObject::new(object_store, path, ReadIntent::foreground());
         let index = self.sst_format.read_index(&handle.info, &obj).await?;
         self.sst_format
             .read_block(&handle.info, &index, block, &obj)
@@ -932,7 +1020,10 @@ impl TableStore {
         };
         // Best effort: if we can't read the index we can't enumerate blocks,
         // so log and skip. Remaining entries will age out under normal pressure.
-        let index = match self.read_index(handle, false).await {
+        let index = match self
+            .read_index(handle, false, ReadIntent::foreground())
+            .await
+        {
             Ok(index) => index,
             Err(e) => {
                 warn!(
@@ -974,7 +1065,10 @@ async fn wal_object_exists(
     object_store: &Arc<dyn ObjectStore>,
     path: &Path,
 ) -> Result<bool, SlateDBError> {
-    match object_store.head(path).await {
+    match object_store
+        .get_opts(path, head_options_with_intent(ReadIntent::foreground()))
+        .await
+    {
         Ok(_) => Ok(true),
         Err(object_store::Error::NotFound { .. }) => Ok(false),
         Err(e) => Err(SlateDBError::from(e)),
@@ -986,9 +1080,14 @@ async fn write_sst_in_object_store(
     id: &SsTableId,
     path: &Path,
     data: &Bytes,
+    intent: WriteIntent,
 ) -> Result<(), SlateDBError> {
     object_store
-        .put_opts(path, data.clone().into(), PutOptions::from(PutMode::Create))
+        .put_opts(
+            path,
+            data.clone().into(),
+            put_options_with_intent_and_mode(intent, PutMode::Create),
+        )
         .await
         .map_err(|e| match e {
             object_store::Error::AlreadyExists { path: _, source: _ } => match id {
@@ -1007,14 +1106,49 @@ async fn write_sst_streaming_in_object_store(
     object_store: Arc<dyn ObjectStore>,
     path: &Path,
     encoded_sst: &EncodedSsTable,
+    intent: WriteIntent,
+    bufwriter_capacity: Option<usize>,
 ) -> Result<(), SlateDBError> {
-    let mut writer = BufWriter::new(object_store, path.clone());
+    let mut writer =
+        new_intent_tagged_bufwriter(object_store, path.clone(), intent, bufwriter_capacity);
     for block in &encoded_sst.unconsumed_blocks {
         writer.put(block.encoded_bytes.clone()).await?;
     }
     writer.put(encoded_sst.footer.clone()).await?;
     writer.shutdown().await?;
     Ok(())
+}
+
+/// Build a `BufWriter` with the given `WriteIntent` attached via
+/// `Extensions`. Note: upstream `object_store` 0.13 has a bug where
+/// `BufWriter::poll_shutdown` drops the extensions on the single-PUT
+/// path (payload <= capacity). The multipart overflow path forwards
+/// them correctly. Tracked upstream:
+/// <https://github.com/apache/arrow-rs-object-store/issues/735>.
+///
+/// Until that upstream fix lands, small SST writes (below the 10 MiB
+/// default capacity) reach a wrapper untagged. The two
+/// `bufwriter_*_payload_*` tests in `object_store_intent::tests`
+/// document the gap and act as regression catches for when upstream
+/// closes the issue.
+///
+/// `capacity` is forwarded to `BufWriter::with_capacity` when `Some`,
+/// otherwise the upstream default (10 MiB) is used. Tests pass a
+/// small value to force every write through the multipart path so
+/// that extensions reach the wrapper.
+pub(crate) fn new_intent_tagged_bufwriter(
+    object_store: Arc<dyn ObjectStore>,
+    path: Path,
+    intent: WriteIntent,
+    capacity: Option<usize>,
+) -> BufWriter {
+    let mut extensions = Extensions::default();
+    set_write_intent(&mut extensions, intent);
+    let writer = match capacity {
+        Some(cap) => BufWriter::with_capacity(object_store, path, cap),
+        None => BufWriter::new(object_store, path),
+    };
+    writer.with_extensions(extensions)
 }
 
 pub(crate) struct EncodedSsTableWriter<'a> {
@@ -1039,10 +1173,10 @@ impl EncodedSsTableWriter<'_> {
     pub(crate) async fn close(mut self) -> Result<SsTableHandle, SlateDBError> {
         let mut encoded_sst = self.builder.build().await?;
         while let Some(block) = encoded_sst.unconsumed_blocks.pop_front() {
-            self.writer.write_all(block.encoded_bytes.as_ref()).await?;
+            self.writer.put(block.encoded_bytes).await?;
         }
 
-        self.writer.write_all(encoded_sst.footer.as_ref()).await?;
+        self.writer.put(encoded_sst.footer).await?;
         self.writer.shutdown().await?;
         self.table_store
             .cache_filters(self.id, encoded_sst.info.filter_offset, encoded_sst.filters)
@@ -1056,7 +1190,7 @@ impl EncodedSsTableWriter<'_> {
 
     async fn drain_blocks(&mut self) -> Result<(), SlateDBError> {
         while let Some(block) = self.builder.next_block() {
-            self.writer.write_all(block.encoded_bytes.as_ref()).await?;
+            self.writer.put(block.encoded_bytes).await?;
             #[cfg(test)]
             {
                 self.blocks_written += 1;
@@ -1080,6 +1214,57 @@ fn slatedb_io_error() -> SlateDBError {
     SlateDBError::from(std::io::Error::other("oops"))
 }
 
+/// Runs `op` against a `ReadOnlyObject` built from `(object_store, path,
+/// intent)`. On a recoverable validation error, rebuilds the
+/// `ReadOnlyObject` with `intent.with_retry(reason)` and runs `op` once
+/// more so the wrapper sees the retry tag and can evict its cached copy.
+/// `op` is invoked at most twice; the retry-loop bound matches the
+/// RFC's "bounded retries" contract.
+async fn read_with_retry<F, Fut, T>(
+    object_store: Arc<dyn ObjectStore>,
+    path: Path,
+    intent: ReadIntent,
+    op: F,
+) -> Result<T, SlateDBError>
+where
+    F: Fn(ReadOnlyObject) -> Fut,
+    Fut: std::future::Future<Output = Result<T, SlateDBError>>,
+{
+    let obj = ReadOnlyObject::new(object_store.clone(), path.clone(), intent);
+    match op(obj).await {
+        Ok(v) => Ok(v),
+        Err(e) => match retry_reason_for(&e) {
+            Some(reason) => {
+                let retry_obj =
+                    ReadOnlyObject::new(object_store, path.clone(), intent.with_retry(reason));
+                op(retry_obj).await.map_err(|e| e.with_path(&path))
+            }
+            None => Err(e.with_path(&path)),
+        },
+    }
+}
+
+/// Maps a recoverable SST validation error to a `RetryReason`, or
+/// returns `None` for non-recoverable errors (network, NotFound,
+/// permission, etc.) which should propagate without a retry.
+fn retry_reason_for(err: &SlateDBError) -> Option<RetryReason> {
+    match err {
+        SlateDBError::ChecksumMismatch { .. } => Some(RetryReason::CrcMismatch),
+        #[cfg(any(
+            feature = "snappy",
+            feature = "zlib",
+            feature = "lz4",
+            feature = "zstd"
+        ))]
+        SlateDBError::BlockDecompressionError => Some(RetryReason::DecompressionError),
+        SlateDBError::BlockTransformError
+        | SlateDBError::EmptyBlock
+        | SlateDBError::EmptyBlockMeta
+        | SlateDBError::InvalidFilterBlock => Some(RetryReason::BlockDecodeError),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::types::KeyValue;
@@ -1100,6 +1285,7 @@ mod tests {
     use crate::format::block::Block;
     use crate::format::sst::SsTableFormat;
     use crate::manifest::SsTableView;
+    use crate::object_store_intent::{ReadIntent, WriteIntent};
     use crate::object_stores::ObjectStores;
     use crate::rand::DbRand;
     use crate::retrying_object_store::RetryingObjectStore;
@@ -1246,7 +1432,7 @@ mod tests {
         let id = SsTableId::Compacted(ulid::Ulid::new());
 
         // when:
-        let mut writer = ts.table_writer(id);
+        let mut writer = ts.table_writer(id, WriteIntent::flush());
         writer
             .add(RowEntry::new_value(&[b'a'; 16], &[1u8; 16], 0))
             .await
@@ -1319,7 +1505,7 @@ mod tests {
         let id = SsTableId::Wal(123);
 
         // when:
-        let mut writer = ts.table_writer(id);
+        let mut writer = ts.table_writer(id, WriteIntent::flush());
         writer
             .add(RowEntry::new_value(&[b'a'; 16], &[1u8; 16], 0))
             .await
@@ -1393,7 +1579,9 @@ mod tests {
             .await
             .unwrap();
         let table = sst1.build().await.unwrap();
-        ts.write_sst(&wal_id, &table, false).await.unwrap();
+        ts.write_sst(&wal_id, &table, false, WriteIntent::flush())
+            .await
+            .unwrap();
 
         let mut sst2 = ts.table_builder();
         sst2.add(RowEntry::new_value(b"key", b"value", 0))
@@ -1402,7 +1590,9 @@ mod tests {
         let table2 = sst2.build().await.unwrap();
 
         // write another wal sst with the same id.
-        let result = ts.write_sst(&wal_id, &table2, false).await;
+        let result = ts
+            .write_sst(&wal_id, &table2, false, WriteIntent::flush())
+            .await;
         assert!(matches!(result, Err(error::SlateDBError::Fenced)));
     }
 
@@ -1454,7 +1644,9 @@ mod tests {
             .await
             .unwrap();
         let table = sst.build().await.unwrap();
-        let result = ts.write_sst(&SsTableId::Wal(1), &table, false).await;
+        let result = ts
+            .write_sst(&SsTableId::Wal(1), &table, false, WriteIntent::flush())
+            .await;
         assert!(matches!(result, Err(error::SlateDBError::Fenced)));
     }
 
@@ -1493,7 +1685,9 @@ mod tests {
         let sst = builder.build().await.unwrap();
 
         // when:
-        ts.write_sst(&id, &sst, false).await.unwrap();
+        ts.write_sst(&id, &sst, false, WriteIntent::flush())
+            .await
+            .unwrap();
 
         // then:
         assert_eq!(os.put_attempts(), 0);
@@ -1536,7 +1730,9 @@ mod tests {
         let sst = builder.build().await.unwrap();
 
         // when:
-        let result = ts.write_sst(&wal_id, &sst, false).await;
+        let result = ts
+            .write_sst(&wal_id, &sst, false, WriteIntent::flush())
+            .await;
 
         // then:
         assert!(matches!(
@@ -1563,7 +1759,7 @@ mod tests {
         ));
         let id = SsTableId::Compacted(ulid::Ulid::new());
 
-        let mut writer = ts.table_writer(id);
+        let mut writer = ts.table_writer(id, WriteIntent::flush());
         writer
             .add(RowEntry::new_value(&[b'a'; 16], &[1u8; 16], 0))
             .await
@@ -1631,7 +1827,7 @@ mod tests {
 
         // Create and write SST
         let id = SsTableId::Compacted(ulid::Ulid::new());
-        let mut writer = ts.table_writer(id);
+        let mut writer = ts.table_writer(id, WriteIntent::flush());
         let mut expected_data = Vec::with_capacity(20);
         for i in 0..20 {
             let key = [i as u8; 16];
@@ -1648,11 +1844,20 @@ mod tests {
         let handle = writer.close().await.unwrap();
 
         // Read the index
-        let index = ts.read_index(&handle, true).await.unwrap();
+        let index = ts
+            .read_index(&handle, true, ReadIntent::foreground())
+            .await
+            .unwrap();
 
         // Test 1: SST hit
         let blocks = ts
-            .read_blocks_using_index(&handle, index.clone(), 0..20, true)
+            .read_blocks_using_index(
+                &handle,
+                index.clone(),
+                0..20,
+                true,
+                ReadIntent::foreground(),
+            )
             .await
             .unwrap();
 
@@ -1684,7 +1889,13 @@ mod tests {
 
         // Test 2: Partial cache hit, everything should be returned since missing blocks are returned from sst
         let blocks = ts
-            .read_blocks_using_index(&handle, index.clone(), 0..20, true)
+            .read_blocks_using_index(
+                &handle,
+                index.clone(),
+                0..20,
+                true,
+                ReadIntent::foreground(),
+            )
             .await
             .unwrap();
         assert_blocks(&blocks, &expected_data).await;
@@ -1709,7 +1920,13 @@ mod tests {
 
         // Test 3: All blocks should be in cache after SST file is emptied
         let blocks = ts
-            .read_blocks_using_index(&handle, index.clone(), 0..20, true)
+            .read_blocks_using_index(
+                &handle,
+                index.clone(),
+                0..20,
+                true,
+                ReadIntent::foreground(),
+            )
             .await
             .unwrap();
         assert_blocks(&blocks, &expected_data).await;
@@ -1730,13 +1947,25 @@ mod tests {
 
         // Test 4: Verify that reading specific ranges still works after SST file is emptied
         let blocks = ts
-            .read_blocks_using_index(&handle, index.clone(), 5..10, true)
+            .read_blocks_using_index(
+                &handle,
+                index.clone(),
+                5..10,
+                true,
+                ReadIntent::foreground(),
+            )
             .await
             .unwrap();
         assert_blocks(&blocks, &expected_data[5..10]).await;
 
         let blocks = ts
-            .read_blocks_using_index(&handle, index.clone(), 15..20, true)
+            .read_blocks_using_index(
+                &handle,
+                index.clone(),
+                15..20,
+                true,
+                ReadIntent::foreground(),
+            )
             .await
             .unwrap();
         assert_blocks(&blocks, &expected_data[15..20]).await;
@@ -1767,7 +1996,12 @@ mod tests {
             .unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
         let handle = writer
-            .write_sst(&id, &builder.build().await.unwrap(), false)
+            .write_sst(
+                &id,
+                &builder.build().await.unwrap(),
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
 
@@ -1785,14 +2019,20 @@ mod tests {
         );
         assert_eq!(meta_cache.entry_count(), 0);
 
-        let _ = reader.read_index(&handle, false).await.unwrap();
+        let _ = reader
+            .read_index(&handle, false, ReadIntent::foreground())
+            .await
+            .unwrap();
         assert!(meta_cache
             .get_index(&(handle.id, handle.info.index_offset).into())
             .await
             .unwrap()
             .is_none());
 
-        let _ = reader.read_index(&handle, true).await.unwrap();
+        let _ = reader
+            .read_index(&handle, true, ReadIntent::foreground())
+            .await
+            .unwrap();
         assert!(meta_cache
             .get_index(&(handle.id, handle.info.index_offset).into())
             .await
@@ -1825,7 +2065,12 @@ mod tests {
             .unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
         let handle = writer
-            .write_sst(&id, &builder.build().await.unwrap(), false)
+            .write_sst(
+                &id,
+                &builder.build().await.unwrap(),
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
 
@@ -1843,7 +2088,10 @@ mod tests {
         );
         assert_eq!(meta_cache.entry_count(), 0);
 
-        let filters = reader.read_filters(&handle, false).await.unwrap();
+        let filters = reader
+            .read_filters(&handle, false, ReadIntent::foreground())
+            .await
+            .unwrap();
         assert!(!filters.is_empty());
         assert!(meta_cache
             .get_filter(&(handle.id, handle.info.filter_offset).into())
@@ -1851,7 +2099,10 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let _ = reader.read_filters(&handle, true).await.unwrap();
+        let _ = reader
+            .read_filters(&handle, true, ReadIntent::foreground())
+            .await
+            .unwrap();
         assert!(meta_cache
             .get_filter(&(handle.id, handle.info.filter_offset).into())
             .await
@@ -1889,7 +2140,9 @@ mod tests {
         let sst_bytes = sst.remaining_as_bytes();
         let sst_info = sst.info.clone();
 
-        ts.write_sst(&id, &sst, true).await.unwrap();
+        ts.write_sst(&id, &sst, true, WriteIntent::flush())
+            .await
+            .unwrap();
 
         let index = ts
             .sst_format
@@ -1934,7 +2187,9 @@ mod tests {
         let sst_bytes = sst.remaining_as_bytes();
         let sst_info = sst.info.clone();
 
-        ts.write_sst(&id, &sst, false).await.unwrap();
+        ts.write_sst(&id, &sst, false, WriteIntent::flush())
+            .await
+            .unwrap();
 
         let index = ts
             .sst_format
@@ -2194,7 +2449,9 @@ mod tests {
         let expected_bytes = sst.remaining_as_bytes();
 
         // When writing via TableStore (should retry once)
-        ts.write_sst(&id, &sst, false).await.unwrap();
+        ts.write_sst(&id, &sst, false, WriteIntent::flush())
+            .await
+            .unwrap();
 
         // Then: a retry happened
         assert!(flaky.put_attempts() >= 2);
@@ -2412,7 +2669,12 @@ mod tests {
             .unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
         let handle = writer
-            .write_sst(&id, &builder.build().await.unwrap(), false)
+            .write_sst(
+                &id,
+                &builder.build().await.unwrap(),
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
 
@@ -2441,7 +2703,11 @@ mod tests {
         let handle_a = tokio::spawn({
             let reader = reader.clone();
             let handle = handle.clone();
-            async move { reader.read_index(&handle, true).await }
+            async move {
+                reader
+                    .read_index(&handle, true, ReadIntent::foreground())
+                    .await
+            }
         });
 
         // wait until A's read has reached the object store and is paused
@@ -2457,7 +2723,11 @@ mod tests {
         let task_b = {
             let reader = reader.clone();
             let handle = handle.clone();
-            async move { reader.read_index(&handle, true).await }
+            async move {
+                reader
+                    .read_index(&handle, true, ReadIntent::foreground())
+                    .await
+            }
         };
         let release_task = {
             let release = release.clone();
@@ -2512,14 +2782,22 @@ mod tests {
             .unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
         let handle = writer
-            .write_sst(&id, &builder.build().await.unwrap(), false)
+            .write_sst(
+                &id,
+                &builder.build().await.unwrap(),
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
 
         // given: pre-load the index via the unwrapped writer so the wrapped store
         // sees only block reads (the fast-path takes `index` as an argument, so no
         // extra index read happens inside the race).
-        let index = writer.read_index(&handle, false).await.unwrap();
+        let index = writer
+            .read_index(&handle, false, ReadIntent::foreground())
+            .await
+            .unwrap();
 
         // given: the same store wrapped so the first range read pauses, behind a
         // real FoyerCache that supports dedup
@@ -2549,7 +2827,7 @@ mod tests {
             let index = index.clone();
             async move {
                 reader
-                    .read_blocks_using_index(&handle, index, 0..1, true)
+                    .read_blocks_using_index(&handle, index, 0..1, true, ReadIntent::foreground())
                     .await
             }
         });
@@ -2570,7 +2848,7 @@ mod tests {
             let index = index.clone();
             async move {
                 reader
-                    .read_blocks_using_index(&handle, index, 0..1, true)
+                    .read_blocks_using_index(&handle, index, 0..1, true, ReadIntent::foreground())
                     .await
             }
         };

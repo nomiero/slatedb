@@ -576,9 +576,18 @@ pub trait DbCacheManagerOps {
     /// `FuturesUnordered`) to get the concurrency they want. Per-target
     /// outcomes are reflected in cache-manager metrics, not the return value.
     ///
-    /// Returns `Err` on the first failing target. If no block cache is
-    /// configured, or if the SST is not reachable from the current manifest,
-    /// the call is a no-op that returns `Ok(())`.
+    /// The warming reads carry `ReadIntent::warmup()` and flow through
+    /// whatever `ObjectStore` the user installed. With a block cache,
+    /// decoded blocks land in it. With an intent-aware disk cache wrapper
+    /// (e.g. `CachedObjectStore`), the fetched bytes land there as a side
+    /// effect, in addition to (or instead of) the block cache. With neither
+    /// cache configured the call still issues the reads, which makes it a
+    /// no-op for end-state but consumes bandwidth; callers usually skip it
+    /// in that case.
+    ///
+    /// Returns `Err` on the first failing target. If the SST is not
+    /// reachable from the current manifest, the call is a no-op that
+    /// returns `Ok(())`.
     async fn warm_sst(
         &self,
         sst_id: SsTableId,

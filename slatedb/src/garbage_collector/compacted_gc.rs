@@ -254,6 +254,7 @@ mod tests {
     use crate::format::sst::{SsTableFormat, SST_FORMAT_VERSION_LATEST};
     use crate::manifest::store::StoredManifest;
     use crate::manifest::{LsmTreeState, Manifest, ManifestCore, Segment};
+    use crate::object_store_intent::WriteIntent;
     use crate::object_stores::ObjectStores;
     use crate::test_utils::build_test_sst;
     use bytes::Bytes;
@@ -313,15 +314,25 @@ mod tests {
         let sst_active_recent = build_test_sst(&format, 1).await;
 
         table_store
-            .write_sst(&id_to_delete, &sst_to_delete, false)
+            .write_sst(&id_to_delete, &sst_to_delete, false, WriteIntent::flush())
             .await
             .unwrap();
         table_store
-            .write_sst(&id_within_min_age, &sst_within_min_age, false)
+            .write_sst(
+                &id_within_min_age,
+                &sst_within_min_age,
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
         let active_handle = table_store
-            .write_sst(&id_active_recent, &sst_active_recent, false)
+            .write_sst(
+                &id_active_recent,
+                &sst_active_recent,
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
 
@@ -417,15 +428,15 @@ mod tests {
         let sst_newer = build_test_sst(&format, 1).await;
 
         table_store
-            .write_sst(&id_to_delete, &sst_to_delete, false)
+            .write_sst(&id_to_delete, &sst_to_delete, false, WriteIntent::flush())
             .await
             .unwrap();
         let manifest_handle = table_store
-            .write_sst(&id_manifest, &sst_manifest, false)
+            .write_sst(&id_manifest, &sst_manifest, false, WriteIntent::flush())
             .await
             .unwrap();
         table_store
-            .write_sst(&id_newer, &sst_newer, false)
+            .write_sst(&id_newer, &sst_newer, false, WriteIntent::flush())
             .await
             .unwrap();
 
@@ -508,15 +519,15 @@ mod tests {
         let sst_barrier = build_test_sst(&format, 1).await;
         let sst_to_newer = build_test_sst(&format, 1).await;
         table_store
-            .write_sst(&id_to_delete, &sst_to_delete, false)
+            .write_sst(&id_to_delete, &sst_to_delete, false, WriteIntent::flush())
             .await
             .unwrap();
         table_store
-            .write_sst(&id_barrier, &sst_barrier, false)
+            .write_sst(&id_barrier, &sst_barrier, false, WriteIntent::flush())
             .await
             .unwrap();
         let active_handle = table_store
-            .write_sst(&id_to_newer, &sst_to_newer, false)
+            .write_sst(&id_to_newer, &sst_to_newer, false, WriteIntent::flush())
             .await
             .unwrap();
 
@@ -612,7 +623,12 @@ mod tests {
         // Newest L0 in the manifest has a later timestamp (9_000ms).
         let l0_id = SsTableId::Compacted(ulid::Ulid::from_parts(9_000, 0));
         let l0_handle = table_store
-            .write_sst(&l0_id, &build_test_sst(&format, 1).await, false)
+            .write_sst(
+                &l0_id,
+                &build_test_sst(&format, 1).await,
+                false,
+                WriteIntent::flush(),
+            )
             .await
             .unwrap();
         let mut dirty_manifest = stored_manifest.prepare_dirty().unwrap();
@@ -629,6 +645,7 @@ mod tests {
                 &compaction_output_id,
                 &build_test_sst(&format, 1).await,
                 false,
+                WriteIntent::flush(),
             )
             .await
             .unwrap();
