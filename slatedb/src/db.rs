@@ -3382,8 +3382,7 @@ mod tests {
             .tempdir()
             .unwrap();
         let path = "/tmp/test_db_records_remote_object_store_reads_but_not_cache_hits";
-        let kv_store =
-            build_cached_db(path, object_store.clone(), temp_dir.keep(), None).await;
+        let kv_store = build_cached_db(path, object_store.clone(), temp_dir.keep(), None).await;
 
         kv_store.put(b"test_key", b"test_value").await.unwrap();
         kv_store.flush().await.unwrap();

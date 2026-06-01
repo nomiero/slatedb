@@ -2501,10 +2501,9 @@ mod tests {
             .await
             .unwrap();
 
-        let reader =
-            DbReader::open(path.clone(), cached_store, None, DbReaderOptions::default())
-                .await
-                .unwrap();
+        let reader = DbReader::open(path.clone(), cached_store, None, DbReaderOptions::default())
+            .await
+            .unwrap();
 
         // Read data to populate the cache
         let val = reader.get(b"key1").await.unwrap();
