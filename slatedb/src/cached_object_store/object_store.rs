@@ -1,7 +1,7 @@
+use crate::cached_object_store::options::ObjectStoreCacheOptions;
 use crate::cached_object_store::stats::CachedObjectStoreStats;
 use crate::cached_object_store::storage_fs::FsCacheStorage;
 use crate::cached_object_store::LocalCacheEntry;
-use crate::cached_object_store::options::ObjectStoreCacheOptions;
 use crate::rand::DbRand;
 use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, stream, stream::BoxStream, StreamExt};
@@ -585,7 +585,7 @@ impl CachedObjectStore {
                 })
                 .await?;
 
-            Ok(Bytes::copy_from_slice(&bytes.slice(range_in_part)))
+            Ok(bytes.slice(range_in_part))
         })
     }
 
