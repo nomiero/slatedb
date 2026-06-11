@@ -4,6 +4,7 @@ use crate::iter::{EmptyIterator, RowEntryIterator};
 use crate::manifest::ManifestCore;
 use crate::manifest::SsTableView;
 use crate::mem_table::WritableKVTable;
+use crate::object_store_intent::ReadKind;
 use crate::sst_iter::{SstIterator, SstIteratorOptions};
 use crate::tablestore::TableStore;
 use crate::utils::panic_string;
@@ -105,6 +106,11 @@ impl WalReplayIterator {
         if sst_batch_size < 1 {
             return Err(SlateDBError::InvalidSSTBatchSize(sst_batch_size));
         }
+
+        // Tag every object store read issued during replay as a WAL replay
+        // (RFC-0027): WAL segments are consumed once, so caching wrappers
+        // should not admit them.
+        let table_store = Arc::new(table_store.as_ref().clone().with_read_kind(ReadKind::Wal));
 
         // load the last seq number from manifest, and use it as the starting seq number to avoid
         // replaying the entries that are already in the L0 SST. while replaying the WALs, we'll
@@ -831,5 +837,60 @@ mod tests {
         }
         writer.close().await?;
         Ok(next_seq)
+    }
+
+    /// Every object store read issued by WAL replay must carry the WAL
+    /// replay intent (RFC-0027) so caching wrappers do not admit one-shot
+    /// segment reads.
+    #[tokio::test]
+    async fn should_tag_replay_reads_with_wal_replay_intent() {
+        use crate::object_store_intent::ReadIntent;
+        use crate::test_utils::IntentRecordingObjectStore;
+
+        let recording = Arc::new(IntentRecordingObjectStore::new(Arc::new(InMemory::new())));
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(recording.clone(), None),
+            SsTableFormat::default(),
+            Path::from("/tmp/test_kv_store"),
+            None,
+        ));
+        let entries: BTreeMap<Bytes, Bytes> = (0..16u32)
+            .map(|i| {
+                (
+                    Bytes::from(format!("key{i:04}")),
+                    Bytes::from(format!("value{i:04}")),
+                )
+            })
+            .collect();
+        let mut iter = entries.iter();
+        write_wal(1, 0, &mut iter, entries.len(), Arc::clone(&table_store))
+            .await
+            .unwrap();
+        recording.clear();
+
+        let mut replay_iter = WalReplayIterator::all_wal_ids(
+            &ManifestCore::new(),
+            WalReplayOptions::default(),
+            Arc::clone(&table_store),
+        )
+        .await
+        .unwrap();
+        while replay_iter.next().await.unwrap().is_some() {}
+
+        let range_intents = recording.get_intents(false);
+        assert!(!range_intents.is_empty(), "replay should read WAL contents");
+        assert!(
+            range_intents.iter().all(|i| *i == Some(ReadIntent::wal())),
+            "expected WAL replay intents on reads, got {range_intents:?}"
+        );
+        let head_intents = recording.get_intents(true);
+        assert!(
+            !head_intents.is_empty(),
+            "replay should probe WAL existence"
+        );
+        assert!(
+            head_intents.iter().all(|i| *i == Some(ReadIntent::wal())),
+            "expected WAL replay intents on probes, got {head_intents:?}"
+        );
     }
 }

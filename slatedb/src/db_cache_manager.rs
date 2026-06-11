@@ -10,6 +10,7 @@ use crate::db_state::{SsTableHandle, SsTableId};
 use crate::error::SlateDBError;
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::manifest::VersionedManifest;
+use crate::object_store_intent::ReadKind;
 use crate::partitioned_keyspace::partitions_covering_range;
 use crate::tablestore::TableStore;
 
@@ -60,6 +61,14 @@ pub(crate) async fn warm_sst_impl(
         warn!("warm_sst called on a Db without a block cache configured");
         return Ok(());
     }
+    // Tag every object store read issued below as a warmup (RFC-0027) so
+    // wrappers can distinguish warmup traffic from foreground queries.
+    let table_store = &Arc::new(
+        table_store
+            .as_ref()
+            .clone()
+            .with_read_kind(ReadKind::Warmup),
+    );
 
     // Reuse the handle embedded in the manifest view instead of calling
     // `open_sst`, which would issue an extra object_store GET for info+version.
@@ -782,6 +791,39 @@ mod tests {
         assert!(
             cache.get_index(&index_key).await.unwrap().is_none(),
             "stats target must not fetch the index",
+        );
+
+        db.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn should_tag_warmup_reads_with_warmup_intent() {
+        use crate::object_store_intent::ReadIntent;
+        use crate::test_utils::IntentRecordingObjectStore;
+
+        // given: a flushed SST whose cache entries have been evicted, behind a
+        // store that records read intents (RFC-0027)
+        let recording = Arc::new(IntentRecordingObjectStore::new(Arc::new(InMemory::new())));
+        let db = open_db_single_sst(recording.clone()).await;
+        write_keys(&db, 64).await;
+        flush_to_l0(&db).await;
+        let sst_id = first_l0_sst_id(&db);
+        db.evict_cached_sst(sst_id).await.expect("evict");
+        recording.clear();
+
+        // when
+        db.warm_sst(sst_id, &[CacheTarget::data::<&[u8], _>(..)])
+            .await
+            .expect("warm_sst");
+
+        // then: every object store read issued by the warmup carries the
+        // warmup intent
+        let intents = recording.get_intents(false);
+        assert!(!intents.is_empty(), "warmup should read from object store");
+        assert!(
+            intents.iter().all(|i| *i == Some(ReadIntent::warmup())),
+            "expected warmup intents, got {:?}",
+            intents,
         );
 
         db.close().await.expect("close");

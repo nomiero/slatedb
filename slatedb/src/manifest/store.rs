@@ -6,6 +6,7 @@ use crate::error::SlateDBError::{
 };
 use crate::flatbuffer_types::FlatBufferManifestCodec;
 use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
+use crate::object_store_intent::{ReadIntent, WriteIntent};
 use chrono::Utc;
 use log::debug;
 use object_store::path::Path;
@@ -463,14 +464,17 @@ pub(crate) struct ManifestStore {
 
 impl ManifestStore {
     pub(crate) fn new(root_path: &Path, object_store: Arc<dyn ObjectStore>) -> Self {
-        let inner: Arc<dyn SequencedStorageProtocol<Manifest>> =
-            Arc::new(ObjectStoreSequencedStorageProtocol::<Manifest>::new(
+        let inner: Arc<dyn SequencedStorageProtocol<Manifest>> = Arc::new(
+            ObjectStoreSequencedStorageProtocol::<Manifest>::new_with_extensions(
                 root_path,
                 object_store,
                 "manifest",
                 "manifest",
                 Box::new(FlatBufferManifestCodec {}),
-            ));
+                ReadIntent::transactional_metadata().into_extensions(),
+                WriteIntent::transactional_metadata().into_extensions(),
+            ),
+        );
         Self { inner }
     }
 
@@ -1469,5 +1473,65 @@ mod tests {
             Some(SlateDBError::Fenced)
         ));
         assert!(fm_a.refresh().await.is_ok());
+    }
+
+    /// Every manifest read and write, including the GC boundary file traffic,
+    /// must carry the transactional metadata intent (RFC-0027) so caching
+    /// wrappers can serve
+    /// this mutable metadata from upstream.
+    #[tokio::test]
+    async fn test_manifest_io_carries_manifest_intent() {
+        use crate::object_store_intent::{ReadIntent, WriteIntent};
+        use crate::test_utils::{IntentRecordingObjectStore, RecordedCall};
+
+        let recording = Arc::new(IntentRecordingObjectStore::new(Arc::new(InMemory::new())));
+        let ms = Arc::new(ManifestStore::new(
+            &Path::from(ROOT),
+            recording.clone() as Arc<dyn object_store::ObjectStore>,
+        ));
+
+        let mut sm = StoredManifest::create_new_db(
+            ms.clone(),
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        sm.update(sm.prepare_dirty().unwrap()).await.unwrap();
+        ms.advance_boundary(1).await.unwrap();
+        ms.read_latest_manifest().await.unwrap();
+
+        let calls = recording.calls();
+        let mut puts = 0;
+        let mut gets = 0;
+        let mut boundary_puts = 0;
+        for call in &calls {
+            match call {
+                RecordedCall::Put { path, intent }
+                | RecordedCall::PutMultipart { path, intent } => {
+                    puts += 1;
+                    boundary_puts += usize::from(path.as_ref().ends_with(".boundary"));
+                    assert_eq!(
+                        *intent,
+                        Some(WriteIntent::transactional_metadata()),
+                        "untagged manifest write to {path}"
+                    );
+                }
+                RecordedCall::Get { path, intent, .. } => {
+                    gets += 1;
+                    assert_eq!(
+                        *intent,
+                        Some(ReadIntent::transactional_metadata()),
+                        "untagged manifest read of {path}"
+                    );
+                }
+            }
+        }
+        assert!(puts >= 2, "expected manifest writes, saw {calls:?}");
+        assert!(gets >= 1, "expected manifest reads, saw {calls:?}");
+        assert!(
+            boundary_puts >= 1,
+            "expected a boundary file write, saw {calls:?}"
+        );
     }
 }

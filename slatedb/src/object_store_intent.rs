@@ -195,6 +195,177 @@ pub enum RetryReason {
     DecompressionError,
 }
 
+/// Test support for asserting which intents object store calls carry.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::fmt;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use object_store::path::Path;
+    use object_store::{
+        CopyOptions, GetOptions, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutOptions,
+        PutPayload, PutResult,
+    };
+
+    use super::{ReadIntent, WriteIntent};
+
+    /// One object store call observed by [`IntentRecordingObjectStore`], with the
+    /// intent (RFC-0027) it carried, if any.
+    #[derive(Clone, Debug)]
+    pub enum RecordedCall {
+        Get {
+            path: Path,
+            head: bool,
+            intent: Option<ReadIntent>,
+        },
+        Put {
+            path: Path,
+            intent: Option<WriteIntent>,
+        },
+        PutMultipart {
+            path: Path,
+            intent: Option<WriteIntent>,
+        },
+    }
+
+    /// Wraps an object store and records the intent extensions carried by every
+    /// get/put/multipart-init call, delegating all I/O to the inner store.
+    #[derive(Debug)]
+    pub struct IntentRecordingObjectStore {
+        inner: Arc<dyn ObjectStore>,
+        calls: parking_lot::Mutex<Vec<RecordedCall>>,
+    }
+
+    impl IntentRecordingObjectStore {
+        pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                calls: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn calls(&self) -> Vec<RecordedCall> {
+            self.calls.lock().clone()
+        }
+
+        pub fn clear(&self) {
+            self.calls.lock().clear();
+        }
+
+        /// Intents observed on get calls matching `head`, in call order.
+        pub fn get_intents(&self, head: bool) -> Vec<Option<ReadIntent>> {
+            self.calls()
+                .into_iter()
+                .filter_map(|call| match call {
+                    RecordedCall::Get {
+                        head: h, intent, ..
+                    } if h == head => Some(intent),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Intents observed on put and multipart-init calls, in call order.
+        pub fn write_intents(&self) -> Vec<Option<WriteIntent>> {
+            self.calls()
+                .into_iter()
+                .filter_map(|call| match call {
+                    RecordedCall::Put { intent, .. }
+                    | RecordedCall::PutMultipart { intent, .. } => Some(intent),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    impl fmt::Display for IntentRecordingObjectStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "IntentRecordingObjectStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for IntentRecordingObjectStore {
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.calls.lock().push(RecordedCall::Get {
+                path: location.clone(),
+                head: options.head,
+                intent: ReadIntent::from_extensions(&options.extensions),
+            });
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.calls.lock().push(RecordedCall::Put {
+                path: location.clone(),
+                intent: WriteIntent::from_extensions(&opts.extensions),
+            });
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.calls.lock().push(RecordedCall::PutMultipart {
+                path: location.clone(),
+                intent: WriteIntent::from_extensions(&opts.extensions),
+            });
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

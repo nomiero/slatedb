@@ -27,6 +27,7 @@ use crate::db_state::{SsTableHandle, SsTableId, SsTableView};
 use crate::error::SlateDBError;
 use crate::format::sst::SsTableFormat;
 use crate::manifest::store::{ManifestStore, StoredManifest};
+use crate::object_store_intent::{ReadKind, WriteKind};
 use crate::object_stores::ObjectStores;
 use crate::rand::DbRand;
 use crate::tablestore::TableStore;
@@ -324,12 +325,16 @@ impl CompactionExecuteBench {
             compression_codec,
             ..SsTableFormat::default()
         };
-        let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(self.object_store.clone(), None),
-            sst_format,
-            self.path.clone(),
-            None,
-        ));
+        let table_store = Arc::new(
+            TableStore::new(
+                ObjectStores::new(self.object_store.clone(), None),
+                sst_format,
+                self.path.clone(),
+                None,
+            )
+            .with_read_kind(ReadKind::CompactionInput)
+            .with_sst_write_kind(WriteKind::CompactionOutput),
+        );
         let (tx, rx) = async_channel::unbounded();
         let worker_options = CompactionWorkerOptions::default();
         let recorder = MetricsRecorderHelper::noop();

@@ -153,6 +153,7 @@ use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::ManifestCore;
 use crate::memtable_flusher::MemtableFlusher;
 use crate::merge_operator::MergeOperatorType;
+use crate::object_store_intent::{ReadKind, WriteKind};
 use crate::object_stores::ObjectStoreType;
 use crate::object_stores::ObjectStores;
 use crate::paths::PathResolver;
@@ -618,17 +619,23 @@ impl<P: Into<Path>> DbBuilder<P> {
             write_rx,
             &tokio_handle,
         )?;
-        // Not to pollute the cache during compaction or GC
-        let uncached_table_store = Arc::new(TableStore::new_with_fp_registry(
-            ObjectStores::new(
-                retrying_main_object_store.clone(),
-                retrying_wal_object_store.clone(),
-            ),
-            sst_format,
-            path_resolver.clone(),
-            self.fp_registry.clone(),
-            None,
-        ));
+        // The compactor and GC get their own table store: no block cache (so
+        // background reads do not pollute it), and reads/writes tagged with
+        // compaction intents (RFC-0027).
+        let uncached_table_store = Arc::new(
+            TableStore::new_with_fp_registry(
+                ObjectStores::new(
+                    retrying_main_object_store.clone(),
+                    retrying_wal_object_store.clone(),
+                ),
+                sst_format,
+                path_resolver.clone(),
+                self.fp_registry.clone(),
+                None,
+            )
+            .with_read_kind(ReadKind::CompactionInput)
+            .with_sst_write_kind(WriteKind::CompactionOutput),
+        );
 
         let compactor_builder = self.compactor_builder.or_else(|| {
             self.settings.compactor_options.as_ref().map(|opts| {
@@ -1153,12 +1160,16 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             block_transformer: self.block_transformer.clone(),
             ..SsTableFormat::default()
         };
-        let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(retrying_main_object_store, None),
-            sst_format,
-            path,
-            None, // no need for cache in GC
-        ));
+        let table_store = Arc::new(
+            TableStore::new(
+                ObjectStores::new(retrying_main_object_store, None),
+                sst_format,
+                path,
+                None, // no need for cache in GC
+            )
+            .with_read_kind(ReadKind::CompactionInput)
+            .with_sst_write_kind(WriteKind::CompactionOutput),
+        );
 
         let scheduler_supplier = self
             .scheduler_supplier
@@ -1315,12 +1326,16 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
         let manifest_store = Arc::new(ManifestStore::new(&path, self.main_object_store.clone()));
         let compactions_store =
             Arc::new(CompactionsStore::new(&path, self.main_object_store.clone()));
-        let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(self.main_object_store, None),
-            SsTableFormat::default(),
-            path,
-            None,
-        ));
+        let table_store = Arc::new(
+            TableStore::new(
+                ObjectStores::new(self.main_object_store, None),
+                SsTableFormat::default(),
+                path,
+                None,
+            )
+            .with_read_kind(ReadKind::CompactionInput)
+            .with_sst_write_kind(WriteKind::CompactionOutput),
+        );
         let recorder = MetricsRecorderHelper::new(
             self.metrics_recorder,
             self.options.metric_level.unwrap_or_default(),

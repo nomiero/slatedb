@@ -3,6 +3,7 @@ use crate::error::SlateDBError;
 #[allow(dead_code)]
 use crate::error::SlateDBError::LatestTransactionalObjectVersionMissing;
 use crate::flatbuffer_types::FlatBufferCompactionsCodec;
+use crate::object_store_intent::{ReadIntent, WriteIntent};
 use chrono::Utc;
 use log::debug;
 use object_store::path::Path;
@@ -202,14 +203,17 @@ pub(crate) struct CompactionsStore {
 
 impl CompactionsStore {
     pub(crate) fn new(root_path: &Path, object_store: Arc<dyn ObjectStore>) -> Self {
-        let inner: Arc<dyn SequencedStorageProtocol<Compactions>> =
-            Arc::new(ObjectStoreSequencedStorageProtocol::<Compactions>::new(
+        let inner: Arc<dyn SequencedStorageProtocol<Compactions>> = Arc::new(
+            ObjectStoreSequencedStorageProtocol::<Compactions>::new_with_extensions(
                 root_path,
                 object_store,
                 "compactions",
                 "compactions",
                 Box::new(FlatBufferCompactionsCodec {}),
-            ));
+                ReadIntent::transactional_metadata().into_extensions(),
+                WriteIntent::transactional_metadata().into_extensions(),
+            ),
+        );
         Self { inner }
     }
 
