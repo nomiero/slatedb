@@ -534,6 +534,7 @@ mod tests {
     use crate::manifest::ManifestCore;
     use crate::memtable_flusher::uploader::Uploader;
     use crate::memtable_flusher::{FlushTarget, MemtableFlusher};
+    use crate::object_store_intent::{ReadKind, WriteKind};
     use crate::object_stores::ObjectStores;
     use crate::paths::PathResolver;
     use crate::rand::DbRand;
@@ -598,6 +599,8 @@ mod tests {
             PathResolver::new(Path::from(path.clone())),
             Arc::clone(&fp_registry),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let status_manager = DbStatusManager::new(0);
         let (write_tx, _) =

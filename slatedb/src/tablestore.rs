@@ -40,10 +40,10 @@ pub(crate) struct TableStore {
     /// In-memory cache for data blocks, indices, and filters
     cache: Option<Arc<dyn DbCache>>,
     /// Intent kind tagged on every SST read issued by this instance.
-    read_kind: ReadKind,
+    default_read_kind: ReadKind,
     /// Intent kind tagged on compacted-SST writes issued by this instance.
     /// WAL SSTs always carry [`WriteKind::Wal`] regardless of this setting.
-    sst_write_kind: WriteKind,
+    default_write_kind: WriteKind,
 }
 
 struct ReadOnlyObject {
@@ -98,11 +98,20 @@ pub struct SstFileMetadata {
 }
 
 impl TableStore {
+    /// Creates a table store whose object store reads are tagged with
+    /// `default_read_kind` and whose compacted-SST writes are tagged with
+    /// `default_write_kind` (RFC-0027). Both are defaults: derived views
+    /// override the read kind (see [`Self::with_read_kind`]), and WAL SSTs
+    /// always carry [`WriteKind::Wal`] regardless of `default_write_kind`.
+    /// The kinds are required constructor arguments so every component must
+    /// state what its traffic is.
     pub(crate) fn new<P: Into<Path>>(
         object_stores: ObjectStores,
         sst_format: SsTableFormat,
         root_path: P,
         block_cache: Option<Arc<dyn DbCache>>,
+        default_read_kind: ReadKind,
+        default_write_kind: WriteKind,
     ) -> Self {
         Self::new_with_fp_registry(
             object_stores,
@@ -110,6 +119,8 @@ impl TableStore {
             PathResolver::new(root_path),
             Arc::new(FailPointRegistry::new()),
             block_cache,
+            default_read_kind,
+            default_write_kind,
         )
     }
 
@@ -119,6 +130,8 @@ impl TableStore {
         path_resolver: PathResolver,
         fp_registry: Arc<FailPointRegistry>,
         cache: Option<Arc<dyn DbCache>>,
+        default_read_kind: ReadKind,
+        default_write_kind: WriteKind,
     ) -> Self {
         Self {
             object_stores,
@@ -126,34 +139,27 @@ impl TableStore {
             path_resolver,
             fp_registry,
             cache,
-            read_kind: ReadKind::Foreground,
-            sst_write_kind: WriteKind::Flush,
+            default_read_kind,
+            default_write_kind,
         }
     }
 
-    /// Returns this store with reads tagged as `read_kind` (RFC-0027). Used at
-    /// construction time for component-specific stores (e.g. the compactor's),
-    /// and via clone for per-call overrides (e.g. warmup).
+    /// Returns a copy of this store with the default read kind overridden
+    /// to `read_kind`, for deriving a per-call view from an existing store
+    /// (e.g. warmup, WAL replay).
     pub(crate) fn with_read_kind(mut self, read_kind: ReadKind) -> Self {
-        self.read_kind = read_kind;
-        self
-    }
-
-    /// Returns this store with compacted-SST writes tagged as `write_kind`
-    /// (RFC-0027). WAL SSTs always carry [`WriteKind::Wal`].
-    pub(crate) fn with_sst_write_kind(mut self, write_kind: WriteKind) -> Self {
-        self.sst_write_kind = write_kind;
+        self.default_read_kind = read_kind;
         self
     }
 
     fn read_intent(&self) -> ReadIntent {
-        ReadIntent::new(self.read_kind)
+        ReadIntent::new(self.default_read_kind)
     }
 
     fn write_intent_for(&self, id: &SsTableId) -> WriteIntent {
         match id {
             SsTableId::Wal(_) => WriteIntent::wal(),
-            SsTableId::Compacted(_) => WriteIntent::new(self.sst_write_kind),
+            SsTableId::Compacted(_) => WriteIntent::new(self.default_write_kind),
         }
     }
 
@@ -593,7 +599,7 @@ impl TableStore {
     ) -> Result<(SsTableInfo, u16), SlateDBError> {
         let object_store = self.object_stores.store_for(id);
         let path = self.path(id);
-        with_validation_retry(self.read_kind, |intent| {
+        with_validation_retry(self.default_read_kind, |intent| {
             let obj = ReadOnlyObject {
                 object_store: object_store.clone(),
                 path: path.clone(),
@@ -659,7 +665,7 @@ impl TableStore {
         }
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
-        with_validation_retry(self.read_kind, |intent| {
+        with_validation_retry(self.default_read_kind, |intent| {
             let obj = ReadOnlyObject {
                 object_store: object_store.clone(),
                 path: path.clone(),
@@ -704,7 +710,7 @@ impl TableStore {
         }
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
-        with_validation_retry(self.read_kind, |intent| {
+        with_validation_retry(self.default_read_kind, |intent| {
             let obj = ReadOnlyObject {
                 object_store: object_store.clone(),
                 path: path.clone(),
@@ -747,7 +753,7 @@ impl TableStore {
         }
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
-        let index = with_validation_retry(self.read_kind, |intent| {
+        let index = with_validation_retry(self.default_read_kind, |intent| {
             let obj = ReadOnlyObject {
                 object_store: object_store.clone(),
                 path: path.clone(),
@@ -776,7 +782,7 @@ impl TableStore {
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
         let sst_format = self.sst_format.clone();
-        let read_kind = self.read_kind;
+        let read_kind = self.default_read_kind;
         Box::new(move || {
             Box::pin(async move {
                 // Only the stats arm can produce `None` (stats_len > 0 but no
@@ -840,7 +846,7 @@ impl TableStore {
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
         let sst_format = self.sst_format.clone();
-        let read_kind = self.read_kind;
+        let read_kind = self.default_read_kind;
         Box::new(move || {
             Box::pin(async move {
                 let block = with_validation_retry(read_kind, |intent| {
@@ -874,7 +880,7 @@ impl TableStore {
         let index = self.read_index(handle, false).await?;
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
-        with_validation_retry(self.read_kind, |intent| {
+        with_validation_retry(self.default_read_kind, |intent| {
             let obj = ReadOnlyObject {
                 object_store: object_store.clone(),
                 path: path.clone(),
@@ -980,7 +986,7 @@ impl TableStore {
             let path = &path;
             let index = &index;
             async move {
-                with_validation_retry(self.read_kind, |intent| {
+                with_validation_retry(self.default_read_kind, |intent| {
                     let obj = ReadOnlyObject {
                         object_store: object_store.clone(),
                         path: path.clone(),
@@ -1036,7 +1042,7 @@ impl TableStore {
         let index = self.read_index(handle, false).await?;
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
-        with_validation_retry(self.read_kind, |intent| {
+        with_validation_retry(self.default_read_kind, |intent| {
             let obj = ReadOnlyObject {
                 object_store: object_store.clone(),
                 path: path.clone(),
@@ -1333,6 +1339,7 @@ fn slatedb_io_error() -> SlateDBError {
 
 #[cfg(test)]
 mod tests {
+    use crate::object_store_intent::{ReadKind, WriteKind};
     use crate::types::KeyValue;
     use bytes::Bytes;
     use futures::future;
@@ -1493,6 +1500,8 @@ mod tests {
             format,
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let id = SsTableId::Compacted(ulid::Ulid::new());
 
@@ -1566,6 +1575,8 @@ mod tests {
             format,
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let id = SsTableId::Wal(123);
 
@@ -1635,6 +1646,8 @@ mod tests {
             format,
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let wal_id = SsTableId::Wal(1);
 
@@ -1665,6 +1678,8 @@ mod tests {
             SsTableFormat::default(),
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         ts.write_wal_fence(1).await.unwrap();
@@ -1681,6 +1696,8 @@ mod tests {
             SsTableFormat::default(),
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         ts.write_wal_fence(1).await.unwrap();
@@ -1696,6 +1713,8 @@ mod tests {
             SsTableFormat::default(),
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         ts.write_wal_fence(1).await.unwrap();
@@ -1727,6 +1746,8 @@ mod tests {
             format,
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let id = SsTableId::Compacted(ulid::Ulid::new());
 
@@ -1770,6 +1791,8 @@ mod tests {
             format,
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let wal_id = SsTableId::Wal(1);
 
@@ -1811,6 +1834,8 @@ mod tests {
             format,
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let id = SsTableId::Compacted(ulid::Ulid::new());
 
@@ -1878,6 +1903,8 @@ mod tests {
             format,
             Path::from("/root"),
             Some(wrapper.clone()),
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         // Create and write SST
@@ -2005,6 +2032,8 @@ mod tests {
             format.clone(),
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
 
         let mut builder = writer.table_builder();
@@ -2033,6 +2062,8 @@ mod tests {
             format,
             Path::from(ROOT),
             Some(cache),
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         assert_eq!(meta_cache.entry_count(), 0);
 
@@ -2063,6 +2094,8 @@ mod tests {
             format.clone(),
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
 
         let mut builder = writer.table_builder();
@@ -2091,6 +2124,8 @@ mod tests {
             format,
             Path::from(ROOT),
             Some(cache),
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         assert_eq!(meta_cache.entry_count(), 0);
 
@@ -2134,6 +2169,8 @@ mod tests {
             SsTableFormat::default(),
             Path::from("/root"),
             Some(wrapper.clone()),
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let id = SsTableId::Compacted(ulid::Ulid::new());
         let sst = build_test_sst(&ts.sst_format, 3).await;
@@ -2179,6 +2216,8 @@ mod tests {
             SsTableFormat::default(),
             Path::from("/root"),
             Some(wrapper),
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let id = SsTableId::Compacted(ulid::Ulid::new());
         let sst = build_test_sst(&ts.sst_format, 3).await;
@@ -2239,6 +2278,8 @@ mod tests {
             format,
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         // Create id1, id2, and i3 as three random UUIDs that have been sorted ascending.
@@ -2308,6 +2349,8 @@ mod tests {
             format,
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         let id1 = SsTableId::Wal(1);
@@ -2381,6 +2424,8 @@ mod tests {
             SsTableFormat::default(),
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ))
     }
 
@@ -2437,6 +2482,8 @@ mod tests {
             format.clone(),
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         // Build an SST and compute expected bytes
@@ -2474,6 +2521,8 @@ mod tests {
             format,
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         let id1 = SsTableId::Compacted(ulid::Ulid::new());
@@ -2518,6 +2567,8 @@ mod tests {
             format,
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         let id1 = SsTableId::Wal(123);
@@ -2567,6 +2618,8 @@ mod tests {
             SsTableFormat::default(),
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let id = SsTableId::Compacted(ulid::Ulid::new());
         let path = ts.path(&id);
@@ -2591,6 +2644,8 @@ mod tests {
             SsTableFormat::default(),
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let id = SsTableId::Wal(42);
         let path = ts.path(&id);
@@ -2615,7 +2670,7 @@ mod tests {
             let os = Arc::new(InMemory::new());
             let format = SsTableFormat { block_size, ..SsTableFormat::default() };
             let ts = Arc::new(TableStore::new(ObjectStores::new(os, None),
-                format, Path::from(ROOT), None));
+                format, Path::from(ROOT), None, ReadKind::Foreground, WriteKind::Flush));
             if let Some(bytes) = block_size.checked_mul(num_blocks) {
                 assert_eq!(num_blocks, ts.bytes_to_blocks(bytes));
             }
@@ -2651,6 +2706,8 @@ mod tests {
             format.clone(),
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = writer.table_builder();
         builder
@@ -2685,6 +2742,8 @@ mod tests {
             format,
             Path::from(ROOT),
             Some(cache),
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         // when: task A starts reading the index; its loader will pause inside the
@@ -2751,6 +2810,8 @@ mod tests {
             format.clone(),
             Path::from(ROOT),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = writer.table_builder();
         builder
@@ -2790,6 +2851,8 @@ mod tests {
             format,
             Path::from(ROOT),
             Some(cache),
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         // when: task A starts a single-block read; its loader will pause inside the
@@ -2859,6 +2922,14 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         fn recording_table_store(recording: &Arc<IntentRecordingObjectStore>) -> Arc<TableStore> {
+            recording_table_store_with_kinds(recording, ReadKind::Foreground, WriteKind::Flush)
+        }
+
+        fn recording_table_store_with_kinds(
+            recording: &Arc<IntentRecordingObjectStore>,
+            default_read_kind: ReadKind,
+            default_write_kind: WriteKind,
+        ) -> Arc<TableStore> {
             let format = SsTableFormat {
                 block_size: 32,
                 min_filter_keys: 1,
@@ -2869,6 +2940,8 @@ mod tests {
                 format,
                 Path::from(ROOT),
                 None,
+                default_read_kind,
+                default_write_kind,
             ))
         }
 
@@ -2937,13 +3010,12 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn compacted_write_intent_follows_sst_write_kind() {
+        async fn compacted_write_intent_follows_default_write_kind() {
             let recording = Arc::new(IntentRecordingObjectStore::new(Arc::new(InMemory::new())));
-            let ts = recording_table_store(&recording);
-            let ts = Arc::new(
-                ts.as_ref()
-                    .clone()
-                    .with_sst_write_kind(WriteKind::CompactionOutput),
+            let ts = recording_table_store_with_kinds(
+                &recording,
+                ReadKind::Foreground,
+                WriteKind::CompactionOutput,
             );
 
             let sst = build_sst(&ts, 11 * 1024 * 1024).await;
@@ -2994,10 +3066,10 @@ mod tests {
             ts.write_sst(&id, &sst, false).await.unwrap();
             recording.clear();
 
-            let ts = Arc::new(
-                ts.as_ref()
-                    .clone()
-                    .with_read_kind(ReadKind::CompactionInput),
+            let ts = recording_table_store_with_kinds(
+                &recording,
+                ReadKind::CompactionInput,
+                WriteKind::Flush,
             );
             let handle = ts.open_sst(&id).await.unwrap();
             ts.read_index(&handle, false).await.unwrap();

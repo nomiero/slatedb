@@ -30,12 +30,9 @@ use std::sync::Arc;
 ///   the same id already exists, the write fails with `ObjectVersionExists`.
 ///
 /// ## Extensions
-/// Callers can supply [`Extensions`] that the protocol attaches to every read
-/// (`get_opts`) and write (`put_opts`) it issues, via
-/// [`ObjectStoreSequencedStorageProtocol::new_with_extensions`]. This lets
-/// callers tag protocol traffic with typed metadata (for example a cache
-/// intent) that wrapper stores can read back. Backends ignore extensions.
-/// `list` and `delete` have no opts-capable variant and carry none.
+/// The constructors take [`Extensions`] that the protocol attaches to every
+/// read (`get_opts`) and write (`put_opts`) it issues. This lets callers tag
+/// protocol traffic with typed metadata.
 pub struct ObjectStoreSequencedStorageProtocol<T> {
     object_store: Box<dyn ObjectStore>,
     codec: Box<dyn ObjectCodec<T>>,
@@ -46,28 +43,11 @@ pub struct ObjectStoreSequencedStorageProtocol<T> {
 }
 
 impl<T> ObjectStoreSequencedStorageProtocol<T> {
+    /// Creates a protocol over the given store. `read_extensions` are
+    /// attached to every read and `write_extensions` to every write issued
+    /// by the protocol and its default boundary object; pass
+    /// [`Extensions::default()`] to attach nothing.
     pub fn new(
-        root_path: &Path,
-        object_store: Arc<dyn ObjectStore>,
-        subdir: &str,
-        file_suffix: &'static str,
-        codec: Box<dyn ObjectCodec<T>>,
-    ) -> Self {
-        Self::new_with_extensions(
-            root_path,
-            object_store,
-            subdir,
-            file_suffix,
-            codec,
-            Extensions::default(),
-            Extensions::default(),
-        )
-    }
-
-    /// Like [`Self::new`], but attaches `read_extensions` to every read and
-    /// `write_extensions` to every write issued by the protocol and its
-    /// default boundary object.
-    pub fn new_with_extensions(
         root_path: &Path,
         object_store: Arc<dyn ObjectStore>,
         subdir: &str,
@@ -76,26 +56,28 @@ impl<T> ObjectStoreSequencedStorageProtocol<T> {
         read_extensions: Extensions,
         write_extensions: Extensions,
     ) -> Self {
-        let boundary = Arc::new(ObjectStoreBoundaryObject::new_with_extensions(
+        let boundary = Arc::new(ObjectStoreBoundaryObject::new(
             root_path,
             object_store.clone(),
             subdir,
             read_extensions.clone(),
             write_extensions.clone(),
         ));
-        let mut protocol = Self::new_with_boundary(
+        Self::new_with_boundary(
             root_path,
             object_store,
             subdir,
             file_suffix,
             codec,
             boundary,
-        );
-        protocol.read_extensions = read_extensions;
-        protocol.write_extensions = write_extensions;
-        protocol
+            read_extensions,
+            write_extensions,
+        )
     }
 
+    /// Like [`Self::new`], but with a caller-supplied boundary object. The
+    /// extensions apply to the protocol's own reads and writes; the boundary
+    /// carries whatever extensions it was constructed with.
     pub fn new_with_boundary(
         root_path: &Path,
         object_store: Arc<dyn ObjectStore>,
@@ -103,6 +85,8 @@ impl<T> ObjectStoreSequencedStorageProtocol<T> {
         file_suffix: &'static str,
         codec: Box<dyn ObjectCodec<T>>,
         boundary: Arc<dyn BoundaryObject>,
+        read_extensions: Extensions,
+        write_extensions: Extensions,
     ) -> Self {
         Self {
             object_store: Box::new(::object_store::prefix::PrefixStore::new(
@@ -112,8 +96,8 @@ impl<T> ObjectStoreSequencedStorageProtocol<T> {
             codec,
             file_suffix,
             boundary,
-            read_extensions: Extensions::default(),
-            write_extensions: Extensions::default(),
+            read_extensions,
+            write_extensions,
         }
     }
 
@@ -158,19 +142,10 @@ pub struct ObjectStoreBoundaryObject {
 }
 
 impl ObjectStoreBoundaryObject {
-    pub fn new(root_path: &Path, object_store: Arc<dyn ObjectStore>, name: &str) -> Self {
-        Self::new_with_extensions(
-            root_path,
-            object_store,
-            name,
-            Extensions::default(),
-            Extensions::default(),
-        )
-    }
-
-    /// Like [`Self::new`], but attaches `read_extensions` to every boundary
-    /// read and `write_extensions` to every boundary write.
-    pub fn new_with_extensions(
+    /// Creates a boundary object. `read_extensions` are attached to every
+    /// boundary read and `write_extensions` to every boundary write; pass
+    /// [`Extensions::default()`] to attach nothing.
+    pub fn new(
         root_path: &Path,
         object_store: Arc<dyn ObjectStore>,
         name: &str,
@@ -750,8 +725,13 @@ mod tests {
     #[tokio::test]
     async fn test_boundary_check_allows_missing_boundary() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let boundary =
-            ObjectStoreBoundaryObject::new(&Path::from("/root"), object_store, "manifest");
+        let boundary = ObjectStoreBoundaryObject::new(
+            &Path::from("/root"),
+            object_store,
+            "manifest",
+            Extensions::default(),
+            Extensions::default(),
+        );
 
         boundary.check(MonotonicId::new(1)).await.unwrap();
     }
@@ -759,8 +739,13 @@ mod tests {
     #[tokio::test]
     async fn test_boundary_advance_creates_boundary_and_rejects_at_or_below_it() {
         let object_store = Arc::new(InMemory::new());
-        let boundary =
-            ObjectStoreBoundaryObject::new(&Path::from("/root"), object_store.clone(), "manifest");
+        let boundary = ObjectStoreBoundaryObject::new(
+            &Path::from("/root"),
+            object_store.clone(),
+            "manifest",
+            Extensions::default(),
+            Extensions::default(),
+        );
 
         boundary.advance(MonotonicId::new(2)).await.unwrap();
 
@@ -781,8 +766,13 @@ mod tests {
     #[tokio::test]
     async fn test_boundary_advance_is_monotonic() {
         let object_store = Arc::new(InMemory::new());
-        let boundary =
-            ObjectStoreBoundaryObject::new(&Path::from("/root"), object_store.clone(), "manifest");
+        let boundary = ObjectStoreBoundaryObject::new(
+            &Path::from("/root"),
+            object_store.clone(),
+            "manifest",
+            Extensions::default(),
+            Extensions::default(),
+        );
 
         boundary.advance(MonotonicId::new(3)).await.unwrap();
         boundary.advance(MonotonicId::new(2)).await.unwrap();
@@ -804,8 +794,13 @@ mod tests {
     async fn test_boundary_check_reuses_cache_on_not_modified() {
         let counting_store = Arc::new(CountingGetStore::new());
         let object_store: Arc<dyn ObjectStore> = counting_store.clone();
-        let boundary =
-            ObjectStoreBoundaryObject::new(&Path::from("/root"), object_store.clone(), "manifest");
+        let boundary = ObjectStoreBoundaryObject::new(
+            &Path::from("/root"),
+            object_store.clone(),
+            "manifest",
+            Extensions::default(),
+            Extensions::default(),
+        );
 
         boundary.advance(MonotonicId::new(2)).await.unwrap();
 
@@ -822,8 +817,13 @@ mod tests {
     async fn test_boundary_check_rejects_from_cache_without_get() {
         let counting_store = Arc::new(CountingGetStore::new());
         let object_store: Arc<dyn ObjectStore> = counting_store.clone();
-        let boundary =
-            ObjectStoreBoundaryObject::new(&Path::from("/root"), object_store.clone(), "manifest");
+        let boundary = ObjectStoreBoundaryObject::new(
+            &Path::from("/root"),
+            object_store.clone(),
+            "manifest",
+            Extensions::default(),
+            Extensions::default(),
+        );
 
         boundary.advance(MonotonicId::new(2)).await.unwrap();
 
@@ -841,10 +841,20 @@ mod tests {
     async fn test_boundary_check_refreshes_cache_when_etag_changes() {
         let counting_store = Arc::new(CountingGetStore::new());
         let object_store: Arc<dyn ObjectStore> = counting_store.clone();
-        let first_boundary =
-            ObjectStoreBoundaryObject::new(&Path::from("/root"), object_store.clone(), "manifest");
-        let second_boundary =
-            ObjectStoreBoundaryObject::new(&Path::from("/root"), object_store, "manifest");
+        let first_boundary = ObjectStoreBoundaryObject::new(
+            &Path::from("/root"),
+            object_store.clone(),
+            "manifest",
+            Extensions::default(),
+            Extensions::default(),
+        );
+        let second_boundary = ObjectStoreBoundaryObject::new(
+            &Path::from("/root"),
+            object_store,
+            "manifest",
+            Extensions::default(),
+            Extensions::default(),
+        );
 
         first_boundary.advance(MonotonicId::new(2)).await.unwrap();
         second_boundary.advance(MonotonicId::new(4)).await.unwrap();
@@ -857,10 +867,20 @@ mod tests {
     #[tokio::test]
     async fn test_boundary_advance_retries_after_conflicting_boundary_update() {
         let object_store = Arc::new(InMemory::new());
-        let first_boundary =
-            ObjectStoreBoundaryObject::new(&Path::from("/root"), object_store.clone(), "manifest");
-        let second_boundary =
-            ObjectStoreBoundaryObject::new(&Path::from("/root"), object_store.clone(), "manifest");
+        let first_boundary = ObjectStoreBoundaryObject::new(
+            &Path::from("/root"),
+            object_store.clone(),
+            "manifest",
+            Extensions::default(),
+            Extensions::default(),
+        );
+        let second_boundary = ObjectStoreBoundaryObject::new(
+            &Path::from("/root"),
+            object_store.clone(),
+            "manifest",
+            Extensions::default(),
+            Extensions::default(),
+        );
 
         first_boundary.advance(MonotonicId::new(2)).await.unwrap();
         second_boundary.advance(MonotonicId::new(3)).await.unwrap();
@@ -886,6 +906,8 @@ mod tests {
             &Path::from("/root"),
             object_store,
             "manifest",
+            Extensions::default(),
+            Extensions::default(),
         ));
 
         let read = tokio::spawn({
@@ -984,6 +1006,8 @@ mod tests {
                 &Path::from("/root"),
                 flaky_store.clone(),
                 "test",
+                Extensions::default(),
+                Extensions::default(),
             )),
             read_extensions: Extensions::default(),
             write_extensions: Extensions::default(),
@@ -999,7 +1023,7 @@ mod tests {
     }
 
     /// Marker inserted into extensions by tests, standing in for whatever
-    /// typed metadata a caller attaches (e.g. a cache intent).
+    /// typed metadata a caller attaches.
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct TestMarker(&'static str);
 
@@ -1101,7 +1125,7 @@ mod tests {
         ObjectStoreSequencedStorageProtocol<TestVal>,
     ) {
         let recording = Arc::new(ExtensionsRecordingStore::new());
-        let protocol = ObjectStoreSequencedStorageProtocol::new_with_extensions(
+        let protocol = ObjectStoreSequencedStorageProtocol::new(
             &Path::from("/root"),
             recording.clone(),
             "test",
@@ -1157,7 +1181,7 @@ mod tests {
     #[tokio::test]
     async fn test_boundary_attaches_extensions_to_reads_and_writes() {
         let recording = Arc::new(ExtensionsRecordingStore::new());
-        let boundary = ObjectStoreBoundaryObject::new_with_extensions(
+        let boundary = ObjectStoreBoundaryObject::new(
             &Path::from("/root"),
             recording.clone(),
             "test",
@@ -1185,6 +1209,8 @@ mod tests {
             "test",
             "val",
             Box::new(TestValCodec),
+            Extensions::default(),
+            Extensions::default(),
         );
 
         let id = protocol

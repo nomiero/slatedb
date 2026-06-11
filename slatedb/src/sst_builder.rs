@@ -411,6 +411,7 @@ impl EncodedSsTableBuilder {
 
 #[cfg(test)]
 mod tests {
+    use crate::object_store_intent::{ReadKind, WriteKind};
     use rstest::rstest;
     use std::ops::Range;
 
@@ -486,6 +487,8 @@ mod tests {
             format.clone(),
             root_path.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let path_resolver = PathResolver::new(root_path);
 
@@ -591,6 +594,8 @@ mod tests {
             format,
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store.table_builder();
         builder
@@ -646,6 +651,8 @@ mod tests {
             format.clone(),
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store.table_builder();
         builder
@@ -744,6 +751,8 @@ mod tests {
             format.clone(),
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store.table_builder();
         for k in 1..=8 {
@@ -828,6 +837,8 @@ mod tests {
             format,
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store.table_builder();
         builder
@@ -895,6 +906,8 @@ mod tests {
             format,
             root_path.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store.table_builder();
         builder
@@ -922,6 +935,8 @@ mod tests {
             format,
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let sst_handle = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
         let index = table_store.read_index(&sst_handle, true).await.unwrap();
@@ -980,6 +995,8 @@ mod tests {
             format.clone(),
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store.table_builder();
         builder
@@ -1032,6 +1049,8 @@ mod tests {
             format,
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store.table_builder();
         builder
@@ -1100,6 +1119,8 @@ mod tests {
             format.clone(),
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store.table_builder();
         builder
@@ -1155,6 +1176,8 @@ mod tests {
             format,
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let mut builder = table_store.table_builder();
         for key in 'a'..='z' {
@@ -1275,6 +1298,8 @@ mod tests {
             format,
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store.table_builder();
         builder
@@ -1330,6 +1355,8 @@ mod tests {
             format,
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store.table_builder();
         builder
@@ -1417,6 +1444,8 @@ mod tests {
             format.clone(),
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store
             .table_builder()
@@ -1483,6 +1512,8 @@ mod tests {
             format.clone(),
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store.table_builder();
         let mut expected = Vec::new();
@@ -1546,6 +1577,8 @@ mod tests {
             format,
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store.table_builder();
 
@@ -1653,6 +1686,8 @@ mod tests {
             format,
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store.table_builder();
         builder
@@ -1695,6 +1730,8 @@ mod tests {
             format,
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store.table_builder();
         builder
@@ -1740,6 +1777,8 @@ mod tests {
             format,
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let mut builder = table_store.table_builder();
         // Block 0: put
@@ -1837,6 +1876,8 @@ mod tests {
             format,
             root_path.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
 
         // Write keys whose 3-byte prefix is "key".
@@ -1893,6 +1934,8 @@ mod tests {
             format_partial,
             root_path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let handle_partial = store_partial.open_sst(&SsTableId::Wal(0)).await.unwrap();
         let partial = store_partial

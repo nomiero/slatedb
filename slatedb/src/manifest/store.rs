@@ -464,8 +464,8 @@ pub(crate) struct ManifestStore {
 
 impl ManifestStore {
     pub(crate) fn new(root_path: &Path, object_store: Arc<dyn ObjectStore>) -> Self {
-        let inner: Arc<dyn SequencedStorageProtocol<Manifest>> = Arc::new(
-            ObjectStoreSequencedStorageProtocol::<Manifest>::new_with_extensions(
+        let inner: Arc<dyn SequencedStorageProtocol<Manifest>> =
+            Arc::new(ObjectStoreSequencedStorageProtocol::<Manifest>::new(
                 root_path,
                 object_store,
                 "manifest",
@@ -473,8 +473,7 @@ impl ManifestStore {
                 Box::new(FlatBufferManifestCodec {}),
                 ReadIntent::transactional_metadata().into_extensions(),
                 WriteIntent::transactional_metadata().into_extensions(),
-            ),
-        );
+            ));
         Self { inner }
     }
 
@@ -679,7 +678,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let boundary = ObjectStoreBoundaryObject::new(&Path::from(ROOT), object_store, "manifest");
+        let boundary = ObjectStoreBoundaryObject::new(
+            &Path::from(ROOT),
+            object_store,
+            "manifest",
+            object_store::Extensions::default(),
+            object_store::Extensions::default(),
+        );
         boundary.advance(MonotonicId::new(2)).await.unwrap();
 
         let result = sm.update(sm.prepare_dirty().unwrap()).await;

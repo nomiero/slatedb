@@ -434,6 +434,7 @@ mod tests {
     use crate::merge_operator::{
         MergeOperator, MergeOperatorError, MERGE_OPERATOR_FLUSH_PATH, MERGE_OPERATOR_READ_PATH,
     };
+    use crate::object_store_intent::{ReadKind, WriteKind};
     use crate::test_utils::lookup_merge_operator_operands;
     use crate::types::{RowEntry, ValueDeletable};
     use bytes::Bytes;
@@ -519,6 +520,8 @@ mod tests {
                 SsTableFormat::default(),
                 Path::from("/test"),
                 None,
+                ReadKind::Foreground,
+                WriteKind::Flush,
             ));
 
             Self {

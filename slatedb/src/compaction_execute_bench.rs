@@ -79,6 +79,8 @@ impl CompactionExecuteBench {
             sst_format,
             self.path.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let num_keys = sst_bytes / (val_bytes + key_bytes);
         let mut key_start = vec![0u8; key_bytes - mem::size_of::<u32>()];
@@ -325,16 +327,14 @@ impl CompactionExecuteBench {
             compression_codec,
             ..SsTableFormat::default()
         };
-        let table_store = Arc::new(
-            TableStore::new(
-                ObjectStores::new(self.object_store.clone(), None),
-                sst_format,
-                self.path.clone(),
-                None,
-            )
-            .with_read_kind(ReadKind::CompactionInput)
-            .with_sst_write_kind(WriteKind::CompactionOutput),
-        );
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(self.object_store.clone(), None),
+            sst_format,
+            self.path.clone(),
+            None,
+            ReadKind::CompactionInput,
+            WriteKind::CompactionOutput,
+        ));
         let (tx, rx) = async_channel::unbounded();
         let worker_options = CompactionWorkerOptions::default();
         let recorder = MetricsRecorderHelper::noop();

@@ -785,6 +785,8 @@ mod tests {
             "test",
             "val",
             Box::new(TestValCodec),
+            object_store::Extensions::default(),
+            object_store::Extensions::default(),
         ))
     }
 
@@ -799,6 +801,8 @@ mod tests {
             "val",
             Box::new(TestValCodec),
             boundary,
+            object_store::Extensions::default(),
+            object_store::Extensions::default(),
         ))
     }
 

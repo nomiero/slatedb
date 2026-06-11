@@ -186,6 +186,7 @@ mod tests {
     use crate::manifest::store::{ManifestStore, StoredManifest};
     use crate::manifest::ManifestCore;
     use crate::memtable_flusher::MANIFEST_REFRESH_COUNT;
+    use crate::object_store_intent::{ReadKind, WriteKind};
     use crate::object_stores::ObjectStores;
     use crate::tablestore::TableStore;
     use crate::{CloseReason, Db, ErrorKind, Settings};
@@ -226,6 +227,8 @@ mod tests {
                 SsTableFormat::default(),
                 path,
                 None,
+                ReadKind::Foreground,
+                WriteKind::Flush,
             ));
             let stored_manifest = StoredManifest::create_new_db(
                 manifest_store.clone(),

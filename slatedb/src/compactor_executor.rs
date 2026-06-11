@@ -596,6 +596,7 @@ mod tests {
     use crate::bytes_range::BytesRange;
     use crate::format::sst::SsTableFormat;
     use crate::manifest::ManifestCore;
+    use crate::object_store_intent::{ReadKind, WriteKind};
     use crate::object_stores::ObjectStores;
     use crate::proptest_util::arbitrary;
     use crate::sst_iter::SstView;
@@ -1051,6 +1052,8 @@ mod tests {
             },
             root_path.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let manifest_store = Arc::new(ManifestStore::new(&root_path, object_store.clone()));
         StoredManifest::create_new_db(manifest_store.clone(), ManifestCore::new(), clock.clone())
@@ -1258,8 +1261,7 @@ mod tests {
                         ..SsTableFormat::default()
                     },
                     root_path.clone(),
-                    None,
-                ));
+                    None, ReadKind::Foreground, WriteKind::Flush,));
                 let manifest_store = Arc::new(ManifestStore::new(&root_path, object_store.clone()));
                 StoredManifest::create_new_db(
                     manifest_store.clone(),
@@ -1406,6 +1408,8 @@ mod tests {
             },
             root_path.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let manifest_store = Arc::new(ManifestStore::new(&root_path, object_store.clone()));
         StoredManifest::create_new_db(manifest_store.clone(), ManifestCore::new(), clock.clone())

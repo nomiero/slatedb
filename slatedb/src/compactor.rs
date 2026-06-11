@@ -1190,6 +1190,7 @@ pub mod stats {
 
 #[cfg(test)]
 mod tests {
+    use crate::object_store_intent::{ReadKind, WriteKind};
     use std::collections::{HashMap, VecDeque};
     use std::future::Future;
     use std::sync::Arc;
@@ -5412,6 +5413,8 @@ mod tests {
             sst_format,
             Path::from(PATH),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         (manifest_store, compactions_store, table_store)
     }

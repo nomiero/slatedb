@@ -291,6 +291,7 @@ mod tests {
     use crate::format::sst::SsTableFormat;
     use crate::iter::RowEntryIterator;
     use crate::manifest::ManifestCore;
+    use crate::object_store_intent::{ReadKind, WriteKind};
     use crate::object_stores::ObjectStores;
     use crate::paths::PathResolver;
     use crate::rand::DbRand;
@@ -342,6 +343,8 @@ mod tests {
             PathResolver::new(Path::from(path)),
             fp_registry.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let status_manager = DbStatusManager::new(0);
         let (write_tx, _) =

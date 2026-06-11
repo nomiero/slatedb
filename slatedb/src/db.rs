@@ -2084,6 +2084,7 @@ mod tests {
     use crate::merge_operator::{
         MERGE_OPERATOR_COMPACT_PATH, MERGE_OPERATOR_FLUSH_PATH, MERGE_OPERATOR_READ_PATH,
     };
+    use crate::object_store_intent::{ReadKind, WriteKind};
     use crate::object_stores::ObjectStores;
     use crate::proptest_util::arbitrary;
     use crate::proptest_util::sample;
@@ -4221,6 +4222,8 @@ mod tests {
             sst_format,
             path.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let db = Db::builder(path.clone(), object_store.clone())
             .with_settings(options)
@@ -4321,6 +4324,8 @@ mod tests {
             sst_format,
             path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         // Write data a few times such that each loop results in a memtable flush
@@ -4507,6 +4512,8 @@ mod tests {
             sst_format,
             path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         // Write some data to populate the memtable
@@ -6041,6 +6048,8 @@ mod tests {
             SsTableFormat::default(),
             path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         // Get the next WAL SST ID based on what's currently in the object store
@@ -6351,6 +6360,8 @@ mod tests {
             SsTableFormat::default(),
             path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let mut w1_paused = false;
         for _ in 0..600 {
@@ -6446,6 +6457,8 @@ mod tests {
             SsTableFormat::default(),
             path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         wait_for_wal_sst_count(
             &probe_table_store,
@@ -6523,6 +6536,8 @@ mod tests {
             SsTableFormat::default(),
             path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         wait_for_wal_sst_count(
             &probe_table_store,
@@ -7766,6 +7781,8 @@ mod tests {
             SsTableFormat::default(),
             path.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         );
         let compacted_ssts = table_store
             .list_compacted_ssts(..)

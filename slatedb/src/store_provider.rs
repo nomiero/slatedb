@@ -2,6 +2,7 @@ use crate::db_cache::DbCache;
 use crate::filter_policy::FilterPolicy;
 use crate::format::sst::{BlockTransformer, SsTableFormat};
 use crate::manifest::store::ManifestStore;
+use crate::object_store_intent::{ReadKind, WriteKind};
 use crate::object_stores::ObjectStores;
 use crate::tablestore::TableStore;
 use object_store::path::Path;
@@ -38,6 +39,8 @@ impl StoreProvider for DefaultStoreProvider {
             sst_format,
             self.path.clone(),
             self.block_cache.clone(),
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ))
     }
 

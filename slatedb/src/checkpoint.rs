@@ -63,6 +63,7 @@ mod tests {
     use crate::iter::RowEntryIterator;
     use crate::manifest::store::ManifestStore;
     use crate::manifest::Manifest;
+    use crate::object_store_intent::{ReadKind, WriteKind};
     use crate::object_stores::ObjectStores;
     use crate::proptest_util::{rng, sample};
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
@@ -446,6 +447,8 @@ mod tests {
             SsTableFormat::default(),
             path.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let sst_handle = SsTableView::identity(table_store.open_sst(table_id).await.unwrap());
 

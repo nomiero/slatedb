@@ -241,6 +241,7 @@ mod tests {
     use crate::bytes_generator::OrderedBytesGenerator;
     use crate::db_state::{SsTableHandle, SsTableId};
     use crate::format::sst::SsTableFormat;
+    use crate::object_store_intent::{ReadKind, WriteKind};
     use crate::proptest_util;
     use crate::proptest_util::sample;
     use crate::test_utils::assert_kv;
@@ -269,6 +270,8 @@ mod tests {
             format,
             root_path.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let mut builder = table_store.table_builder();
         builder
@@ -326,6 +329,8 @@ mod tests {
             format,
             root_path.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let mut builder = table_store.table_builder();
         builder
@@ -390,6 +395,8 @@ mod tests {
             format,
             root_path.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let key_gen = OrderedBytesGenerator::new_with_byte_range(&[b'a'; 16], b'a', b'z');
         let mut test_case_key_gen = key_gen.clone();
@@ -434,6 +441,8 @@ mod tests {
             format,
             root_path.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let key_gen = OrderedBytesGenerator::new_with_byte_range(&[b'a'; 16], b'a', b'z');
         let mut expected_key_gen = key_gen.clone();
@@ -472,6 +481,8 @@ mod tests {
             format,
             root_path.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let key_gen = OrderedBytesGenerator::new_with_byte_range(&[b'a'; 16], b'a', b'z');
         let val_gen = OrderedBytesGenerator::new_with_byte_range(&[0u8; 16], 0u8, 26u8);
@@ -498,6 +509,8 @@ mod tests {
             SsTableFormat::default(),
             root_path.clone(),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         let mut rng = proptest_util::rng::new_test_rng(None);
@@ -644,6 +657,8 @@ mod tests {
                 format,
                 root_path,
                 None,
+                ReadKind::Foreground,
+                WriteKind::Flush,
             ));
 
             // Build a sorted run with v1, v2, v1, v2 SSTs
@@ -715,6 +730,8 @@ mod tests {
                 format,
                 root_path,
                 None,
+                ReadKind::Foreground,
+                WriteKind::Flush,
             ));
 
             // Build a sorted run with v1, v2, v1, v2 SSTs

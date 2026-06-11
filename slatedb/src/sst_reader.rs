@@ -57,6 +57,7 @@ use crate::db_cache::DbCache;
 use crate::db_state::{SsTableHandle, SsTableId, SsTableInfo};
 use crate::format::sst::{BlockTransformer, SsTableFormat};
 use crate::iter::IterationOrder;
+use crate::object_store_intent::{ReadKind, WriteKind};
 use crate::object_stores::ObjectStores;
 use crate::sst_stats::SstStats;
 use crate::tablestore::{SstFileMetadata, TableStore};
@@ -93,6 +94,8 @@ impl SstReader {
             sst_format,
             root_path.into(),
             cache,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         Self { table_store }
     }

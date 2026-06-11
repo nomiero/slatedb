@@ -287,6 +287,7 @@ mod tests {
     use crate::iter::{IterationOrder, RowEntryIterator};
     use crate::manifest::ManifestCore;
     use crate::mem_table::WritableKVTable;
+    use crate::object_store_intent::{ReadKind, WriteKind};
     use crate::object_stores::ObjectStores;
     use crate::proptest_util::{rng, sample};
     use crate::tablestore::TableStore;
@@ -771,6 +772,8 @@ mod tests {
             SsTableFormat::default(),
             path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ))
     }
 
@@ -853,6 +856,8 @@ mod tests {
             SsTableFormat::default(),
             Path::from("/tmp/test_kv_store"),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
         let entries: BTreeMap<Bytes, Bytes> = (0..16u32)
             .map(|i| {

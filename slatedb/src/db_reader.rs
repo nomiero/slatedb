@@ -1227,6 +1227,7 @@ mod tests {
     use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
     use crate::mem_table::{ImmutableMemtable, WritableKVTable};
     use crate::merge_operator::MergeOperatorType;
+    use crate::object_store_intent::{ReadKind, WriteKind};
     use crate::object_stores::ObjectStores;
     use crate::oracle::DbReaderOracle;
     use crate::paths::PathResolver;
@@ -2696,6 +2697,8 @@ mod tests {
                 PathResolver::new(self.path.clone()),
                 Arc::clone(&self.fp_registry),
                 None,
+                ReadKind::Foreground,
+                WriteKind::Flush,
             ))
         }
 

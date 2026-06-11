@@ -203,8 +203,8 @@ pub(crate) struct CompactionsStore {
 
 impl CompactionsStore {
     pub(crate) fn new(root_path: &Path, object_store: Arc<dyn ObjectStore>) -> Self {
-        let inner: Arc<dyn SequencedStorageProtocol<Compactions>> = Arc::new(
-            ObjectStoreSequencedStorageProtocol::<Compactions>::new_with_extensions(
+        let inner: Arc<dyn SequencedStorageProtocol<Compactions>> =
+            Arc::new(ObjectStoreSequencedStorageProtocol::<Compactions>::new(
                 root_path,
                 object_store,
                 "compactions",
@@ -212,8 +212,7 @@ impl CompactionsStore {
                 Box::new(FlatBufferCompactionsCodec {}),
                 ReadIntent::transactional_metadata().into_extensions(),
                 WriteIntent::transactional_metadata().into_extensions(),
-            ),
-        );
+            ));
         Self { inner }
     }
 
@@ -354,8 +353,13 @@ mod tests {
             object_store.clone(),
         ));
         let mut sc = StoredCompactions::create(store.clone(), 0).await.unwrap();
-        let boundary =
-            ObjectStoreBoundaryObject::new(&Path::from(ROOT), object_store, "compactions");
+        let boundary = ObjectStoreBoundaryObject::new(
+            &Path::from(ROOT),
+            object_store,
+            "compactions",
+            object_store::Extensions::default(),
+            object_store::Extensions::default(),
+        );
         boundary.advance(MonotonicId::new(2)).await.unwrap();
 
         let result = sc.update(sc.prepare_dirty().unwrap()).await;

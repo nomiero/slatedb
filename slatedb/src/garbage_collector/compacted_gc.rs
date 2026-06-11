@@ -254,6 +254,7 @@ mod tests {
     use crate::format::sst::{SsTableFormat, SST_FORMAT_VERSION_LATEST};
     use crate::manifest::store::StoredManifest;
     use crate::manifest::{LsmTreeState, Manifest, ManifestCore, Segment};
+    use crate::object_store_intent::{ReadKind, WriteKind};
     use crate::object_stores::ObjectStores;
     use crate::test_utils::build_test_sst;
     use bytes::Bytes;
@@ -273,6 +274,8 @@ mod tests {
             format.clone(),
             Path::from("/root"),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         // Manifest store and initial manifest
@@ -377,6 +380,8 @@ mod tests {
             format.clone(),
             Path::from("/root"),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         // Manifest store and initial manifest
@@ -483,6 +488,8 @@ mod tests {
             format.clone(),
             Path::from("/root"),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         // Manifest store with empty DB
@@ -585,6 +592,8 @@ mod tests {
             format.clone(),
             Path::from("/root"),
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         // Manifest with an L0 newer than the compaction output.

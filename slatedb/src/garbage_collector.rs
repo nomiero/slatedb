@@ -363,6 +363,7 @@ impl GarbageCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_store_intent::{ReadKind, WriteKind};
 
     use std::collections::HashSet;
     use std::{fs::OpenOptions, sync::Arc};
@@ -1562,6 +1563,8 @@ mod tests {
             sst_format,
             path,
             None,
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         (

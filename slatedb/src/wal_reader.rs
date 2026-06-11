@@ -76,7 +76,7 @@ use crate::db_state::SsTableId;
 use crate::format::sst::SsTableFormat;
 use crate::iter::{EmptyIterator, RowEntryIterator};
 use crate::manifest::SsTableView;
-use crate::object_store_intent::ReadKind;
+use crate::object_store_intent::{ReadKind, WriteKind};
 use crate::object_stores::ObjectStores;
 use crate::sst_iter::{SstIterator, SstIteratorOptions};
 use crate::tablestore::TableStore;
@@ -207,17 +207,17 @@ impl WalReader {
     /// object store here.
     pub fn new<P: Into<Path>>(path: P, object_store: Arc<dyn ObjectStore>) -> Self {
         let sst_format = SsTableFormat::default();
-        // WAL scans are tagged as WAL replay reads (RFC-0027) so caching
-        // wrappers do not admit one-shot segment reads.
-        let table_store = Arc::new(
-            TableStore::new(
-                ObjectStores::new(object_store, None),
-                sst_format,
-                path.into(),
-                None,
-            )
-            .with_read_kind(ReadKind::Wal),
-        );
+        // WAL scans are tagged as WAL reads (RFC-0027) so caching
+        // wrappers do not admit one-shot segment reads. WalReader never
+        // writes compacted SSTs, so the write kind is inert.
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(object_store, None),
+            sst_format,
+            path.into(),
+            None,
+            ReadKind::Wal,
+            WriteKind::Flush,
+        ));
         Self { table_store }
     }
 

@@ -545,6 +545,8 @@ impl<P: Into<Path>> DbBuilder<P> {
                     system_clock.clone(),
                 )) as Arc<dyn DbCache>
             }),
+            ReadKind::Foreground,
+            WriteKind::Flush,
         ));
 
         // Initialize the database
@@ -622,20 +624,18 @@ impl<P: Into<Path>> DbBuilder<P> {
         // The compactor and GC get their own table store: no block cache (so
         // background reads do not pollute it), and reads/writes tagged with
         // compaction intents (RFC-0027).
-        let uncached_table_store = Arc::new(
-            TableStore::new_with_fp_registry(
-                ObjectStores::new(
-                    retrying_main_object_store.clone(),
-                    retrying_wal_object_store.clone(),
-                ),
-                sst_format,
-                path_resolver.clone(),
-                self.fp_registry.clone(),
-                None,
-            )
-            .with_read_kind(ReadKind::CompactionInput)
-            .with_sst_write_kind(WriteKind::CompactionOutput),
-        );
+        let uncached_table_store = Arc::new(TableStore::new_with_fp_registry(
+            ObjectStores::new(
+                retrying_main_object_store.clone(),
+                retrying_wal_object_store.clone(),
+            ),
+            sst_format,
+            path_resolver.clone(),
+            self.fp_registry.clone(),
+            None,
+            ReadKind::CompactionInput,
+            WriteKind::CompactionOutput,
+        ));
 
         let compactor_builder = self.compactor_builder.or_else(|| {
             self.settings.compactor_options.as_ref().map(|opts| {
@@ -951,7 +951,11 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             ),
             SsTableFormat::default(), // read only SSTs can use default
             path,
-            None, // no need for cache in GC
+            None, // no need for a block cache in GC
+            // GC issues only metadata, list, and delete traffic; tag it as
+            // background compaction traffic so wrappers treat it accordingly.
+            ReadKind::CompactionInput,
+            WriteKind::CompactionOutput,
         ));
         GarbageCollector::new(
             manifest_store,
@@ -1160,16 +1164,14 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             block_transformer: self.block_transformer.clone(),
             ..SsTableFormat::default()
         };
-        let table_store = Arc::new(
-            TableStore::new(
-                ObjectStores::new(retrying_main_object_store, None),
-                sst_format,
-                path,
-                None, // no need for cache in GC
-            )
-            .with_read_kind(ReadKind::CompactionInput)
-            .with_sst_write_kind(WriteKind::CompactionOutput),
-        );
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(retrying_main_object_store, None),
+            sst_format,
+            path,
+            None, // no need for a block cache in the compactor
+            ReadKind::CompactionInput,
+            WriteKind::CompactionOutput,
+        ));
 
         let scheduler_supplier = self
             .scheduler_supplier
@@ -1326,16 +1328,14 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
         let manifest_store = Arc::new(ManifestStore::new(&path, self.main_object_store.clone()));
         let compactions_store =
             Arc::new(CompactionsStore::new(&path, self.main_object_store.clone()));
-        let table_store = Arc::new(
-            TableStore::new(
-                ObjectStores::new(self.main_object_store, None),
-                SsTableFormat::default(),
-                path,
-                None,
-            )
-            .with_read_kind(ReadKind::CompactionInput)
-            .with_sst_write_kind(WriteKind::CompactionOutput),
-        );
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(self.main_object_store, None),
+            SsTableFormat::default(),
+            path,
+            None,
+            ReadKind::CompactionInput,
+            WriteKind::CompactionOutput,
+        ));
         let recorder = MetricsRecorderHelper::new(
             self.metrics_recorder,
             self.options.metric_level.unwrap_or_default(),
