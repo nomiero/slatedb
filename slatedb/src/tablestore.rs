@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use fail_parallel::{fail_point, FailPointRegistry};
 use futures::{future::join_all, StreamExt};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
 use object_store::{
@@ -718,8 +718,15 @@ impl TableStore {
         let path = self.path(&handle.id);
         let sst_format = self.sst_format.clone();
         let tag = ObjectStoreCallTag::new(self.kind, SstType::from(&handle.id));
+        let id = handle.id;
         Box::new(move || {
             Box::pin(async move {
+                // This loader runs only on a db_cache (in-memory) miss, so log it
+                // to confirm what is being pulled from the object store and when.
+                info!(
+                    "db_cache miss, loading {:?} from object store [id={:?}]",
+                    target, id
+                );
                 // Only the stats arm can produce `None` (stats_len > 0 but no
                 // stats decoded); filters and index always yield an entry.
                 let entry = read_with_validation_retry(tag, async |tag| {

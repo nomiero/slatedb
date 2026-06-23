@@ -476,7 +476,11 @@ impl CachedObjectStore {
                 return Ok(bytes);
             }
 
-            // Cache miss, so we need to fetch from the object store.
+            // Cache miss, so we need to fetch from the object store (S3).
+            info!(
+                "part disk cache miss, fetching from object store [location={}, part_id={}]",
+                location, part_id
+            );
             // Read Part — deduplicate concurrent fetches of the same part.
             // The SingleFlight fetches the full part and saves it to cache; each
             // caller then slices out their own range_in_part.
