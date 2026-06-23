@@ -22,7 +22,7 @@ use crate::single_flight::SingleFlight;
 use crate::cached_object_store::admission::AdmissionPicker;
 use crate::cached_object_store::storage::{LocalCacheStorage, PartID};
 use crate::error::SlateDBError;
-use log::warn;
+use log::{info, warn};
 
 use crate::utils::build_concurrent;
 use slatedb_common::metrics::MetricsRecorderHelper;
@@ -183,8 +183,10 @@ impl CachedObjectStore {
         let entry = self.cache_storage.entry(location, self.part_size_bytes);
         if let Ok(Some((meta, attributes))) = entry.read_head().await {
             self.stats.object_store_cache_head_hits.increment(1);
+            info!("object store cache head hit [location={}]", location);
             return Ok(head_only_get_result(meta, attributes, Extensions::new()));
         }
+        info!("object store cache head miss [location={}]", location);
 
         // Cache miss — deduplicate concurrent HEAD requests for the same path.
         let (meta, attributes, extensions) = self
@@ -255,6 +257,10 @@ impl CachedObjectStore {
 
         if action == PutAction::Skip {
             // Write through to upstream without cloning the payload.
+            info!(
+                "object store cache put skipped [location={}, tag={:?}]",
+                location, tag
+            );
             return self.object_store.put_opts(location, payload, opts).await;
         }
 
@@ -285,6 +291,15 @@ impl CachedObjectStore {
                 .save_head((&meta, &attributes))
                 .await
                 .ok();
+            info!(
+                "object store cache put saved head [location={}, tag={:?}]",
+                location, tag
+            );
+        } else {
+            info!(
+                "object store cache put not admitted [location={}, tag={:?}]",
+                location, tag
+            );
         }
 
         Ok(result)
@@ -682,11 +697,10 @@ impl ObjectStore for CachedObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        // The init time tag is authoritative for multipart: unlike the
-        // single-PUT shutdown path, BufWriter forwards extensions to
-        // put_multipart_opts, so the tag is intact and no path fallback is
-        // needed. Large compacted SSTs (above BufWriter's multipart threshold)
-        // take this path.
+        // BufWriter forwards extensions to both put_opts and put_multipart_opts
+        // (object_store >= 0.14), so the init-time tag is intact on both the
+        // single-PUT shutdown path and here. Large compacted SSTs (above
+        // BufWriter's multipart threshold) take this path.
         let tag = ObjectStoreCallTag::from_extensions(&opts.extensions);
         let admit = policy::put_action(tag.as_ref(), &self.cache_put_policy) == PutAction::Cache;
         // Captured before `opts` is consumed, for the head committed on complete.
@@ -697,6 +711,10 @@ impl ObjectStore for CachedObjectStore {
         // Wrap the upload to mirror its parts into the cache only when the policy
         // admits it and disk admission allows it.
         if !admit {
+            info!(
+                "object store cache multipart not admitted by policy [location={}, tag={:?}]",
+                location, tag
+            );
             return Ok(inner);
         }
         let cache_location = location.clone();
@@ -704,8 +722,16 @@ impl ObjectStore for CachedObjectStore {
             .cache_storage
             .entry(&cache_location, self.part_size_bytes);
         if !self.admission_picker.pick(entry.as_ref()).admitted() {
+            info!(
+                "object store cache multipart not admitted by disk [location={}, tag={:?}]",
+                location, tag
+            );
             return Ok(inner);
         }
+        info!(
+            "object store cache multipart caching enabled [location={}, tag={:?}]",
+            location, tag
+        );
         Ok(Box::new(CachingMultipartUpload {
             inner,
             cache_storage: Arc::clone(&self.cache_storage),
@@ -873,6 +899,10 @@ impl MultipartUpload for CachingMultipartUpload {
         // serve from the cache instead of doing an upstream HEAD and re-prefetch.
         let meta = put_head(&self.cache_location, self.total_len, &result);
         entry.save_head((&meta, &self.attributes)).await.ok();
+        info!(
+            "object store cache multipart saved head [location={}]",
+            self.cache_location
+        );
         Ok(result)
     }
 
