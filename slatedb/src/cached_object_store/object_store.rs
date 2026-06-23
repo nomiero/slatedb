@@ -257,10 +257,6 @@ impl CachedObjectStore {
 
         if action == PutAction::Skip {
             // Write through to upstream without cloning the payload.
-            info!(
-                "object store cache put skipped [location={}, tag={:?}]",
-                location, tag
-            );
             return self.object_store.put_opts(location, payload, opts).await;
         }
 
@@ -954,14 +950,14 @@ impl From<GetRange> for GetRangeKey {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
     use object_store::{
         path::Path, GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt,
         PutMultipartOptions, PutPayload,
     };
     use rand::Rng;
     use rstest::rstest;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use super::CachedObjectStore;
     use crate::cached_object_store::policy::CachePutPolicy;
@@ -1001,8 +997,14 @@ mod tests {
             Arc::new(DbRand::default()),
             1000,
         ));
-        CachedObjectStore::new(object_store, cache_storage, 1024, CachePutPolicy::default(), stats)
-            .unwrap()
+        CachedObjectStore::new(
+            object_store,
+            cache_storage,
+            1024,
+            CachePutPolicy::default(),
+            stats,
+        )
+        .unwrap()
     }
 
     #[tokio::test]

@@ -3759,27 +3759,28 @@ mod tests {
             .await
             .unwrap();
 
-        let l0_ids: Vec<_> = {
-            let state = kv_store.inner.state.read();
-            state
-                .state()
-                .core()
-                .tree
-                .l0
-                .iter()
-                .map(|v| v.id)
-                .collect()
-        };
-        assert!(!l0_ids.is_empty(), "expected at least one L0 SST after flush");
-        for ulid in l0_ids {
-            let sst_path =
-                object_store::path::Path::from(format!("{db_path}/compacted/{ulid}.sst"));
-            let entry = cached_object_store.cache_storage.entry(&sst_path, 1024);
+        // Every compacted SST written through the flush path should be cached.
+        // List them (rather than matching SST ids) to stay robust against the
+        // background flusher producing more than one L0 SST.
+        let compacted_prefix = object_store::path::Path::from(format!("{db_path}/compacted"));
+        let compacted = cached_object_store
+            .list(Some(&compacted_prefix))
+            .collect::<Vec<_>>()
+            .await;
+        let mut cached_compacted = 0;
+        for meta in compacted {
+            let location = meta.unwrap().location;
+            let entry = cached_object_store.cache_storage.entry(&location, 1024);
             assert!(
                 !entry.cached_parts().await.unwrap().is_empty(),
-                "flushed L0 SST {ulid} should be cached"
+                "flushed compacted SST {location} should be cached"
             );
+            cached_compacted += 1;
         }
+        assert!(
+            cached_compacted > 0,
+            "expected at least one cached compacted SST after flush"
+        );
 
         kv_store.close().await.unwrap();
     }
