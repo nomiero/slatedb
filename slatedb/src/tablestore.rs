@@ -722,11 +722,17 @@ impl TableStore {
         Box::new(move || {
             Box::pin(async move {
                 // This loader runs only on a db_cache (in-memory) miss, so log it
-                // to confirm what is being pulled from the object store and when.
-                info!(
-                    "db_cache miss, loading {:?} from object store [id={:?}]",
-                    target, id
-                );
+                // to confirm what is being pulled from the object store and time
+                // how long the load (object store fetch + decode) takes. The
+                // encoded byte size lets us tell IO-bound from decode/contention.
+                let target_label = format!("{target:?}");
+                let load_bytes = match &target {
+                    CacheTarget::Filters => info.filter_len,
+                    CacheTarget::Index => info.index_len,
+                    CacheTarget::Stats => info.stats_len,
+                    CacheTarget::Data(_) => 0,
+                };
+                let load_start = std::time::Instant::now();
                 // Only the stats arm can produce `None` (stats_len > 0 but no
                 // stats decoded); filters and index always yield an entry.
                 let entry = read_with_validation_retry(tag, async |tag| {
@@ -763,6 +769,10 @@ impl TableStore {
                     }
                 })
                 .await?;
+                info!(
+                    "db_cache miss, loaded {target_label} ({load_bytes} bytes) from object store in {:?} [id={id:?}]",
+                    load_start.elapsed()
+                );
                 entry.ok_or_else(|| {
                     crate::Error::data("stats_len > 0 but read_stats returned no stats".to_string())
                 })
