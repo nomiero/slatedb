@@ -178,8 +178,11 @@ impl CachedObjectStore {
     }
 
     pub(crate) async fn cached_head(&self, location: &Path) -> object_store::Result<GetResult> {
+        self.stats.object_store_cache_head_access.increment(1);
+
         let entry = self.cache_storage.entry(location, self.part_size_bytes);
         if let Ok(Some((meta, attributes))) = entry.read_head().await {
+            self.stats.object_store_cache_head_hits.increment(1);
             return Ok(head_only_get_result(meta, attributes, Extensions::new()));
         }
 
@@ -1163,6 +1166,48 @@ mod tests {
             .expect("cache miss should fetch head from inner store");
 
         assert!(result.extensions.get::<ExtensionMarker>().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_cached_head_records_access_and_hit_metrics() {
+        use crate::cached_object_store::stats::{HEAD_ACCESS_COUNT, HEAD_HIT_COUNT};
+        use slatedb_common::metrics::{lookup_metric, test_recorder_helper};
+
+        let (recorder, helper) = test_recorder_helper();
+        let stats = Arc::new(CachedObjectStoreStats::new(&helper));
+
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let location = Path::from("/data/test_head_metrics");
+        inner
+            .put(
+                &location,
+                PutPayload::from_bytes(bytes::Bytes::from_static(b"hello")),
+            )
+            .await
+            .unwrap();
+
+        let cache_storage = Arc::new(FsCacheStorage::new(
+            new_test_cache_folder(),
+            None,
+            None,
+            stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        ));
+        let cached_store =
+            CachedObjectStore::new(inner, cache_storage, 1024, CachePutPolicy::default(), stats)
+                .unwrap();
+
+        // First HEAD misses the disk cache and populates the head entry.
+        cached_store.cached_head(&location).await.unwrap();
+        assert_eq!(lookup_metric(&recorder, HEAD_ACCESS_COUNT), Some(1));
+        assert_eq!(lookup_metric(&recorder, HEAD_HIT_COUNT), Some(0));
+
+        // Second HEAD is served from the disk cache.
+        cached_store.cached_head(&location).await.unwrap();
+        assert_eq!(lookup_metric(&recorder, HEAD_ACCESS_COUNT), Some(2));
+        assert_eq!(lookup_metric(&recorder, HEAD_HIT_COUNT), Some(1));
     }
 
     #[test]

@@ -167,6 +167,8 @@ Here is an AI-assisted listing of the current metrics and proposed mapped metric
 | `compactor/total_throughput_bytes_per_sec` | `slatedb.compactor.total_throughput_bytes_per_sec` | |
 | `oscache/part_hits` | `slatedb.object_store_cache.part_hit_count` | |
 | `oscache/part_access` | `slatedb.object_store_cache.part_access_count` | |
+| `oscache/head_hits` | `slatedb.object_store_cache.head_hit_count` | |
+| `oscache/head_access` | `slatedb.object_store_cache.head_access_count` | |
 | `oscache/cache_keys` | `slatedb.object_store_cache.cache_keys` | |
 | `oscache/cache_bytes` | `slatedb.object_store_cache.cache_bytes` | |
 | `oscache/evicted_keys` | `slatedb.object_store_cache.evicted_keys` | |
