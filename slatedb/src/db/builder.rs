@@ -645,6 +645,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             if let Some(operator) = self.merge_operator {
                 builder = builder.with_merge_operator(operator);
             }
+            builder = builder.with_fp_registry(self.fp_registry.clone());
 
             let compactor_table_store = Arc::new(TableStore::new_with_fp_registry(
                 ObjectStores::new(
@@ -1020,6 +1021,7 @@ pub struct CompactorBuilder<P: Into<Path>> {
     system_clock: Arc<dyn SystemClock>,
     closed_result: Arc<dyn ClosedResultWriter>,
     merge_operator: Option<MergeOperatorType>,
+    fp_registry: Arc<FailPointRegistry>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     #[cfg(feature = "compaction_filters")]
@@ -1040,6 +1042,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             system_clock: Arc::new(DefaultSystemClock::default()),
             closed_result: Arc::new(WatchableOnceCell::new()),
             merge_operator: None,
+            fp_registry: Arc::new(FailPointRegistry::new()),
             block_transformer: None,
             filter_policies: default_filter_policies(),
             #[cfg(feature = "compaction_filters")]
@@ -1059,6 +1062,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             system_clock: self.system_clock,
             closed_result: self.closed_result,
             merge_operator: self.merge_operator,
+            fp_registry: self.fp_registry,
             block_transformer: self.block_transformer,
             filter_policies: self.filter_policies,
             #[cfg(feature = "compaction_filters")]
@@ -1109,6 +1113,11 @@ impl<P: Into<Path>> CompactorBuilder<P> {
     /// Sets the merge operator to use for the compactor.
     pub fn with_merge_operator(mut self, merge_operator: MergeOperatorType) -> Self {
         self.merge_operator = Some(merge_operator);
+        self
+    }
+
+    pub(crate) fn with_fp_registry(mut self, fp_registry: Arc<FailPointRegistry>) -> Self {
+        self.fp_registry = fp_registry;
         self
     }
 
@@ -1207,6 +1216,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             self.rand,
             &recorder,
             self.system_clock,
+            self.fp_registry,
             self.closed_result,
             self.merge_operator,
             #[cfg(feature = "compaction_filters")]
@@ -1245,6 +1255,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             self.rand.clone(),
             stats.clone(),
             self.system_clock.clone(),
+            recorder.clone(),
         )
         .await?;
         let worker = options.worker.clone().map(|worker_options| {
@@ -1256,7 +1267,9 @@ impl<P: Into<Path>> CompactorBuilder<P> {
                 self.compaction_runtime,
                 self.rand,
                 stats,
+                recorder.clone(),
                 self.system_clock,
+                self.fp_registry,
                 self.merge_operator,
                 #[cfg(feature = "compaction_filters")]
                 self.compaction_filter_supplier,
@@ -1284,6 +1297,7 @@ pub struct CompactionWorkerBuilder<P: Into<Path>> {
     metrics_recorder: Arc<dyn MetricsRecorder>,
     system_clock: Arc<dyn SystemClock>,
     merge_operator: Option<MergeOperatorType>,
+    fp_registry: Arc<FailPointRegistry>,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -1299,6 +1313,7 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
             system_clock: Arc::new(DefaultSystemClock::default()),
             merge_operator: None,
+            fp_registry: Arc::new(FailPointRegistry::new()),
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
         }
@@ -1375,7 +1390,9 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
             worker_runtime,
             self.rand,
             stats,
+            recorder,
             self.system_clock,
+            self.fp_registry,
             self.merge_operator,
             #[cfg(feature = "compaction_filters")]
             self.compaction_filter_supplier,

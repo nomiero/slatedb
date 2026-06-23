@@ -55,11 +55,13 @@
 //! attempt (JobSpec).
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use fail_parallel::FailPointRegistry;
 use futures::stream::BoxStream;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -84,7 +86,7 @@ use crate::merge_operator::MergeOperatorType;
 use crate::tablestore::TableStore;
 use crate::utils::{format_bytes_si, IdGenerator};
 use slatedb_common::clock::SystemClock;
-use slatedb_common::metrics::MetricsRecorderHelper;
+use slatedb_common::metrics::{GaugeFn, MetricsRecorderHelper};
 use slatedb_common::DbRand;
 
 pub use crate::compactor_state::{
@@ -312,7 +314,9 @@ pub struct Compactor {
     compactor_runtime: Handle,
     rand: Arc<DbRand>,
     stats: Arc<CompactionStats>,
+    recorder: MetricsRecorderHelper,
     system_clock: Arc<dyn SystemClock>,
+    fp_registry: Arc<FailPointRegistry>,
     merge_operator: Option<MergeOperatorType>,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
@@ -330,6 +334,7 @@ impl Compactor {
         rand: Arc<DbRand>,
         recorder: &MetricsRecorderHelper,
         system_clock: Arc<dyn SystemClock>,
+        fp_registry: Arc<FailPointRegistry>,
         closed_result: Arc<dyn ClosedResultWriter>,
         merge_operator: Option<MergeOperatorType>,
         #[cfg(feature = "compaction_filters")] compaction_filter_supplier: Option<
@@ -351,7 +356,9 @@ impl Compactor {
             compactor_runtime,
             rand,
             stats,
+            recorder: recorder.clone(),
             system_clock,
+            fp_registry,
             merge_operator,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier,
@@ -384,6 +391,7 @@ impl Compactor {
             self.rand.clone(),
             self.stats.clone(),
             self.system_clock.clone(),
+            self.recorder.clone(),
         )
         .await?;
         self.task_executor
@@ -407,7 +415,9 @@ impl Compactor {
                 self.compactor_runtime.clone(),
                 self.rand.clone(),
                 self.stats.clone(),
+                self.recorder.clone(),
                 self.system_clock.clone(),
+                self.fp_registry.clone(),
                 self.merge_operator.clone(),
                 #[cfg(feature = "compaction_filters")]
                 self.compaction_filter_supplier.clone(),
@@ -505,6 +515,17 @@ pub(crate) struct CompactorEventHandler {
     rand: Arc<DbRand>,
     stats: Arc<CompactionStats>,
     system_clock: Arc<dyn SystemClock>,
+    recorder: MetricsRecorderHelper,
+    /// Job ids the coordinator has observed claimed by a worker (`Running` or
+    /// `Compacted` with a worker assigned). Initially empty, so the first metrics
+    /// update counts every inherited claim before establishing the set-difference
+    /// baseline. See [`Self::update_distributed_compaction_metrics`].
+    prev_claimed: HashSet<Ulid>,
+    /// Cached handles for per-worker `worker_last_heartbeat_ms` gauges. Handles are
+    /// retained only for workers currently owning in-flight jobs, so this map cannot
+    /// grow without bound. Dropping a handle does not remove its registered metric
+    /// series; that lifecycle is determined by the recorder.
+    worker_heartbeat_gauges: HashMap<String, Arc<dyn GaugeFn>>,
 }
 
 #[async_trait]
@@ -532,6 +553,7 @@ impl MessageHandler<CompactorMessage> for CompactorEventHandler {
             CompactorMessage::PollManifest => self.handle_ticker().await?,
             CompactorMessage::CommitCompacted => {
                 self.state_writer.load_compactions().await?;
+                self.update_distributed_compaction_metrics();
                 self.commit_compacted_entries().await?;
             }
         }
@@ -556,6 +578,7 @@ impl CompactorEventHandler {
         rand: Arc<DbRand>,
         stats: Arc<CompactionStats>,
         system_clock: Arc<dyn SystemClock>,
+        recorder: MetricsRecorderHelper,
     ) -> Result<Self, SlateDBError> {
         let state_writer = CompactorStateWriter::new(
             manifest_store,
@@ -574,6 +597,9 @@ impl CompactorEventHandler {
             rand,
             stats,
             system_clock,
+            recorder,
+            prev_claimed: HashSet::new(),
+            worker_heartbeat_gauges: HashMap::new(),
         })
     }
 
@@ -690,8 +716,9 @@ impl CompactorEventHandler {
     /// Handles a polling tick by refreshing compactions and the manifest, then possibly scheduling compactions.
     async fn handle_ticker(&mut self) -> Result<(), SlateDBError> {
         self.state_writer.refresh().await?;
-        self.commit_compacted_entries().await?;
         self.reclaim_stale_workers().await?;
+        self.update_distributed_compaction_metrics();
+        self.commit_compacted_entries().await?;
         self.maybe_schedule_compactions().await?;
         self.maybe_validate_submitted_compactions().await?;
         Ok(())
@@ -700,7 +727,8 @@ impl CompactorEventHandler {
     /// Reclaims `Running` compactions whose workers have not emitted a heartbeat
     /// within [`CompactorOptions::worker_heartbeat_timeout`], as well as any
     /// `Running` entry with no worker at all. Reclaimed compactions are reset to
-    /// `Submitted` (with no worker) so they can be picked up again.
+    /// `Scheduled` (with no worker) so they can be picked up again while
+    /// preserving any persisted job context needed for resume.
     ///
     /// This is the coordinator-side half of the failure-detection protocol described
     /// in RFC-0025. The worker side emits heartbeats (updating `last_heartbeat_ms`)
@@ -710,23 +738,17 @@ impl CompactorEventHandler {
         let timeout_ms = self.options.worker_heartbeat_timeout.as_millis() as u64;
 
         // A Running compaction is stale if its worker's heartbeat has aged past
-        // the timeout, or if it has no worker at all — the protocol shouldn't
+        // the timeout, or if it has no worker at all. The protocol shouldn't
         // produce the latter, but it would otherwise be stuck in Running forever.
-        // Capture the owning worker id for the log ("<none>" when absent).
-        let stale: Vec<(Ulid, String)> = self
+        // Capture the owning worker id (None in the no-worker case) for the log.
+        let stale: Vec<(Ulid, Option<String>)> = self
             .state()
             .compactions_with_status(&[CompactionStatus::Running])
             .filter(|c| match c.worker() {
                 Some(w) => now_ms.saturating_sub(w.last_heartbeat_ms) > timeout_ms,
                 None => true,
             })
-            .map(|c| {
-                let worker_id = c
-                    .worker()
-                    .map(|w| w.worker_id.clone())
-                    .unwrap_or_else(|| "<none>".to_string());
-                (c.id(), worker_id)
-            })
+            .map(|c| (c.id(), c.worker().map(|w| w.worker_id.clone())))
             .collect();
 
         if stale.is_empty() {
@@ -734,18 +756,89 @@ impl CompactorEventHandler {
         }
 
         for (id, worker_id) in &stale {
-            info!(
-                "reclaiming stale compaction [worker_id={}, id={}]",
-                worker_id, id
-            );
+            match worker_id {
+                Some(worker_id) => info!(
+                    "reclaiming stale compaction whose worker's heartbeat timed out \
+                     [worker_id={}, id={}]",
+                    worker_id, id
+                ),
+                None => {
+                    let message = format!(
+                        "reclaiming Running compaction that has no worker; this should \
+                         not happen. please open issue. [id={}]",
+                        id
+                    );
+                    debug_assert!(false, "{message}");
+                    error!("{message}");
+                }
+            }
             self.state_mut().update_compaction(id, |c| {
-                c.set_status(CompactionStatus::Submitted);
+                c.set_status(CompactionStatus::Scheduled);
                 c.set_worker(None);
             });
         }
 
         self.state_writer.write_compactions_safely().await?;
+        self.stats.jobs_reclaimed.increment(stale.len() as u64);
         Ok(())
+    }
+
+    /// Updates coordinator-side distributed-compaction metrics after each tick:
+    /// - `jobs_claimed`: counts jobs claimed by a worker. A job is "claimed"
+    ///   once it carries a worker and is `Running` or `Compacted` (the worker
+    ///   keeps its ownership through `Compacted`), so a job that finishes
+    ///   execution between two ticks is still counted. The first update counts
+    ///   every inherited claim once; later updates count set differences.
+    /// - `worker_last_heartbeat_ms`: a per-worker gauge of the last heartbeat
+    ///   timestamp. Gauge handles are cached only for workers that currently own
+    ///   in-flight jobs; a recorder may retain a registered series after its handle
+    ///   is dropped.
+    fn update_distributed_compaction_metrics(&mut self) {
+        use crate::compactor::stats::{WORKER_ID_LABEL, WORKER_LAST_HEARTBEAT_MS};
+
+        let claimed: Vec<(Ulid, crate::compactor_state::WorkerSpec)> = self
+            .state()
+            .compactions_with_status(&[CompactionStatus::Running, CompactionStatus::Compacted])
+            .filter_map(|c| c.worker().cloned().map(|w| (c.id(), w)))
+            .collect();
+
+        let current_ids: HashSet<Ulid> = claimed.iter().map(|(id, _)| *id).collect();
+        // The initially empty set counts all inherited claims once.
+        // This includes work claimed while the coordinator was unavailable;
+        // thereafter the counter records only newly observed claim ids.
+        let newly_claimed = current_ids.difference(&self.prev_claimed).count() as u64;
+        if newly_claimed > 0 {
+            self.stats.jobs_claimed.increment(newly_claimed);
+        }
+        self.prev_claimed = current_ids;
+
+        // Refresh the cached gauge handle for every worker that owns an in-flight
+        // job. Remove handles for workers that no longer do so, keeping worker_heartbeat_gauges
+        // bounded by the current worker count rather than every worker id ever seen.
+        // Recorders may retain the corresponding registered metric series.
+        let recorder = self.recorder.clone();
+        let mut last_heartbeat_per_worker: HashMap<String, u64> = HashMap::new();
+        for (_, w) in &claimed {
+            last_heartbeat_per_worker
+                .entry(w.worker_id.clone())
+                .and_modify(|last| *last = (*last).max(w.last_heartbeat_ms))
+                .or_insert(w.last_heartbeat_ms);
+        }
+
+        for (id, last_heartbeat_ms) in &last_heartbeat_per_worker {
+            let gauge = self
+                .worker_heartbeat_gauges
+                .entry(id.clone())
+                .or_insert_with(|| {
+                    recorder
+                        .gauge(WORKER_LAST_HEARTBEAT_MS)
+                        .labels(&[(WORKER_ID_LABEL, id.as_str())])
+                        .register()
+                });
+            gauge.set(*last_heartbeat_ms as i64);
+        }
+        self.worker_heartbeat_gauges
+            .retain(|id, _| last_heartbeat_per_worker.contains_key(id));
     }
 
     /// Commits any compactions in the `Compacted` state to the manifest.
@@ -1104,6 +1197,7 @@ impl CompactorEventHandler {
                 self.state_mut().finish_drain_compaction(compaction.id());
             } else {
                 self.state_mut().update_compaction(&compaction.id(), |c| {
+                    c.clear_ctx();
                     c.set_status(CompactionStatus::Scheduled)
                 });
             }
@@ -1188,6 +1282,12 @@ pub mod stats {
     pub const COMPACTOR_EPOCH: &str = compactor_stat_name!("epoch");
     pub const LAST_COMPACTION_TS_SEC: &str = compactor_stat_name!("last_compaction_timestamp_sec");
     pub const RUNNING_COMPACTIONS: &str = compactor_stat_name!("running_compactions");
+    pub const SSTS_WRITTEN: &str = compactor_stat_name!("ssts_written");
+    pub const JOBS_CLAIMED: &str = compactor_stat_name!("jobs_claimed");
+    pub const JOBS_RECLAIMED: &str = compactor_stat_name!("jobs_reclaimed");
+    pub const WORKER_LAST_HEARTBEAT_MS: &str = compactor_stat_name!("worker_last_heartbeat_ms");
+    /// Label key carrying a worker's id on per-worker metrics.
+    pub const WORKER_ID_LABEL: &str = "worker_id";
     pub const TOTAL_BYTES_BEING_COMPACTED: &str =
         compactor_stat_name!("total_bytes_being_compacted");
     pub const TOTAL_THROUGHPUT_BYTES_PER_SEC: &str =
@@ -1201,16 +1301,25 @@ pub mod stats {
     pub const ENTRY_TYPE_VALUE: &str = "value";
     pub const ENTRY_TYPE_MERGE: &str = "merge";
 
+    /// Coordinator-side compaction metrics.
+    ///
+    /// Per-worker throughput (`bytes_compacted`, `running_compactions`,
+    /// `ssts_written`) lives in [`WorkerStats`] instead: those are emitted by the
+    /// executor running inside a worker and tagged with `{worker_id}`. The
+    /// coordinator runs no executor, so it does not emit them (RFC-0025
+    /// Observability).
     pub(crate) struct CompactionStats {
         pub(crate) compactor_epoch: Arc<dyn GaugeFn>,
         pub(crate) last_compaction_ts: Arc<dyn GaugeFn>,
-        pub(crate) running_compactions: Arc<dyn UpDownCounterFn>,
-        pub(crate) bytes_compacted: Arc<dyn CounterFn>,
         pub(crate) total_bytes_being_compacted: Arc<dyn GaugeFn>,
         pub(crate) total_throughput: Arc<dyn GaugeFn>,
         pub(crate) merge_operator_compact_operands: Arc<dyn CounterFn>,
         pub(crate) expired_entries_purged_value: Arc<dyn CounterFn>,
         pub(crate) expired_entries_purged_merge: Arc<dyn CounterFn>,
+        /// `Scheduled → Running` transitions the coordinator observed in `.compactions`.
+        pub(crate) jobs_claimed: Arc<dyn CounterFn>,
+        /// Stale jobs the coordinator reset `Running → Submitted`.
+        pub(crate) jobs_reclaimed: Arc<dyn CounterFn>,
     }
 
     impl CompactionStats {
@@ -1218,8 +1327,8 @@ pub mod stats {
             Self {
                 compactor_epoch: recorder.gauge(COMPACTOR_EPOCH).register(),
                 last_compaction_ts: recorder.gauge(LAST_COMPACTION_TS_SEC).register(),
-                running_compactions: recorder.up_down_counter(RUNNING_COMPACTIONS).register(),
-                bytes_compacted: recorder.counter(BYTES_COMPACTED).register(),
+                jobs_claimed: recorder.counter(JOBS_CLAIMED).register(),
+                jobs_reclaimed: recorder.counter(JOBS_RECLAIMED).register(),
                 total_bytes_being_compacted: recorder.gauge(TOTAL_BYTES_BEING_COMPACTED).register(),
                 total_throughput: recorder.gauge(TOTAL_THROUGHPUT_BYTES_PER_SEC).register(),
                 merge_operator_compact_operands: recorder
@@ -1247,6 +1356,47 @@ pub mod stats {
             }
         }
     }
+
+    /// Per-worker compaction throughput, tagged `{worker_id=<id>}`.
+    ///
+    /// Registered once per worker from the worker's recorder with the worker id
+    /// baked into the label set, and incremented by the executor (which always
+    /// runs inside a worker). A shared metrics backend can therefore attribute
+    /// throughput to individual workers in multi-worker deployments.
+    #[derive(Clone)]
+    pub(crate) struct WorkerStats {
+        /// Bytes written to output SSTs by this worker (cumulative).
+        pub(crate) bytes_compacted: Arc<dyn CounterFn>,
+        /// Compaction jobs currently executing on this worker.
+        pub(crate) running_compactions: Arc<dyn UpDownCounterFn>,
+        /// Output SSTs produced by this worker (cumulative).
+        pub(crate) ssts_written: Arc<dyn CounterFn>,
+    }
+
+    impl WorkerStats {
+        pub(crate) fn new(recorder: &MetricsRecorderHelper, worker_id: &str) -> Self {
+            Self {
+                bytes_compacted: recorder
+                    .counter(BYTES_COMPACTED)
+                    .labels(&[(WORKER_ID_LABEL, worker_id)])
+                    .register(),
+                running_compactions: recorder
+                    .up_down_counter(RUNNING_COMPACTIONS)
+                    .labels(&[(WORKER_ID_LABEL, worker_id)])
+                    .register(),
+                ssts_written: recorder
+                    .counter(SSTS_WRITTEN)
+                    .labels(&[(WORKER_ID_LABEL, worker_id)])
+                    .register(),
+            }
+        }
+
+        /// A no-op instance for tests that don't assert on worker metrics.
+        #[cfg(test)]
+        pub(crate) fn noop() -> Self {
+            Self::new(&MetricsRecorderHelper::noop(), "")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1265,7 +1415,6 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use crate::bytes_range::BytesRange;
     use crate::compaction_worker::WorkerMessage;
     use crate::compactions_store::{FenceableCompactions, StoredCompactions};
     use crate::compactor::stats::CompactionStats;
@@ -1292,7 +1441,6 @@ mod tests {
     use crate::object_stores::ObjectStores;
     use crate::proptest_util::rng;
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
-    use crate::subcompaction::Subcompaction;
     use crate::tablestore::{TableStore, TableStoreKind};
     use crate::test_utils::{assert_iterator, FixedThreeBytePrefixExtractor, GatedObjectStore};
     use crate::types::KeyValue;
@@ -4371,6 +4519,7 @@ mod tests {
                     table_store,
                     rand: rand.clone(),
                     stats: compactor_stats.clone(),
+                    worker_stats: stats::WorkerStats::new(&recorder, "test-worker"),
                     clock: Arc::new(DefaultSystemClock::new()),
                     manifest_store: manifest_store.clone(),
                     merge_operator: None,
@@ -4386,6 +4535,7 @@ mod tests {
                 rand.clone(),
                 compactor_stats.clone(),
                 Arc::new(DefaultSystemClock::new()),
+                MetricsRecorderHelper::noop(),
             )
             .await
             .unwrap();
@@ -4441,6 +4591,7 @@ mod tests {
                     table_store,
                     rand: rand.clone(),
                     stats: compactor_stats.clone(),
+                    worker_stats: stats::WorkerStats::noop(),
                     clock: system_clock.clone(),
                     manifest_store: manifest_store.clone(),
                     merge_operator: None,
@@ -4456,6 +4607,7 @@ mod tests {
                 rand.clone(),
                 compactor_stats.clone(),
                 system_clock.clone(),
+                recorder.clone(),
             )
             .await
             .unwrap();
@@ -4534,7 +4686,7 @@ mod tests {
             let scheduled = self.get_scheduled_compactions().await;
             for compaction in scheduled {
                 let destination = compaction.spec().destination().expect("tiered spec");
-                let sst_views = compaction.get_l0_sst_views(db_state);
+                let l0_sst_views = compaction.get_l0_sst_views(db_state);
                 let sorted_runs = compaction.get_sorted_runs(db_state);
                 let is_dest_last_run = match db_state.tree_for_segment(compaction.spec().segment())
                 {
@@ -4548,12 +4700,12 @@ mod tests {
                     id: compaction.id(),
                     compaction_id: compaction.id(),
                     destination,
-                    sst_views,
+                    l0_sst_views,
                     sorted_runs,
-                    subcompactions: compaction.subcompactions().clone(),
                     compaction_clock_tick: db_state.last_l0_clock_tick,
-                    retention_min_seq: Some(db_state.recent_snapshot_min_seq),
                     is_dest_last_run,
+                    retention_min_seq: None,
+                    ctx: compaction.ctx().cloned(),
                 };
 
                 self.real_executor.start_compaction_job(args);
@@ -4571,9 +4723,6 @@ mod tests {
                 .await
                 .expect("timeout waiting for compaction result");
 
-                let output_ssts: Vec<SsTableHandle> =
-                    result.sst_views.into_iter().map(|v| v.sst).collect();
-
                 let mut stored = StoredCompactions::try_load(self.compactions_store.clone())
                     .await
                     .unwrap()
@@ -4581,9 +4730,11 @@ mod tests {
                 loop {
                     stored.refresh().await.unwrap();
                     let mut dirty = stored.prepare_dirty().unwrap();
-                    let mut completed = compaction.clone().with_status(CompactionStatus::Compacted);
-                    completed.set_subcompactions(vec![Subcompaction::new(BytesRange::unbounded())
-                        .with_output_ssts(output_ssts.clone())]);
+                    let completed = compaction
+                        .clone()
+                        .with_status(CompactionStatus::Compacted)
+                        .with_output_ssts(result.sst_views.iter().map(|v| v.sst.clone()).collect())
+                        .with_ctx(None);
                     dirty.value.insert(completed);
                     match stored.update(dirty).await {
                         Ok(()) => break,
@@ -4915,6 +5066,7 @@ mod tests {
             rand,
             compactor_stats,
             system_clock,
+            recorder,
         )
         .await
         .unwrap();
@@ -5045,7 +5197,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(feature = "zstd")]
     async fn test_compactor_compressed_block_size() {
-        use crate::compactor::stats::BYTES_COMPACTED;
+        use crate::compactor::stats::{BYTES_COMPACTED, SSTS_WRITTEN};
         use crate::config::{CompressionCodec, SstBlockSize};
         use slatedb_common::metrics::{lookup_metric, DefaultMetricsRecorder};
 
@@ -5093,10 +5245,11 @@ mod tests {
             .await
             .expect("db was not compacted");
 
-        // then:
+        // then: the embedded worker recorded per-worker throughput.
         let bytes_compacted = lookup_metric(&metrics_recorder, BYTES_COMPACTED).unwrap();
-
         assert!(bytes_compacted > 0, "bytes_compacted: {}", bytes_compacted);
+        let ssts_written = lookup_metric(&metrics_recorder, SSTS_WRITTEN).unwrap();
+        assert!(ssts_written > 0, "ssts_written: {}", ssts_written);
     }
 
     #[tokio::test]
@@ -5722,11 +5875,9 @@ mod tests {
         spec: CompactionSpec,
         output: Vec<SsTableHandle>,
     ) -> Compaction {
-        let mut compaction = Compaction::new(id, spec).with_status(CompactionStatus::Compacted);
-        compaction.set_subcompactions(vec![
-            Subcompaction::new(BytesRange::unbounded()).with_output_ssts(output)
-        ]);
-        compaction
+        Compaction::new(id, spec)
+            .with_status(CompactionStatus::Compacted)
+            .with_output_ssts(output)
     }
 
     #[tokio::test]
@@ -5879,7 +6030,7 @@ mod tests {
     }
 
     /// A Running compaction whose heartbeat is older than the timeout must be
-    /// reset to Submitted (worker cleared) by `reclaim_stale_workers`.
+    /// reset to Scheduled (worker cleared) by `reclaim_stale_workers`.
     #[tokio::test]
     async fn test_reclaim_stale_running_compaction() {
         // given: clock starts at 0 ms
@@ -5919,15 +6070,15 @@ mod tests {
         system_clock.advance(Duration::from_secs(60)).await;
 
         // when: call reclaim_stale_workers directly to avoid the scheduling
-        // side-effects of handle_ticker (which would try to start the reclaimed
-        // Submitted compaction with an empty spec and mark it Failed).
+        // side-effects of handle_ticker (which would try to claim the reclaimed
+        // Scheduled compaction with an empty spec and mark it Failed).
         fixture
             .handler
             .reclaim_stale_workers()
             .await
             .expect("reclaim_stale_workers failed");
 
-        // then: the compaction is now Submitted with no worker.
+        // then: the compaction is now Scheduled with no worker.
         let stored = fixture
             .compactions_store
             .read_latest_compactions()
@@ -5937,10 +6088,67 @@ mod tests {
         let c = stored.get(&compaction_id).expect("compaction missing");
         assert_eq!(
             c.status(),
-            CompactionStatus::Submitted,
+            CompactionStatus::Scheduled,
             "should be reclaimed"
         );
         assert!(c.worker().is_none(), "worker should be cleared");
+
+        // and: the reclamation is counted.
+        let reclaimed = slatedb_common::metrics::lookup_metric(
+            &fixture.test_recorder,
+            crate::compactor::stats::JOBS_RECLAIMED,
+        )
+        .expect("metric not found");
+        assert_eq!(reclaimed, 1, "one job should be counted as reclaimed");
+    }
+
+    /// `jobs_claimed` counts every job inherited by the coordinator on its first
+    /// metrics update, then counts each newly claimed job exactly once across the
+    /// `Running` and `Compacted` states.
+    #[tokio::test]
+    async fn test_jobs_claimed_metric_counts_inherited_then_new_claims() {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+
+        let claimed_count = || {
+            slatedb_common::metrics::lookup_metric(
+                &fixture.test_recorder,
+                crate::compactor::stats::JOBS_CLAIMED,
+            )
+            .expect("metric not found")
+        };
+
+        // given: a job already claimed (Running) before the coordinator's first tick.
+        let id1 = Ulid::new();
+        fixture.handler.state_mut().insert_compaction_for_test(
+            Compaction::new(id1, CompactionSpec::new(vec![], 0))
+                .with_status(CompactionStatus::Running)
+                .with_worker(Some(WorkerSpec::new("worker-1".to_string(), 0))),
+        );
+
+        // when: the first snapshot inherits the existing claim.
+        fixture.handler.update_distributed_compaction_metrics();
+        // then: the inherited job is counted once.
+        assert_eq!(claimed_count(), 1);
+
+        // when: a new job is claimed.
+        let id2 = Ulid::new();
+        fixture.handler.state_mut().insert_compaction_for_test(
+            Compaction::new(id2, CompactionSpec::new(vec![], 0))
+                .with_status(CompactionStatus::Running)
+                .with_worker(Some(WorkerSpec::new("worker-1".to_string(), 0))),
+        );
+        fixture.handler.update_distributed_compaction_metrics();
+        // then: it is counted once.
+        assert_eq!(claimed_count(), 2);
+
+        // when: that job finishes execution (Compacted, worker retained) and we
+        // tick again.
+        fixture.handler.state_mut().update_compaction(&id2, |c| {
+            c.set_status(CompactionStatus::Compacted);
+        });
+        fixture.handler.update_distributed_compaction_metrics();
+        // then: a still-claimed job is not recounted.
+        assert_eq!(claimed_count(), 2);
     }
 
     /// A Running compaction whose heartbeat is within the timeout must NOT be
@@ -6007,10 +6215,14 @@ mod tests {
         assert!(c.worker().is_some(), "worker should still be set");
     }
 
-    /// A Running compaction with no worker at all must also be reclaimed to
-    /// Submitted — the claim protocol shouldn't produce this state, but if it
-    /// somehow arises the entry would otherwise be stuck in Running forever.
+    /// A Running compaction without a worker violates the claim protocol. It
+    /// panics in debug builds and is reclaimed in release builds so it cannot
+    /// remain stuck in Running forever.
     #[tokio::test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "reclaiming Running compaction that has no worker")
+    )]
     async fn test_reclaim_worker_less_running_compaction() {
         let system_clock = Arc::new(MockSystemClock::new());
         let options = Arc::new(CompactorOptions {
@@ -6048,7 +6260,7 @@ mod tests {
             .await
             .expect("reclaim_stale_workers failed");
 
-        // then: the compaction is now Submitted with no worker.
+        // then: the compaction is now Scheduled with no worker.
         let stored = fixture
             .compactions_store
             .read_latest_compactions()
@@ -6058,7 +6270,7 @@ mod tests {
         let c = stored.get(&compaction_id).expect("compaction missing");
         assert_eq!(
             c.status(),
-            CompactionStatus::Submitted,
+            CompactionStatus::Scheduled,
             "should be reclaimed"
         );
         assert!(c.worker().is_none(), "worker should remain cleared");
