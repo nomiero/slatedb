@@ -1864,7 +1864,7 @@ impl Db {
     }
 
     /// Resolve an object store from a URL.
-    /// 
+    ///
     /// URL must not have a path component. This is an artifact of the way `object_store`
     /// handles URL parsing. Paths should be providedd in the various `*Builder::new`
     /// methods that take `path` arguments, not in the URL passed to this method.
@@ -1874,7 +1874,7 @@ impl Db {
     ///
     /// ## Returns
     /// - `Result<Arc<dyn ObjectStore>, crate::Error>`: the resolved object store
-    /// 
+    ///
     /// ## Errors
     /// - `Error`: if the URL is unparseable, if the URL contains a path component, or if
     ///   there was an error initializing the object store.
@@ -2072,6 +2072,7 @@ impl WriteHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cached_object_store::policy::CachePutPolicy;
     use crate::cached_object_store::stats::{PART_ACCESS_COUNT, PART_HIT_COUNT};
     use crate::cached_object_store::{CachedObjectStore, FsCacheStorage};
     use crate::cached_object_store_stats::CachedObjectStoreStats;
@@ -3659,7 +3660,7 @@ mod tests {
     }
 
     async fn test_object_store_cache_helper(
-        cache_puts_enabled: bool,
+        cache_put_policy: CachePutPolicy,
         db_path: &str,
         expected_cache_parts: Vec<(&str, usize)>,
     ) -> (Arc<CachedObjectStore>, Db) {
@@ -3691,7 +3692,7 @@ mod tests {
             object_store.clone(),
             cache_storage,
             part_size,
-            cache_puts_enabled,
+            cache_put_policy,
             cache_stats.clone(),
         )
         .unwrap();
@@ -3724,10 +3725,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_with_object_store_cache_stored_files() {
+        // With both write admission flags off (the default), no SST write is
+        // cached. The only cached part comes from a manifest READ, not a write.
         let expected_cache_parts =
             vec![
             ("tmp/test_kv_store_with_cache_stored_files/manifest/00000000000000000001.manifest", 0),
-            // 1 part is cached because fence_writers refreshes the manifest after writing the fence.
+            // 1 part is cached because fence_writers refreshes (reads) the manifest after writing the fence.
             ("tmp/test_kv_store_with_cache_stored_files/manifest/00000000000000000002.manifest", 1),
             // The startup fence WAL is zero bytes, so replay does not cache any object parts.
             ("tmp/test_kv_store_with_cache_stored_files/wal/00000000000000000001.sst", 0),
@@ -3735,7 +3738,7 @@ mod tests {
         ];
 
         let (_cached_object_store, kv_store) = test_object_store_cache_helper(
-            false, // cache_puts disabled
+            CachePutPolicy::default(),
             "/tmp/test_kv_store_with_cache_stored_files",
             expected_cache_parts,
         )
@@ -3745,26 +3748,277 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_with_object_store_cache_put_caching_enabled() {
-        let expected_cache_parts =
-            vec![
-            ("tmp/test_kv_store_with_put_cache_enabled/manifest/00000000000000000001.manifest", 1),
-            // 1 part is cached because fence_writers refreshes the manifest after writing the fence.
-            ("tmp/test_kv_store_with_put_cache_enabled/manifest/00000000000000000002.manifest", 1),
+    async fn test_object_store_cache_never_caches_wal_writes() {
+        // Even with both write admission flags enabled, WAL writes are never
+        // cached: the test_key write lands in WAL 0002, which stays uncached.
+        let expected_cache_parts = vec![
+            (
+                "tmp/test_kv_store_wal_never_cached/manifest/00000000000000000001.manifest",
+                0,
+            ),
+            // 1 part is cached because fence_writers refreshes (reads) the manifest after writing the fence.
+            (
+                "tmp/test_kv_store_wal_never_cached/manifest/00000000000000000002.manifest",
+                1,
+            ),
             // The startup fence WAL is zero bytes, so replay does not cache any object parts.
-            ("tmp/test_kv_store_with_put_cache_enabled/wal/00000000000000000001.sst", 0),
-            // 1 part is cached because the put with cache_puts enabled should cache the test_key put
-            ("tmp/test_kv_store_with_put_cache_enabled/wal/00000000000000000002.sst", 1),
+            (
+                "tmp/test_kv_store_wal_never_cached/wal/00000000000000000001.sst",
+                0,
+            ),
+            // WAL writes are skipped by policy regardless of the flags, so the
+            // test_key write is not cached.
+            (
+                "tmp/test_kv_store_wal_never_cached/wal/00000000000000000002.sst",
+                0,
+            ),
         ];
 
         let (_cached_object_store, kv_store) = test_object_store_cache_helper(
-            true, // cache_puts enabled
-            "/tmp/test_kv_store_with_put_cache_enabled",
+            CachePutPolicy {
+                cache_on_flush: true,
+                cache_on_compaction: true,
+            },
+            "/tmp/test_kv_store_wal_never_cached",
             expected_cache_parts,
         )
         .await;
 
         kv_store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_object_store_cache_caches_compaction_output() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // The embedded compactor is routed through the cached store, so with
+        // cache_on_compaction enabled its output SSTs are admitted.
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_compaction_cache_")
+            .tempdir()
+            .unwrap();
+        let recorder = MetricsRecorderHelper::noop();
+        let cache_stats = Arc::new(CachedObjectStoreStats::new(&recorder));
+        let part_size = 1024;
+        let cache_storage = Arc::new(FsCacheStorage::new(
+            temp_dir.keep(),
+            None,
+            None,
+            cache_stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        ));
+        let cached_object_store = CachedObjectStore::new(
+            object_store.clone(),
+            cache_storage,
+            part_size,
+            CachePutPolicy {
+                cache_on_flush: false,
+                cache_on_compaction: true,
+            },
+            cache_stats.clone(),
+        )
+        .unwrap();
+
+        let path = "/tmp/test_object_store_cache_compaction_output";
+        let should_compact = Arc::new(AtomicBool::new(false));
+        let should_compact_clone = should_compact.clone();
+        let compaction_scheduler = Arc::new(OnDemandCompactionSchedulerSupplier::new(Arc::new(
+            move |_state| should_compact_clone.swap(false, Ordering::SeqCst),
+        )));
+
+        let mut opts = test_db_options(0, 1024, None);
+        opts.manifest_poll_interval = Duration::from_millis(50);
+        let db = Db::builder(path, cached_object_store.clone())
+            .with_settings(opts)
+            .with_compactor_builder(
+                CompactorBuilder::new(path, cached_object_store.clone())
+                    .with_scheduler_supplier(compaction_scheduler)
+                    .with_options(fast_compactor_options()),
+            )
+            .build()
+            .await
+            .unwrap();
+        let db = Arc::new(db);
+
+        // Write enough that the memtable crosses l0_sst_size_bytes and flushes
+        // to L0 (mirrors test_coarse_size_estimation).
+        for i in 0..100u32 {
+            let key = format!("k{:04}", i);
+            db.put(key.as_bytes(), &[7u8; 64]).await.unwrap();
+        }
+        db.flush().await.unwrap();
+
+        // Trigger compaction and wait for a sorted run to land in the state.
+        should_compact.store(true, Ordering::SeqCst);
+        let db_poll = db.clone();
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            loop {
+                {
+                    let state = db_poll.inner.state.read();
+                    if !state.state().core().tree.compacted.is_empty() {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("compaction did not produce a sorted run in time");
+
+        // Each compaction output SST should be present in the cache.
+        let compacted_ssts: Vec<_> = {
+            let state = db.inner.state.read();
+            state
+                .state()
+                .core()
+                .tree
+                .compacted
+                .iter()
+                .flat_map(|sr| sr.sst_views.iter())
+                .map(|v| v.sst.id.unwrap_compacted_id())
+                .collect()
+        };
+        assert!(
+            !compacted_ssts.is_empty(),
+            "expected at least one compaction output SST"
+        );
+        for ulid in compacted_ssts {
+            let sst_path =
+                object_store::path::Path::from(format!("{}/compacted/{}.sst", path, ulid));
+            let entry = cached_object_store
+                .cache_storage
+                .entry(&sst_path, part_size);
+            assert!(
+                !entry.cached_parts().await.unwrap().is_empty(),
+                "compaction output {ulid} should be cached"
+            );
+        }
+    }
+
+    /// End to end check that a compaction output larger than BufWriter's 10 MiB
+    /// multipart threshold is cached through the multipart path (precisely, by
+    /// tag, not via the single-PUT path fallback). Ignored by default because it
+    /// writes >10 MiB; run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "heavy: writes >10 MiB to exercise the multipart compaction caching path"]
+    async fn test_object_store_cache_caches_large_multipart_compaction_output() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const MIB: usize = 1024 * 1024;
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_multipart_cache_")
+            .tempdir()
+            .unwrap();
+        let recorder = MetricsRecorderHelper::noop();
+        let cache_stats = Arc::new(CachedObjectStoreStats::new(&recorder));
+        // 1 MiB cache parts so a ~20 MiB output yields ~20 part files (not 20k).
+        let part_size = MIB;
+        let cache_storage = Arc::new(FsCacheStorage::new(
+            temp_dir.keep(),
+            None,
+            None,
+            cache_stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        ));
+        let cached_object_store = CachedObjectStore::new(
+            object_store.clone(),
+            cache_storage,
+            part_size,
+            CachePutPolicy {
+                cache_on_flush: false,
+                cache_on_compaction: true,
+            },
+            cache_stats.clone(),
+        )
+        .unwrap();
+
+        let path = "/tmp/test_object_store_cache_large_multipart";
+        let should_compact = Arc::new(AtomicBool::new(false));
+        let should_compact_clone = should_compact.clone();
+        let compaction_scheduler = Arc::new(OnDemandCompactionSchedulerSupplier::new(Arc::new(
+            move |_state| should_compact_clone.swap(false, Ordering::SeqCst),
+        )));
+
+        // 4 MiB L0 SSTs and a high l0_max_ssts so writing ~20 MiB across several
+        // L0s does not hit write backpressure before the (on demand) compaction.
+        let mut opts = test_db_options(0, 4 * MIB, None);
+        opts.l0_max_ssts = 100;
+        opts.manifest_poll_interval = Duration::from_millis(50);
+        let db = Db::builder(path, cached_object_store.clone())
+            .with_settings(opts)
+            .with_compactor_builder(
+                CompactorBuilder::new(path, cached_object_store.clone())
+                    .with_scheduler_supplier(compaction_scheduler)
+                    .with_options(fast_compactor_options()),
+            )
+            .build()
+            .await
+            .unwrap();
+        let db = Arc::new(db);
+
+        // 20 distinct keys with 1 MiB values: ~20 MiB of non-overlapping data
+        // that compacts into a single output SST above the 10 MiB threshold.
+        for i in 0..20u32 {
+            let key = format!("k{:04}", i);
+            db.put(key.as_bytes(), &vec![i as u8; MIB]).await.unwrap();
+        }
+        db.flush().await.unwrap();
+
+        should_compact.store(true, Ordering::SeqCst);
+        let db_poll = db.clone();
+        tokio::time::timeout(Duration::from_secs(30), async move {
+            loop {
+                {
+                    let state = db_poll.inner.state.read();
+                    if !state.state().core().tree.compacted.is_empty() {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("compaction did not produce a sorted run in time");
+
+        // Sum cached parts across all compaction output SSTs. The output is one
+        // ~20 MiB SST written multipart, so at 1 MiB parts the count is well
+        // above 10, which a single-PUT object (capped at 10 MiB) could not reach.
+        let compacted_ssts: Vec<_> = {
+            let state = db.inner.state.read();
+            state
+                .state()
+                .core()
+                .tree
+                .compacted
+                .iter()
+                .flat_map(|sr| sr.sst_views.iter())
+                .map(|v| v.sst.id.unwrap_compacted_id())
+                .collect()
+        };
+        assert!(
+            !compacted_ssts.is_empty(),
+            "expected at least one compaction output SST"
+        );
+        let mut total_cached_parts = 0usize;
+        for ulid in compacted_ssts {
+            let sst_path =
+                object_store::path::Path::from(format!("{}/compacted/{}.sst", path, ulid));
+            let entry = cached_object_store
+                .cache_storage
+                .entry(&sst_path, part_size);
+            total_cached_parts += entry.cached_parts().await.unwrap().len();
+        }
+        assert!(
+            total_cached_parts >= 11,
+            "expected >10 MiB of compaction output cached via multipart, got {total_cached_parts} parts"
+        );
     }
 
     async fn build_database_from_table(

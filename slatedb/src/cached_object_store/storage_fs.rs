@@ -270,7 +270,13 @@ impl FsCacheEntry {
                 .open(tmp_path)
                 .map_err(wrap_io_err)?;
             file.write_all(&buf).map_err(wrap_io_err)?;
-            file.sync_all().map_err(wrap_io_err)?;
+            // No fsync before the rename. The cache holds derived copies of
+            // durable upstream bytes, so part durability is not required, only
+            // correctness. The tmp file plus atomic rename means a reader never
+            // observes a partially written part. If a crash leaves a renamed but
+            // not yet flushed part that reads back corrupt, block validation
+            // fails on read, the reissued (retry) GET drops the entry, and the
+            // cache refetches the part from the object store. See RFC 0027.
             std::fs::rename(tmp_path, path).map_err(wrap_io_err)
         })
         .await?

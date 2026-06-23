@@ -620,8 +620,11 @@ impl<P: Into<Path>> DbBuilder<P> {
             write_rx,
             &tokio_handle,
         )?;
-        // The compactor and GC each get their own cacheless store (so background
-        // reads do not pollute the foreground cache), tagged with their kind.
+        // The embedded compactor shares the (optionally cached) main store, while
+        // GC uses the raw retrying store. The per-call tag keeps background reads
+        // from polluting the cache: compaction-input reads carry kind=Compactor
+        // and bypass the cache, while compaction-output writes are admitted only
+        // when `cache_on_compaction` is set.
         let compactor_builder = self.compactor_builder.or_else(|| {
             self.settings.compactor_options.as_ref().map(|opts| {
                 CompactorBuilder::new(path.clone(), retrying_main_object_store.clone())
@@ -645,7 +648,7 @@ impl<P: Into<Path>> DbBuilder<P> {
 
             let compactor_table_store = Arc::new(TableStore::new_with_fp_registry(
                 ObjectStores::new(
-                    retrying_main_object_store.clone(),
+                    maybe_cached_main_object_store.clone(),
                     retrying_wal_object_store.clone(),
                 ),
                 sst_format.clone(),

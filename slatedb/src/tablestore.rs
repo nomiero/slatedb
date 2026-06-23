@@ -20,11 +20,16 @@ use crate::blob::ReadOnlyBlob;
 use crate::db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache, EncodedCachedFilter};
 use crate::db_cache_manager::CacheTarget;
 use crate::db_state::{SsTableHandle, SsTableId, SstType};
-use crate::error::{RetryReason, SlateDBError};
+use crate::error::SlateDBError;
 use crate::filter_policy::NamedFilter;
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::block::Block;
 use crate::format::sst::{EncodedSsTable, SsTableFormat};
+// Re-exported (rather than a private `use`) so existing call sites that pair
+// `TableStoreKind` with `TableStore` can keep importing both from here, while
+// the canonical home stays the neutral `object_store_tag` module that the cache
+// also depends on.
+pub(crate) use crate::object_store_tag::{ObjectStoreCallTag, TableStoreKind};
 use crate::object_stores::{ObjectStoreType, ObjectStores};
 use crate::paths::PathResolver;
 use crate::sst_builder::EncodedSsTableBuilder;
@@ -1061,11 +1066,13 @@ async fn wal_object_exists(
 }
 
 /// Number of additional attempts after an SST read fails validation. The
-/// reissue carries a [`RetryReason`] so a caching wrapper drops its local copy.
+/// reissue carries a [`RetryReason`](crate::error::RetryReason) so a caching
+/// wrapper drops its local copy.
 const MAX_VALIDATION_RETRIES: usize = 1;
 
-/// Runs `read` with the source/type `tag`, reissuing it with a [`RetryReason`]
-/// set on the tag when the result is a recoverable validation failure.
+/// Runs `read` with the source/type `tag`, reissuing it with a
+/// [`RetryReason`](crate::error::RetryReason) set on the tag when the result is
+/// a recoverable validation failure.
 ///
 /// This is done to enable object store wrappers like a cache to know when
 /// to drop a cached entry that failed validation and retry the read from the
@@ -1098,10 +1105,6 @@ where
 }
 
 /// Builds a [`BufWriter`] whose upload carries `tag` in its extensions.
-///
-/// Caveat: object_store 0.13.2 drops extensions on the single-PUT shutdown path
-/// (payload fits in capacity), so compacted SSTs below that threshold reach a
-/// wrapper untagged. Fixed upstream on the object_store main branch.
 fn tagged_buf_writer(
     object_store: Arc<dyn ObjectStore>,
     path: Path,
@@ -1216,63 +1219,6 @@ impl EncodedSsTableWriter {
     #[cfg(test)]
     pub(crate) fn blocks_written(&self) -> usize {
         self.blocks_written
-    }
-}
-
-/// Identifies the component whose [`TableStore`] issued an object store call.
-/// Tagged on every read and write via `object_store::Extensions` as the call
-/// source, alongside the [`SstType`]. A caching wrapper combines it with the
-/// call type (get vs put) to decide admission.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TableStoreKind {
-    /// The primary database store: foreground reads and memtable flush writes.
-    Main,
-    /// A read-only store.
-    Reader,
-    /// The compactor store: compaction-input reads, compaction-output writes.
-    Compactor,
-    /// The garbage collector store.
-    GC,
-}
-
-/// The tag carried on every tablestore object store call via
-/// `object_store::Extensions`.
-///
-/// This can be used by `ObjectStore` wrappers to classify calls.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ObjectStoreCallTag {
-    /// The source of the call to distinguish main store, compactor .. etc.
-    pub(crate) kind: TableStoreKind,
-    /// The kind of SST the call is targeting (WAL vs compacted).
-    pub(crate) sst_type: SstType,
-    /// The reason for retry if this call is retried after a validation failure
-    /// for a read.
-    pub(crate) retry: Option<RetryReason>,
-}
-
-impl ObjectStoreCallTag {
-    /// A tag with no retry reason: the common case (a read sets the retry reason
-    /// itself on a reissue).
-    fn new(kind: TableStoreKind, sst_type: SstType) -> Self {
-        Self {
-            kind,
-            sst_type,
-            retry: None,
-        }
-    }
-
-    /// Reads the tag back from an extensions map, if present.
-    #[cfg(test)]
-    pub(crate) fn from_extensions(extensions: &Extensions) -> Option<Self> {
-        extensions.get::<Self>().copied()
-    }
-}
-
-impl From<ObjectStoreCallTag> for Extensions {
-    fn from(tag: ObjectStoreCallTag) -> Self {
-        let mut extensions = Extensions::new();
-        extensions.insert(tag);
-        extensions
     }
 }
 
