@@ -652,12 +652,19 @@ impl ObjectStore for CachedObjectStore {
     ) -> object_store::Result<GetResult> {
         let tag = ObjectStoreCallTag::from_extensions(&options.extensions);
 
-        // A HEAD is cheap metadata and admits no data blocks, so it reads through
-        // the cache (compaction included: a cached head saved on write lets the
-        // read skip an upstream HEAD round trip). The exception is WAL, which is
-        // never cached (writes skip, data reads bypass), so its HEAD bypasses too.
+        // A tagged non-WAL HEAD is cheap metadata and admits no data blocks, so
+        // it reads through the cache (compaction included: a cached head saved on
+        // write lets the read skip an upstream HEAD round trip). WAL HEADs bypass
+        // (WAL is never cached), and so do untagged HEADs: those are coordination
+        // I/O like WAL existence probes, never cached, and routing them through
+        // the cache would only log guaranteed misses. This mirrors `get_action`
+        // and `put_action` treating untagged I/O as bypass/skip.
         if options.head {
-            if tag.as_ref().is_some_and(|t| t.sst_type == SstType::Wal) {
+            let bypass = match tag.as_ref() {
+                None => true,
+                Some(t) => t.sst_type == SstType::Wal,
+            };
+            if bypass {
                 return self.object_store.get_opts(location, options).await;
             }
             return self.cached_head(location).await;
@@ -1238,6 +1245,48 @@ mod tests {
         cached_store.cached_head(&location).await.unwrap();
         assert_eq!(lookup_metric(&recorder, HEAD_ACCESS_COUNT), Some(2));
         assert_eq!(lookup_metric(&recorder, HEAD_HIT_COUNT), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_get_opts_untagged_head_bypasses_cache() {
+        use crate::cached_object_store::stats::HEAD_ACCESS_COUNT;
+        use slatedb_common::metrics::{lookup_metric, test_recorder_helper};
+
+        let (recorder, helper) = test_recorder_helper();
+        let stats = Arc::new(CachedObjectStoreStats::new(&helper));
+
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let location = Path::from("/data/test_untagged_head");
+        inner
+            .put(
+                &location,
+                PutPayload::from_bytes(bytes::Bytes::from_static(b"hello")),
+            )
+            .await
+            .unwrap();
+
+        let cache_storage = Arc::new(FsCacheStorage::new(
+            new_test_cache_folder(),
+            None,
+            None,
+            stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        ));
+        let cached_store =
+            CachedObjectStore::new(inner, cache_storage, 1024, CachePutPolicy::default(), stats)
+                .unwrap();
+
+        // An untagged HEAD (e.g. a WAL existence probe) bypasses the cache: it
+        // never enters cached_head, so it is not counted and reads upstream.
+        let opts = GetOptions {
+            head: true,
+            ..GetOptions::default()
+        };
+        let result = cached_store.get_opts(&location, opts).await.unwrap();
+        assert_eq!(result.meta.size, 5);
+        assert_eq!(lookup_metric(&recorder, HEAD_ACCESS_COUNT), Some(0));
     }
 
     #[test]
@@ -2037,9 +2086,15 @@ mod tests {
         .unwrap();
         cached_store.start_evictor().await;
 
+        // Populate the cache through the normal read path. Untagged reads bypass
+        // the cache, so tag these as a cacheable (main, compacted) read.
+        let cacheable = || GetOptions {
+            extensions: ObjectStoreCallTag::new(TableStoreKind::Main, SstType::Compacted).into(),
+            ..GetOptions::default()
+        };
         if cached {
             cached_store
-                .get(&location1)
+                .get_opts(&location1, cacheable())
                 .await
                 .unwrap()
                 .bytes()
@@ -2047,7 +2102,7 @@ mod tests {
                 .unwrap();
         }
         cached_store
-            .get(&location2)
+            .get_opts(&location2, cacheable())
             .await
             .unwrap()
             .bytes()

@@ -3725,24 +3725,61 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_with_object_store_cache_stored_files() {
-        // With both write admission flags off (the default), no SST write is
-        // cached. The only cached part comes from a manifest READ, not a write.
+        // cache_on_flush admits the L0 SST produced by a memtable flush, so the
+        // compacted SST is stored in the cache (asserted below). Manifest reads
+        // are untagged and bypass the cache; WAL writes are never cached.
         let expected_cache_parts =
             vec![
             ("tmp/test_kv_store_with_cache_stored_files/manifest/00000000000000000001.manifest", 0),
-            // 1 part is cached because fence_writers refreshes (reads) the manifest after writing the fence.
-            ("tmp/test_kv_store_with_cache_stored_files/manifest/00000000000000000002.manifest", 1),
+            // The fence_writers manifest refresh (read) is untagged and bypasses the cache.
+            ("tmp/test_kv_store_with_cache_stored_files/manifest/00000000000000000002.manifest", 0),
             // The startup fence WAL is zero bytes, so replay does not cache any object parts.
             ("tmp/test_kv_store_with_cache_stored_files/wal/00000000000000000001.sst", 0),
+            // WAL writes are never cached.
             ("tmp/test_kv_store_with_cache_stored_files/wal/00000000000000000002.sst", 0),
         ];
 
-        let (_cached_object_store, kv_store) = test_object_store_cache_helper(
-            CachePutPolicy::default(),
-            "/tmp/test_kv_store_with_cache_stored_files",
+        let db_path = "/tmp/test_kv_store_with_cache_stored_files";
+        let (cached_object_store, kv_store) = test_object_store_cache_helper(
+            CachePutPolicy {
+                cache_on_flush: true,
+                cache_on_compaction: false,
+            },
+            db_path,
             expected_cache_parts,
         )
         .await;
+
+        // Flush the memtable to L0 so a compacted SST is written. With
+        // cache_on_flush enabled, that write is admitted to the cache.
+        kv_store
+            .flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+
+        let l0_ids: Vec<_> = {
+            let state = kv_store.inner.state.read();
+            state
+                .state()
+                .core()
+                .tree
+                .l0
+                .iter()
+                .map(|v| v.id)
+                .collect()
+        };
+        assert!(!l0_ids.is_empty(), "expected at least one L0 SST after flush");
+        for ulid in l0_ids {
+            let sst_path =
+                object_store::path::Path::from(format!("{db_path}/compacted/{ulid}.sst"));
+            let entry = cached_object_store.cache_storage.entry(&sst_path, 1024);
+            assert!(
+                !entry.cached_parts().await.unwrap().is_empty(),
+                "flushed L0 SST {ulid} should be cached"
+            );
+        }
 
         kv_store.close().await.unwrap();
     }
@@ -3756,10 +3793,10 @@ mod tests {
                 "tmp/test_kv_store_wal_never_cached/manifest/00000000000000000001.manifest",
                 0,
             ),
-            // 1 part is cached because fence_writers refreshes (reads) the manifest after writing the fence.
+            // The fence_writers manifest refresh (read) is untagged and bypasses the cache.
             (
                 "tmp/test_kv_store_wal_never_cached/manifest/00000000000000000002.manifest",
-                1,
+                0,
             ),
             // The startup fence WAL is zero bytes, so replay does not cache any object parts.
             (

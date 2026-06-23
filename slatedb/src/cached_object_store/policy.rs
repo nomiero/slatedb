@@ -47,24 +47,28 @@ pub(crate) struct CachePutPolicy {
 /// Decides the GET action for a data read from the call tag.
 ///
 /// This applies to data GETs only. HEAD requests are handled by the caller
-/// (`CachedObjectStore::get_opts`) before this is consulted: a non-WAL HEAD
-/// always reads through the cache (cheap metadata that admits no data blocks, so
-/// even compaction reads benefit from a cached head), while a WAL HEAD bypasses
-/// the cache like its data reads.
+/// (`CachedObjectStore::get_opts`) before this is consulted, with the same
+/// bypass set: a tagged non-WAL HEAD reads through the cache (cheap metadata
+/// that admits no data blocks, so even compaction reads benefit from a cached
+/// head), while WAL and untagged HEADs bypass.
 ///
-/// Compactor data reads and WAL reads bypass the cache (compaction input scans
-/// are one-shot; WAL is never cached). A reissued (retry) read refetches; every
-/// other read (main, reader, GC, or untagged coordination I/O) takes the normal
-/// admit on miss path. Bypass is checked first, so a WAL or compactor read that
-/// is reissued after a validation failure still bypasses (there is nothing
-/// cached to drop).
+/// Untagged reads (manifest, WAL existence probes, other coordination I/O) are
+/// never cached, mirroring `put_action` skipping untagged writes. Compactor data
+/// reads and WAL reads also bypass (compaction input scans are one-shot; WAL is
+/// never cached). A reissued (retry) read refetches; every other tagged read
+/// (main, reader, GC) takes the normal admit on miss path. Bypass is checked
+/// first, so a WAL or compactor read that is reissued after a validation failure
+/// still bypasses (there is nothing cached to drop).
 pub(crate) fn get_action(tag: Option<&ObjectStoreCallTag>) -> GetAction {
-    match tag {
-        Some(t) if t.kind == TableStoreKind::Compactor || t.sst_type == SstType::Wal => {
-            GetAction::Bypass
-        }
-        Some(t) if t.retry.is_some() => GetAction::Refetch,
-        _ => GetAction::Admit,
+    let Some(tag) = tag else {
+        return GetAction::Bypass;
+    };
+    if tag.kind == TableStoreKind::Compactor || tag.sst_type == SstType::Wal {
+        GetAction::Bypass
+    } else if tag.retry.is_some() {
+        GetAction::Refetch
+    } else {
+        GetAction::Admit
     }
 }
 
@@ -168,7 +172,7 @@ mod tests {
         Some(tag(TableStoreKind::GC, SstType::Compacted, None)),
         GetAction::Admit
     )]
-    #[case(None, GetAction::Admit)]
+    #[case(None, GetAction::Bypass)]
     fn test_get_action(#[case] tag: Option<ObjectStoreCallTag>, #[case] expected: GetAction) {
         assert_eq!(get_action(tag.as_ref()), expected);
     }
