@@ -43,7 +43,7 @@ use crate::utils::{
     build_concurrent, compute_max_parallel, estimate_bytes_before_key, last_written_key_and_seq,
     spawn_bg_task, IdGenerator,
 };
-use log::{debug, error};
+use log::{debug, error, info};
 use tracing::instrument;
 use ulid::Ulid;
 
@@ -515,6 +515,16 @@ impl TokioCompactionExecutorInner {
         args: StartCompactionJobArgs,
     ) -> Result<SortedRun, SlateDBError> {
         debug!("executing compaction [job_args={:?}]", args);
+        // DIAGNOSTIC: time the whole job so compaction activity can be correlated
+        // with read-latency spikes on the main runtime.
+        #[allow(clippy::disallowed_types)]
+        let start = std::time::Instant::now();
+        let id = args.id;
+        let destination = args.destination;
+        info!(
+            "DIAGNOSTIC compaction job started [id={}, destination={}]",
+            id, destination
+        );
         // Load the manifest's sequence tracker once per job; every range shares
         // it rather than re-reading the manifest.
         let stored_manifest =
@@ -522,11 +532,18 @@ impl TokioCompactionExecutorInner {
         let sequence_tracker = Arc::new(stored_manifest.db_state().sequence_tracker.clone());
 
         // Plan the job's ranges, then run them concurrently.
-        let id = args.id;
-        let destination = args.destination;
         let planned = self.plan_compaction_job(args);
-        self.execute_compaction_job(id, destination, planned, sequence_tracker)
-            .await
+        let result = self
+            .execute_compaction_job(id, destination, planned, sequence_tracker)
+            .await;
+        info!(
+            "DIAGNOSTIC compaction job finished [id={}, destination={}, latency_ms={}, ok={}]",
+            id,
+            destination,
+            start.elapsed().as_millis(),
+            result.is_ok()
+        );
+        result
     }
 
     /// Determines the subcompaction plan for a job (RFC-0028).

@@ -1,11 +1,12 @@
 use std::collections::VecDeque;
 use std::ops::{Range, RangeBounds};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use fail_parallel::{fail_point, FailPointRegistry};
 use futures::{future::join_all, StreamExt};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
 use object_store::{
@@ -33,6 +34,57 @@ use crate::sst_builder::EncodedSsTableBuilder;
 use crate::sst_stats::SstStats;
 use crate::types::RowEntry;
 use crate::wal::wal_sst_builder::EncodedWalSsTableBuilder;
+
+/// Latency above which a read-path operation (filter, index, or block fetch) is
+/// logged by [`SlowReadGuard`]. A served-from-memory cache hit stays well under
+/// this, so the log only surfaces genuinely slow reads.
+const SLOW_READ_THRESHOLD: Duration = Duration::from_millis(10);
+
+/// DIAGNOSTIC: logs the wall-clock latency of a read-path operation on drop, but
+/// only when it exceeds [`SLOW_READ_THRESHOLD`]. Covers every exit path of the
+/// guarded function (including `?` early returns).
+///
+/// Wall-clock (rather than just the object-store call time) is deliberate: it
+/// also captures time the task spent waiting to be scheduled. A slow read here
+/// combined with a fast object-store GET (see `instrumented_object_store`) points
+/// at runtime contention (e.g. compaction or flush) rather than a cache miss.
+#[allow(clippy::disallowed_types)]
+struct SlowReadGuard {
+    op: &'static str,
+    store: TableStoreKind,
+    sst: SsTableId,
+    start: std::time::Instant,
+}
+
+#[allow(clippy::disallowed_types)]
+impl SlowReadGuard {
+    fn new(op: &'static str, store: TableStoreKind, sst: SsTableId) -> Self {
+        Self {
+            op,
+            store,
+            sst,
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for SlowReadGuard {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed();
+        if elapsed >= SLOW_READ_THRESHOLD {
+            // `store` distinguishes main read-path latency from the compactor's
+            // and GC's own reads, so log lines can be filtered to the path that
+            // serves user gets/scans.
+            info!(
+                "DIAGNOSTIC slow {} read [store={:?}, sst={:?}, latency_ms={}]",
+                self.op,
+                self.store,
+                self.sst,
+                elapsed.as_millis()
+            );
+        }
+    }
+}
 
 pub(crate) struct TableStore {
     object_stores: ObjectStores,
@@ -613,6 +665,7 @@ impl TableStore {
         handle: &SsTableHandle,
         cache_blocks: bool,
     ) -> Result<Arc<[NamedFilter]>, SlateDBError> {
+        let _slow_read_guard = SlowReadGuard::new("filter", self.kind, handle.id);
         // No filter exists for this SST (either no policies configured, or the
         // SST was built below `min_filter_keys`). Return an empty slice without
         // touching the cache: there is nothing to load, and caching the empty
@@ -700,6 +753,7 @@ impl TableStore {
         handle: &SsTableHandle,
         cache_blocks: bool,
     ) -> Result<Arc<SsTableIndexOwned>, SlateDBError> {
+        let _slow_read_guard = SlowReadGuard::new("index", self.kind, handle.id);
         let cache_key = (handle.id, handle.info.index_offset).into();
         if let Some(ref cache) = self.cache {
             // See `read_filters` for the rationale on the fall-through path.
@@ -715,6 +769,13 @@ impl TableStore {
                 return Ok(index);
             }
         }
+        // DIAGNOSTIC: the index was not served from the block cache, so it is read
+        // from the object store. This is either a table store with no block cache,
+        // or a cache_blocks=false (read only) lookup that missed (e.g. WAL replay).
+        info!(
+            "index cache miss, reading from object store [id={:?}, index_offset={}, cache_blocks={}, kind={:?}]",
+            handle.id, handle.info.index_offset, cache_blocks, self.kind
+        );
         let index = read_obj!(self, &handle.id, |obj| self
             .sst_format
             .read_index(&handle.info, &obj))
@@ -761,6 +822,12 @@ impl TableStore {
                             Ok(stats.map(|s| CachedEntry::with_sst_stats(Arc::new(s))))
                         }
                         CacheTarget::Index => {
+                            // DIAGNOSTIC: a cache_blocks=true index fetch missed, so
+                            // the loader runs and reads the index from the object store.
+                            info!(
+                                "index cache miss via loader, reading from object store [path={}, tag={:?}]",
+                                obj.path, tag
+                            );
                             let index = sst_format
                                 .read_index(&info, &obj)
                                 .await
@@ -819,6 +886,7 @@ impl TableStore {
         handle: &SsTableHandle,
         blocks: Range<usize>,
     ) -> Result<VecDeque<Block>, SlateDBError> {
+        let _slow_read_guard = SlowReadGuard::new("block", self.kind, handle.id);
         let object_store = self.object_stores.store_for(&handle.id);
         let path = self.path(&handle.id);
         read_with_validation_retry(
@@ -859,6 +927,7 @@ impl TableStore {
         blocks: Range<usize>,
         cache_blocks: bool,
     ) -> Result<VecDeque<Arc<Block>>, SlateDBError> {
+        let _slow_read_guard = SlowReadGuard::new("block", self.kind, handle.id);
         // Single-block reads (point-gets via SstIterator::for_key, SstFile::read_block,
         // etc.) take a dedup-aware fast-path: concurrent callers for the same block
         // collapse onto one loader. Multi-block reads fall through to the range-
@@ -989,6 +1058,7 @@ impl TableStore {
         handle: &SsTableHandle,
         block: usize,
     ) -> Result<Block, SlateDBError> {
+        let _slow_read_guard = SlowReadGuard::new("block", self.kind, handle.id);
         read_obj!(self, &handle.id, |obj| async {
             let index = self.sst_format.read_index(&handle.info, &obj).await?;
             self.sst_format
