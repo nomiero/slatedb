@@ -653,7 +653,19 @@ impl<P: Into<Path>> DbBuilder<P> {
                 sst_format.clone(),
                 path_resolver.clone(),
                 self.fp_registry.clone(),
-                None,
+                // HACK: share the block cache with the main table store so the
+                // compaction write path (EncodedSsTableWriter::close) can warm the
+                // output SST filters and indexes. Compaction reads use
+                // cache_blocks=false and cache_metadata=false, so this never
+                // caches input data blocks or input metadata; only the output
+                // filter and index are inserted.
+                self.db_cache.as_ref().map(|c| {
+                    Arc::new(DbCacheWrapper::new(
+                        c.clone(),
+                        &recorder,
+                        system_clock.clone(),
+                    )) as Arc<dyn DbCache>
+                }),
                 TableStoreKind::Compactor,
             ));
             let compactor_handlers = builder

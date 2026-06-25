@@ -402,14 +402,18 @@ impl TableStore {
                         )
                         .await;
                 }
-                cache
-                    .insert(
-                        (*id, encoded_sst.info.index_offset).into(),
-                        CachedEntry::with_sst_index(Arc::new(encoded_sst.index.clone())),
-                    )
-                    .await;
             }
         }
+        // HACK: always cache the index and filters at flush and compaction. The
+        // write_cache flag above gates only the bulk data blocks; the index and
+        // filters are small and read on every lookup, so we keep them warm
+        // unconditionally to avoid an object store round trip on the first read.
+        self.cache_index(
+            *id,
+            encoded_sst.info.index_offset,
+            Arc::new(encoded_sst.index.clone()),
+        )
+        .await;
         self.cache_filters(
             *id,
             encoded_sst.info.filter_offset,
@@ -451,6 +455,22 @@ impl TableStore {
                 .insert((sst, id).into(), CachedEntry::with_filters(filters))
                 .await;
         }
+    }
+
+    // HACK: mirror of cache_filters for the SST index, used by the flush and
+    // compaction write paths to always warm the index in the block cache (even
+    // when bulk block caching on write is disabled), so the first read of a
+    // freshly written SST does not fault the index in from the object store.
+    async fn cache_index(&self, sst: SsTableId, index_offset: u64, index: Arc<SsTableIndexOwned>) {
+        let Some(ref cache) = self.cache else {
+            return;
+        };
+        cache
+            .insert(
+                (sst, index_offset).into(),
+                CachedEntry::with_sst_index(index),
+            )
+            .await;
     }
 
     /// Decodes an `EncodedCachedFilter` slice into a fully-decoded
@@ -1184,6 +1204,15 @@ impl EncodedSsTableWriter {
 
         self.writer.write_all(encoded_sst.footer.as_ref()).await?;
         self.writer.shutdown().await?;
+        // HACK: always cache the index and filters for compaction output (mirror
+        // of write_sst on the flush path), so query metadata is warm on first read.
+        self.table_store
+            .cache_index(
+                self.id,
+                encoded_sst.info.index_offset,
+                Arc::new(encoded_sst.index.clone()),
+            )
+            .await;
         self.table_store
             .cache_filters(self.id, encoded_sst.info.filter_offset, encoded_sst.filters)
             .await;
