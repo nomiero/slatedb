@@ -529,6 +529,18 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Create path resolver and table store
         let path_resolver = PathResolver::new_with_external_ssts(path.clone(), external_ssts);
+        // HACK: build one cache wrapper and share it between the main and
+        // compactor table stores. Each `DbCacheWrapper` namespaces keys by a
+        // distinct `scope_id`, so giving the compactor its own wrapper made the
+        // compaction write path's index/filter warming
+        // (EncodedSsTableWriter::close) land under a scope the read path never
+        // queries. Sharing the wrapper (same scope) makes that warming visible
+        // to reads, so a freshly compacted SST's metadata is warm on first read
+        // instead of faulting in from the object store.
+        let shared_db_cache: Option<Arc<dyn DbCache>> = self.db_cache.as_ref().map(|c| {
+            Arc::new(DbCacheWrapper::new(c.clone(), &recorder, system_clock.clone()))
+                as Arc<dyn DbCache>
+        });
         let table_store = Arc::new(TableStore::new_with_fp_registry(
             ObjectStores::new(
                 maybe_cached_main_object_store.clone(),
@@ -537,13 +549,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             sst_format.clone(),
             path_resolver.clone(),
             self.fp_registry.clone(),
-            self.db_cache.as_ref().map(|c| {
-                Arc::new(DbCacheWrapper::new(
-                    c.clone(),
-                    &recorder,
-                    system_clock.clone(),
-                )) as Arc<dyn DbCache>
-            }),
+            shared_db_cache.clone(),
             TableStoreKind::Main,
         ));
 
@@ -653,19 +659,16 @@ impl<P: Into<Path>> DbBuilder<P> {
                 sst_format.clone(),
                 path_resolver.clone(),
                 self.fp_registry.clone(),
-                // HACK: share the block cache with the main table store so the
-                // compaction write path (EncodedSsTableWriter::close) can warm the
-                // output SST filters and indexes. Compaction reads use
-                // cache_blocks=false and cache_metadata=false, so this never
-                // caches input data blocks or input metadata; only the output
-                // filter and index are inserted.
-                self.db_cache.as_ref().map(|c| {
-                    Arc::new(DbCacheWrapper::new(
-                        c.clone(),
-                        &recorder,
-                        system_clock.clone(),
-                    )) as Arc<dyn DbCache>
-                }),
+                // HACK: reuse the main table store's cache wrapper (same
+                // `scope_id`) so the compaction write path
+                // (EncodedSsTableWriter::close) warms the output SST index and
+                // filters into the namespace the read path actually queries. A
+                // separate wrapper here would namespace those warmed entries
+                // under a different scope, so reads would never see them and
+                // would fault metadata in from the object store after every
+                // compaction. Compaction reads still use cache_blocks=false and
+                // cache_metadata=false, so input data/metadata are not cached.
+                shared_db_cache.clone(),
                 TableStoreKind::Compactor,
             ));
             let compactor_handlers = builder
