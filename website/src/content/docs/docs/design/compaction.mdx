@@ -71,6 +71,8 @@ Final commits do not wait for the interval.
 The coordinator batches eligible jobs into one manifest update, even when no SST loses its last view.
 The same atomic write adds a checkpoint, a reference that keeps an older manifest available.
 Garbage collection deletes released files only after their checkpoints expire and their timestamps pass its cutoff.
+The counter `slatedb.compactor.incremental_released_bytes` estimates the bytes of input SSTs released before their jobs finish.
+It counts each physical file once, only after a successful commit removes its last view across all trees.
 
 The destination remains the oldest input run.
 It holds committed output and the remaining input views in key order.

@@ -9,6 +9,7 @@
 //!
 //! Keeping these rules in one place makes it harder to regress GC safety or
 //! compactor fencing logic elsewhere in the codebase.
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use log::{debug, info};
 use crate::compactions_store::{CompactionsStore, FenceableCompactions, StoredCompactions};
 use crate::compactor_state::{CompactionStatus, CompactorState, VersionedCompactions};
 use crate::config::{CheckpointOptions, CompactorOptions};
+use crate::db_state::SsTableId;
 use crate::error::SlateDBError;
 use crate::manifest::store::{FenceableManifest, ManifestStore, StoredManifest};
 use crate::manifest::VersionedManifest;
@@ -265,10 +267,43 @@ impl CompactorStateWriter {
     /// - `Ok(())` when the manifest is successfully persisted.
     /// - `SlateDBError` if non-retryable errors occur.
     pub(crate) async fn write_manifest_safely(&mut self) -> Result<(), SlateDBError> {
+        self.write_manifest_with_released_bytes(&HashSet::new())
+            .await
+            .map(|_| ())
+    }
+
+    /// Returns the estimated bytes of tracked SSTs released by the successful write.
+    /// Counts each physical file once, after its last view disappears from all trees.
+    pub(crate) async fn write_manifest_with_released_bytes(
+        &mut self,
+        tracked_inputs: &HashSet<SsTableId>,
+    ) -> Result<u64, SlateDBError> {
         loop {
             self.load_manifest().await?;
+            let released_bytes = if tracked_inputs.is_empty() {
+                0
+            } else {
+                let current = self.manifest.prepare_dirty()?;
+                let retained = self
+                    .state
+                    .db_state()
+                    .all_sst_views()
+                    .map(|view| view.sst.id)
+                    .collect::<HashSet<_>>();
+                current
+                    .value
+                    .core
+                    .all_sst_views()
+                    .filter(|view| {
+                        tracked_inputs.contains(&view.sst.id) && !retained.contains(&view.sst.id)
+                    })
+                    .map(|view| (view.sst.id, view.sst.estimate_size()))
+                    .collect::<HashMap<_, _>>()
+                    .values()
+                    .sum()
+            };
             match self.write_manifest().await {
-                Ok(_) => return Ok(()),
+                Ok(_) => return Ok(released_bytes),
                 Err(err) if err.is_sequenced_write_conflict() => {
                     debug!("conflicting manifest version. updating and retrying write again.");
                 }
@@ -1188,5 +1223,108 @@ mod tests {
         let final_id = final_manifest.id;
         // The racing writer and the successful retry each add one version.
         assert_eq!(final_id, start_id + 2);
+    }
+
+    #[rstest::rstest]
+    #[case(false, false, 120)]
+    #[case(true, false, 0)]
+    #[case(false, true, 0)]
+    #[tokio::test]
+    async fn released_bytes_use_the_successful_base_and_all_physical_references(
+        #[case] reference_in_other_tree: bool,
+        #[case] add_reference_on_conflict: bool,
+        #[case] expected_bytes: u64,
+    ) {
+        use crate::bytes_range::BytesRange;
+        use crate::db_state::{SortedRun, SsTableView};
+        use crate::manifest::{LsmTreeState, Segment};
+
+        let inner_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let gated_store = Arc::new(GatedObjectStore::new(inner_store.clone()));
+        let manifest_store = Arc::new(ManifestStore::new(&Path::from(ROOT), gated_store.clone()));
+        let compactions_store = Arc::new(CompactionsStore::new(
+            &Path::from(ROOT),
+            gated_store.clone(),
+        ));
+        let clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
+        let input = SsTableView::identity(SsTableHandle::new(
+            Ulid::new().into(),
+            SST_FORMAT_VERSION_LATEST,
+            SsTableInfo {
+                first_entry: Some(Bytes::from_static(b"a")),
+                last_entry: Some(Bytes::from_static(b"z")),
+                index_offset: 100,
+                index_len: 20,
+                ..Default::default()
+            },
+        ));
+        let left = input.with_visible_range(BytesRange::from_slice(..b"m".as_slice()));
+        let mut right = input.with_visible_range(BytesRange::from_slice(b"m".as_slice()..));
+        right.id = Ulid::new();
+        let mut core = ManifestCore::new();
+        Arc::make_mut(&mut core.tree).compacted = vec![SortedRun::new(1, [left, right])];
+        if reference_in_other_tree {
+            core.segments.push(Segment {
+                prefix: Bytes::from_static(b"other/"),
+                tree: Arc::new(LsmTreeState {
+                    compacted: vec![SortedRun::new(0, [input.clone()])],
+                    ..LsmTreeState::default()
+                }),
+            });
+        }
+        StoredManifest::create_new_db(manifest_store.clone(), core, clock.clone())
+            .await
+            .unwrap();
+        let mut writer = CompactorStateWriter::new(
+            manifest_store.clone(),
+            compactions_store,
+            clock.clone(),
+            &CompactorOptions::default(),
+            Arc::new(DbRand::new(7)),
+        )
+        .await
+        .unwrap();
+        Arc::make_mut(&mut writer.state.manifest_mut_for_test().value.core.tree)
+            .compacted
+            .clear();
+        let start_id = manifest_store.read_latest_manifest().await.unwrap().id();
+        let tracked = HashSet::from([input.sst.id]);
+        let baseline_puts = gated_store.put_opts_gate.arrivals();
+        gated_store.put_opts_gate.close();
+        let write_task = tokio::spawn(async move {
+            let result = writer.write_manifest_with_released_bytes(&tracked).await;
+            (writer, tracked, result)
+        });
+        gated_store
+            .put_opts_gate
+            .wait_for_arrivals(baseline_puts + 1)
+            .await;
+
+        let remote_store = Arc::new(ManifestStore::new(&Path::from(ROOT), inner_store));
+        let mut remote = StoredManifest::load(remote_store, clock).await.unwrap();
+        let mut dirty = remote.prepare_dirty().unwrap();
+        dirty.value.core.next_wal_sst_id += 1;
+        if add_reference_on_conflict {
+            Arc::make_mut(&mut dirty.value.core.tree)
+                .l0
+                .push_front(input);
+        }
+        remote.update(dirty).await.unwrap();
+        gated_store.put_opts_gate.release();
+        let (mut writer, tracked, result) = write_task.await.unwrap();
+        assert_eq!(result.unwrap(), expected_bytes);
+        let committed = manifest_store.read_latest_manifest().await.unwrap();
+        assert_eq!(committed.id(), start_id + 2);
+        assert_eq!(
+            committed.core().checkpoints.last().unwrap().manifest_id,
+            start_id + 1
+        );
+        assert_eq!(
+            writer
+                .write_manifest_with_released_bytes(&tracked)
+                .await
+                .unwrap(),
+            0
+        );
     }
 }
