@@ -4,8 +4,8 @@
 //! - **Reads**: fetch compactions before manifests so GC sees a consistent view of
 //!   in-flight/finished compactions alongside the active manifests.
 //! - **Writes**: persist manifest updates before compactions so new SSTs are visible
-//!   before trimming input references. Checkpoints are written first to keep inputs
-//!   GC-safe during the update.
+//!   before trimming input references. Each replacement includes a checkpoint of
+//!   its base manifest in the same atomic write.
 //!
 //! Keeping these rules in one place makes it harder to regress GC safety or
 //! compactor fencing logic elsewhere in the codebase.
@@ -241,28 +241,22 @@ impl CompactorStateWriter {
         Ok(())
     }
 
-    /// Persists the updated manifest after a compaction finishes.
-    ///
-    /// A checkpoint is written first to prevent GC from deleting SSTs that are about
-    /// to be removed. Its configured lifetime keeps them available to in-flight
-    /// operations such as iterator scans.
+    /// Writes the replacement and a checkpoint of its base in one atomic update.
     async fn write_manifest(&mut self) -> Result<(), SlateDBError> {
-        // write the checkpoint first so that it points to the manifest with the ssts
-        // being removed
-        let checkpoint_id = self.rand.rng().gen_uuid();
-        self.manifest
-            .write_checkpoint(
-                checkpoint_id,
-                &CheckpointOptions {
-                    lifetime: Some(self.checkpoint_lifetime),
-                    ..CheckpointOptions::default()
-                },
-            )
-            .await?;
+        let mut checkpoint = self.manifest.new_checkpoint(
+            self.rand.rng().gen_uuid(),
+            &CheckpointOptions {
+                lifetime: Some(self.checkpoint_lifetime),
+                ..CheckpointOptions::default()
+            },
+        )?;
+        let mut dirty = self.state.manifest().clone();
+        checkpoint.manifest_id = dirty.id.into();
+        dirty.value.core.checkpoints.push(checkpoint);
+        self.manifest.update(dirty).await?;
         self.state
             .merge_remote_manifest(self.manifest.prepare_dirty()?);
-        let dirty = self.state.manifest().clone();
-        self.manifest.update(dirty).await
+        Ok(())
     }
 
     /// Writes the manifest, retrying on sequenced write conflicts by reloading and retrying.
@@ -1155,15 +1149,13 @@ mod tests {
         // Record the version after fencing.
         let start_id = manifest_store.read_latest_manifest().await.unwrap().id;
 
-        // Allow write_manifest's checkpoint through, then block its manifest update.
-        // The safe path has already loaded and pruned local state at that boundary.
+        // Block the atomic manifest update after it prepares the replacement.
         let baseline_puts = gated_store.put_opts_gate.arrivals();
         gated_store.put_opts_gate.close();
-        gated_store.put_opts_gate.admit(1);
         let write_task = tokio::spawn(async move { writer.write_manifest_safely().await });
         gated_store
             .put_opts_gate
-            .wait_for_arrivals(baseline_puts + 2)
+            .wait_for_arrivals(baseline_puts + 1)
             .await;
 
         // Race a checkpoint into the exact version intended by the blocked update.
@@ -1174,7 +1166,7 @@ mod tests {
             .expect("create checkpoint failed");
 
         let conflicting_id = manifest_store.read_latest_manifest().await.unwrap().id;
-        assert_eq!(conflicting_id, start_id + 2);
+        assert_eq!(conflicting_id, start_id + 1);
 
         // Reloading and retrying must neither resurrect the pruned SST nor lose
         // checkpoint metadata from either the external DB or the racing writer.
@@ -1194,12 +1186,7 @@ mod tests {
             .any(|checkpoint| checkpoint.id == remote_checkpoint.id));
 
         let final_id = final_manifest.id;
-        // write_manifest_safely now bumps the manifest twice per successful call because write_manifest
-        // writes a checkpoint first:
-        // - write_manifest() calls self.manifest.write_checkpoint(...) to create the checkpoint, then
-        // - write_manifest() calls self.manifest.update(...) to update the manifest
-        // So we do +1 for the first checkpoint, +1 for the external update, and +2 for
-        // the successful retry.
-        assert_eq!(final_id, start_id + 4);
+        // The racing writer and the successful retry each add one version.
+        assert_eq!(final_id, start_id + 2);
     }
 }

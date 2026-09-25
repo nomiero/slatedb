@@ -128,6 +128,7 @@ impl FenceableManifest {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn write_checkpoint(
         &mut self,
         checkpoint_id: Uuid,
@@ -151,6 +152,7 @@ impl FenceableManifest {
         Ok(checkpoint)
     }
 
+    #[cfg(test)]
     pub(crate) async fn maybe_apply_update<F>(&mut self, mutator: F) -> Result<(), SlateDBError>
     where
         F: Fn(
