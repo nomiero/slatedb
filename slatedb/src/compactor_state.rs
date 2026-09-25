@@ -183,6 +183,12 @@ impl CompactionSpec {
         matches!(self, CompactionSpec::DrainSegment(_))
     }
 
+    /// Returns whether this job reuses an input run as its destination.
+    pub(crate) fn reuses_input_run(&self) -> bool {
+        self.destination()
+            .is_some_and(|id| self.sources().contains(&SourceId::SortedRun(id)))
+    }
+
     /// Returns true if any of the compaction sources are L0 SST views.
     pub fn has_l0_sources(&self) -> bool {
         self.sources()
@@ -1008,6 +1014,20 @@ impl CompactorState {
         remote_manifest.value.core = merged;
         remote_manifest.value.prune_external_sst_ids();
         self.manifest = remote_manifest;
+    }
+
+    pub(crate) fn apply_incremental_progress(
+        &mut self,
+        job: &Compaction,
+        progress: &crate::incremental_compaction::IncrementalProgress,
+        new_view_id: impl FnMut() -> Ulid,
+    ) -> Result<bool, SlateDBError> {
+        let mut core = self.db_state().clone();
+        progress.apply_to_manifest(&mut core, job, new_view_id)?;
+        let changed = &core != self.db_state();
+        self.manifest.value.core = core;
+        self.manifest.value.prune_external_sst_ids();
+        Ok(changed)
     }
 
     /// Registers a newly proposed compaction in the compactor's local state.

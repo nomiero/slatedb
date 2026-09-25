@@ -1276,6 +1276,11 @@ pub struct CompactorOptions {
     #[serde(serialize_with = "serialize_duration")]
     pub commit_compacted_interval: Duration,
 
+    /// Publishes stored output before sorted-run compactions finish.
+    /// Defaults to false. Partial commits use an internal one-minute interval.
+    #[serde(default)]
+    pub enable_incremental_compaction: bool,
+
     /// How long the compactor checkpoint protects input SSTs while publishing a
     /// manifest that replaces them with compacted output.
     ///
@@ -1323,6 +1328,7 @@ impl Default for CompactorOptions {
             worker: Some(CompactionWorkerOptions::default()),
             metric_level: None,
             commit_compacted_interval: Duration::from_secs(1),
+            enable_incremental_compaction: false,
             checkpoint_lifetime: default_compactor_checkpoint_lifetime(),
             worker_heartbeat_timeout: Duration::from_secs(30),
             object_store_max_retries: None,
@@ -1339,6 +1345,10 @@ impl std::fmt::Debug for CompactorOptions {
             .field(
                 "max_concurrent_compactions",
                 &self.max_concurrent_compactions,
+            )
+            .field(
+                "enable_incremental_compaction",
+                &self.enable_incremental_compaction,
             )
             .field("enable_trivial_move", &self.enable_trivial_move)
             .field("scheduler_options", &self.scheduler_options)
@@ -1894,6 +1904,21 @@ mod tests {
     fn test_db_options_default_metric_level() {
         let options = Settings::default();
         assert_eq!(MetricLevel::default(), options.metric_level);
+    }
+
+    #[test]
+    fn incremental_compaction_is_opt_in() {
+        let mut value = serde_json::to_value(CompactorOptions::default()).unwrap();
+        assert_eq!(value["enable_incremental_compaction"], false);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("enable_incremental_compaction");
+        let omitted: CompactorOptions = serde_json::from_value(value.clone()).unwrap();
+        assert!(!omitted.enable_incremental_compaction);
+        value["enable_incremental_compaction"] = true.into();
+        let enabled: CompactorOptions = serde_json::from_value(value).unwrap();
+        assert!(enabled.enable_incremental_compaction);
     }
 
     #[test]

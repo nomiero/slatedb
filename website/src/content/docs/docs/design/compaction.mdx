@@ -43,3 +43,41 @@ to enable them.
 To split data with different read/write profiles into independent LSM trees — each with its own
 compaction policy — and to retire whole key ranges cheaply, see
 [Segmented Compaction](/docs/design/segmented-compaction).
+
+## Incremental compaction
+
+Incremental compaction publishes stored output before a sorted-run compaction finishes.
+An SST is a file that stores sorted rows.
+A view limits which keys readers can see in an SST.
+The coordinator replaces consumed input views with output views and retains the remaining input keys.
+A key with versions across several output SSTs stays in the inputs until all its versions are ready.
+
+Set `CompactorOptions::enable_incremental_compaction` to enable this feature:
+
+```rust
+let options = slatedb::config::CompactorOptions {
+    enable_incremental_compaction: true,
+    ..Default::default()
+};
+```
+
+The default is `false`, which disables partial commits.
+The coordinator waits at least one minute between successful partial commits across all jobs.
+This interval is an internal constant.
+The coordinator commits partial progress during its normal compaction polls.
+Compactions with L0 inputs publish their output only when they finish.
+Final commits do not wait for the interval.
+
+The coordinator batches eligible jobs into one manifest update, even when no SST loses its last view.
+The same atomic write adds a checkpoint, a reference that keeps an older manifest available.
+Garbage collection deletes released files only after their checkpoints expire and their timestamps pass its cutoff.
+
+The destination remains the oldest input run.
+It holds committed output and the remaining input views in key order.
+The scheduler keeps its existing rules for run IDs and run order.
+
+Recovery preserves the range plan, output lists, subcompaction status, and retention sequence.
+Each subcompaction moves from `InProgress` to `Completed` after the worker stores all its output.
+Completed ranges do not run again, including ranges with no output.
+The final commit removes the other input runs and leaves the destination with the full output list.
+If the coordinator restarts before recording completion, recovery recognizes that result and finishes without another manifest write.

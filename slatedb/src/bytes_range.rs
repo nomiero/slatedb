@@ -277,6 +277,10 @@ impl BytesRange {
             .map(|inner| Self { inner })
     }
 
+    pub(crate) fn union(&self, other: &Self) -> Option<Self> {
+        self.inner.union(&other.inner).map(|inner| Self { inner })
+    }
+
     pub(crate) fn is_start_bound_included_or_unbounded(&self) -> bool {
         !matches!(ByteRangeBounds::start_bound(self), Excluded(_))
     }
