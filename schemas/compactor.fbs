@@ -116,6 +116,13 @@ table Compaction {
     ctx: CompactionContext;
 }
 
+enum SubcompactionStatus : byte {
+    // The worker has not finished this range. More output SSTs can follow.
+    InProgress = 0,
+    // The worker stored all output, including an empty result.
+    Completed,
+}
+
 // A compaction over a sub-range of the parent compaction's key space
 // (RFC-0028). Subcompactions are only valid within the context of a parent
 // `Compaction` and let a single logical compaction execute its disjoint
@@ -126,10 +133,11 @@ table Subcompaction {
     // full key space.
     range: BytesRange (required);
 
-    // Output SSTs already produced by this subcompaction. A subcompaction with
-    // output SSTs that cover its full range has completed; on resume, ranges
-    // with no recorded output are re-run from scratch. 
+    // Output SSTs already produced by this subcompaction.
     output_ssts: [CompactedSsTable];
+
+    // Older records without this field read as InProgress.
+    status: SubcompactionStatus;
 }
 
 table CompactionsV1 {

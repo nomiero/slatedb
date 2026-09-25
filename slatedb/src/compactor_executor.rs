@@ -644,12 +644,17 @@ impl TokioCompactionExecutorInner {
             self.send_compaction_progress(id, 0, ctx.clone());
         }
 
+        let mut completed = ctx
+            .subcompactions()
+            .iter()
+            .map(|s| s.completed())
+            .collect::<Vec<_>>();
         let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut sub_tasks = Vec::new();
         for args in subcompaction_args {
-            // Each range runs as its own task, resuming from the output already
-            // recorded against it. A range whose output is already complete
-            // finds nothing left to merge and finishes immediately.
+            if completed[args.index] {
+                continue;
+            }
             let this = self.clone();
             let index = args.index;
             let sequence_tracker = sequence_tracker.clone();
@@ -696,7 +701,6 @@ impl TokioCompactionExecutorInner {
         }
         drop(sub_tx);
 
-        let mut completed = vec![false; num_subcompactions];
         let mut first_error: Option<SlateDBError> = None;
         while !completed.iter().all(|done| *done) {
             let Some(event) = sub_rx.recv().await else {
@@ -718,6 +722,7 @@ impl TokioCompactionExecutorInner {
                 SubcompactionEvent::Finished { index, result } => match result {
                     Ok(output_ssts) => {
                         ctx.set_output_ssts(index, output_ssts);
+                        ctx.mark_completed(index);
                         completed[index] = true;
                         let total_bytes = bytes_processed_by_sub.iter().sum();
                         self.send_compaction_progress(id, total_bytes, ctx.clone());
@@ -2165,9 +2170,7 @@ mod tests {
                 );
             }
 
-            // The fully-complete snapshot must do no merge work — the run is
-            // rebuilt purely from recorded output — yet still report its full
-            // processed size, never regressing to zero.
+            // A completed plan rebuilds its output without reading inputs or reporting new work.
             if index == snapshots.len() - 1 {
                 let recorded: usize = snapshot.iter().map(|s| s.output_ssts().len()).sum();
                 assert_eq!(
@@ -2176,8 +2179,8 @@ mod tests {
                     "resuming a completed compaction must not produce new SSTs"
                 );
                 assert!(
-                    !resume_bytes.is_empty() && resume_bytes.iter().all(|&b| b > 0),
-                    "resuming a completed compaction must never report zero bytes, got {resume_bytes:?}"
+                    resume_bytes.is_empty(),
+                    "completed ranges must not execute again: {resume_bytes:?}"
                 );
             }
         }
@@ -2433,6 +2436,35 @@ mod tests {
         // when/then: the persisted plan is returned verbatim.
         let planned = ctx.executor.inner.plan_compaction_job(args).await.unwrap();
         assert_eq!(planned.ctx.subcompactions(), &persisted);
+    }
+
+    #[tokio::test]
+    async fn should_skip_completed_ranges_without_reading_missing_inputs() {
+        let ctx = TestContextBuilder::new("testdb-completed-range")
+            .build()
+            .await;
+        let missing = SsTableHandle::new(
+            SsTableId::from(Ulid::new()),
+            crate::format::sst::SST_FORMAT_VERSION_LATEST,
+            crate::db_state::SsTableInfo {
+                first_entry: Some(Bytes::from_static(b"a")),
+                last_entry: Some(Bytes::from_static(b"z")),
+                ..Default::default()
+            },
+        );
+        let args = job_with_subcompactions(
+            vec![SsTableView::identity(missing)],
+            vec![],
+            vec![Subcompaction::new(BytesRange::unbounded())
+                .with_status(crate::subcompaction::SubcompactionStatus::Completed)],
+        );
+        let output = ctx
+            .executor
+            .inner
+            .plan_and_execute_compaction_job(args)
+            .await
+            .unwrap();
+        assert!(output.sst_views().is_empty());
     }
 
     /// The planner reads the real input SST indexes and splits a sizable

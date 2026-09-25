@@ -615,7 +615,12 @@ impl CompactionWorkerHandler {
                 return Ok(());
             }
             let heartbeat_ms = self.clock.now().timestamp_millis() as u64;
-            let updated = existing
+            let ctx = self
+                .job_progress
+                .get(&compaction_id)
+                .and_then(Clone::clone)
+                .or_else(|| existing.ctx().cloned());
+            let mut updated = existing
                 .with_status(CompactionStatus::Compacted)
                 .with_output_ssts(
                     sorted_run
@@ -624,8 +629,8 @@ impl CompactionWorkerHandler {
                         .map(|v| v.sst.clone())
                         .collect(),
                 )
-                .with_worker(Some(WorkerSpec::new(self.worker_id.clone(), heartbeat_ms)))
-                .with_ctx(None);
+                .with_worker(Some(WorkerSpec::new(self.worker_id.clone(), heartbeat_ms)));
+            updated.set_ctx(ctx);
             dirty.value.insert(updated);
             match stored.update(dirty).await {
                 Ok(()) => return Ok(()),
@@ -694,7 +699,6 @@ impl CompactionWorkerHandler {
         id: Ulid,
         result: Result<SortedRun, SlateDBError>,
     ) -> Result<(), SlateDBError> {
-        self.job_progress.remove(&id);
         match result {
             Ok(sorted_run) => self.write_compacted(id, sorted_run).await?,
             Err(e) => {
@@ -702,6 +706,7 @@ impl CompactionWorkerHandler {
                 self.release_claim(id).await?;
             }
         }
+        self.job_progress.remove(&id);
         Ok(())
     }
 }
