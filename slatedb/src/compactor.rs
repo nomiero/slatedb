@@ -941,8 +941,8 @@ impl CompactorEventHandler {
     /// - Drain specs do not target the empty-prefix (root) segment
     /// - The target segment exists in the manifest
     /// - All sources exist in the target segment's tree
-    /// - Submitted L0-only tiered compactions have a destination > highest SR id across all trees
-    /// - Compacted L0-only tiered compactions have a destination > highest SR id in their segment
+    /// - Input sources are consecutive in manifest order
+    /// - L0 inputs include the oldest L0 view
     /// - A tiered destination does not overwrite a committed SR in any tree unless the SR is among sources
     /// - Drain L0 sources cover every L0 at or below the newest drained L0 in the target tree
     /// - At most one L0 compaction is Running per segment
@@ -1030,6 +1030,27 @@ impl CompactorEventHandler {
         }
 
         Self::validate_destination_overwrite(spec, db_state)?;
+        if !spec.is_drain() {
+            let logical_sources = tree
+                .l0
+                .iter()
+                .map(|view| SourceId::SstView(view.id))
+                .chain(tree.compacted.iter().map(|run| SourceId::SortedRun(run.id)))
+                .collect::<Vec<_>>();
+            if !logical_sources
+                .windows(spec.sources().len())
+                .any(|window| window == spec.sources())
+            {
+                return Err(SlateDBError::InvalidCompaction);
+            }
+            // L0 output sits before all sorted runs, so it must consume the oldest L0 suffix.
+            if spec.has_l0_sources() {
+                let oldest = tree.l0.back().map(|view| SourceId::SstView(view.id));
+                if oldest.is_some_and(|id| !spec.sources().contains(&id)) {
+                    return Err(SlateDBError::InvalidCompaction);
+                }
+            }
+        }
         Self::validate_drain_watermark_advance(spec, tree)?;
 
         // Reject parallel L0 compactions within the same segment. Each
@@ -1053,6 +1074,22 @@ impl CompactorEventHandler {
                 );
                 return Err(SlateDBError::InvalidCompaction);
             }
+        }
+
+        let reserved = |spec: &CompactionSpec| {
+            spec.sources()
+                .iter()
+                .copied()
+                .chain(spec.destination().map(SourceId::SortedRun))
+                .collect::<HashSet<_>>()
+        };
+        let requested = reserved(spec);
+        if self.state().active_compactions().any(|other| {
+            other.id() != compaction.id()
+                && other.status() != CompactionStatus::Submitted
+                && !requested.is_disjoint(&reserved(other.spec()))
+        }) {
+            return Err(SlateDBError::InvalidCompaction);
         }
 
         self.scheduler
@@ -4910,7 +4947,12 @@ mod tests {
                 {
                     Some(tree) => {
                         tree.compacted.is_empty()
-                            || tree.compacted.last().is_some_and(|sr| destination == sr.id)
+                            || tree.compacted.last().is_some_and(|sr| {
+                                compaction
+                                    .spec()
+                                    .sources()
+                                    .contains(&SourceId::SortedRun(sr.id))
+                            })
                     }
                     None => false,
                 };
@@ -5724,10 +5766,7 @@ mod tests {
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }
 
-    /// The L0-only monotonicity check is global across all segment trees, not
-    /// just the target tree. A spec whose destination is above the target
-    /// tree's local max but below the global max (an SR in some other
-    /// segment) must be rejected.
+    /// An unused destination is valid regardless of other trees' run IDs.
     #[tokio::test]
     async fn test_validate_compaction_l0_only_rejects_when_dest_below_global_highest_sr() {
         let mut fixture = CompactorEventHandlerTestFixture::new().await;
@@ -5805,11 +5844,10 @@ mod tests {
 
         let spec = CompactionSpec::for_segment(prefix, vec![SourceId::SstView(l0_view)], 3);
 
-        let submitted_err = fixture
+        fixture
             .handler
             .validate_compaction(&Compaction::new(Ulid::new(), spec.clone()))
             .unwrap_err();
-        assert!(matches!(submitted_err, SlateDBError::InvalidCompaction));
         let completed = Compaction::new(Ulid::new(), spec).with_status(CompactionStatus::Compacted);
         fixture
             .handler
@@ -5854,7 +5892,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validate_compaction_mixed_l0_and_sr_deferred_to_scheduler() {
+    async fn test_validate_compaction_rejects_mixed_sources_in_wrong_order() {
         let mut fixture = CompactorEventHandlerTestFixture::new().await;
         // create one SR so we can reference its id
         fixture.write_l0().await;
@@ -5874,11 +5912,11 @@ mod tests {
             vec![SourceId::SortedRun(sr_id), SourceId::SstView(l0_view_id)],
             sr_id,
         );
-        // Compactor-level validation should not reject (scheduler default validate returns Ok(()))
+        // The coordinator rejects sources outside manifest order.
         fixture
             .handler
             .validate_compaction(&Compaction::new(Ulid::new(), mixed))
-            .unwrap();
+            .unwrap_err();
     }
 
     #[tokio::test]
@@ -6394,6 +6432,51 @@ mod tests {
         Compaction::new(id, spec)
             .with_status(CompactionStatus::Compacted)
             .with_output_ssts(output)
+    }
+
+    #[tokio::test]
+    async fn output_keeps_the_oldest_input_run_position() {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        Arc::make_mut(
+            &mut fixture
+                .handler
+                .state_mut()
+                .manifest_mut_for_test()
+                .value
+                .core
+                .tree,
+        )
+        .compacted = [5, 4, 3, 2, 1]
+            .into_iter()
+            .map(|id| SortedRun::new(id, []))
+            .collect();
+        let job = Compaction::new(
+            Ulid::from_parts(1, 0),
+            CompactionSpec::new(vec![SourceId::SortedRun(3), SourceId::SortedRun(2)], 2),
+        )
+        .with_status(CompactionStatus::Compacted);
+        fixture.handler.state_mut().insert_compaction_for_test(job);
+        fixture.handler.commit_compacted_entries().await.unwrap();
+        let ids = fixture
+            .handler
+            .state()
+            .db_state()
+            .tree
+            .compacted
+            .iter()
+            .map(|run| run.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![5, 4, 2, 1]);
+        let next = Compaction::new(
+            Ulid::from_parts(2, 0),
+            CompactionSpec::new(vec![SourceId::SortedRun(4), SourceId::SortedRun(2)], 2),
+        );
+        fixture.handler.validate_compaction(&next).unwrap();
+        let invalid = Compaction::new(
+            Ulid::from_parts(3, 0),
+            CompactionSpec::new(vec![SourceId::SortedRun(5), SourceId::SortedRun(2)], 2),
+        );
+        assert!(fixture.handler.validate_compaction(&invalid).is_err());
     }
 
     #[tokio::test]

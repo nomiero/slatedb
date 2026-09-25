@@ -68,7 +68,9 @@ use crate::compactor_executor::{
     CompactionExecutor, StartCompactionJobArgs, TokioCompactionExecutor,
     TokioCompactionExecutorOptions,
 };
-use crate::compactor_state::{Compaction, CompactionContext, CompactionStatus, WorkerSpec};
+use crate::compactor_state::{
+    Compaction, CompactionContext, CompactionStatus, SourceId, WorkerSpec,
+};
 use crate::config::CompactionWorkerOptions;
 use crate::db_state::SortedRun;
 use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef};
@@ -478,7 +480,12 @@ impl CompactionWorkerHandler {
         let is_dest_last_run = match db_state.tree_for_segment(compaction.spec().segment()) {
             Some(tree) => {
                 tree.compacted.is_empty()
-                    || tree.compacted.last().is_some_and(|sr| destination == sr.id)
+                    || tree.compacted.last().is_some_and(|sr| {
+                        compaction
+                            .spec()
+                            .sources()
+                            .contains(&SourceId::SortedRun(sr.id))
+                    })
             }
             None => false,
         };

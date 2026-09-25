@@ -1085,7 +1085,7 @@ impl CompactorState {
     /// Applies the effects of a finished compaction to the in-memory manifest.
     ///
     /// This removes compacted L0 SSTs and source SRs from the spec's target segment tree
-    /// (root tree for an empty segment), inserts the output SR in id-descending order,
+    /// (root tree for an empty segment), inserts the output in descending run ID order,
     /// updates `last_compacted_l0_*`, and marks the compaction finished (retaining the most
     /// recent finished compaction for GC; see #1044).
     pub(crate) fn finish_compaction(&mut self, compaction_id: Ulid, output_sr: SortedRun) {
@@ -1150,7 +1150,7 @@ impl CompactorState {
             if !inserted {
                 new_compacted.push(output_sr);
             }
-            Self::assert_compacted_srs_in_id_order(&new_compacted);
+            assert!(new_compacted.windows(2).all(|runs| runs[0].id > runs[1].id));
             if let Some(view_id) = first_source.maybe_unwrap_sst_view() {
                 // if there are l0s, the newest must be the first entry in sources.
                 // TODO: validate that this is the case
@@ -1254,15 +1254,6 @@ impl CompactorState {
         self.update_compaction(&compaction_id, |c| {
             c.set_status(CompactionStatus::Completed);
         });
-    }
-
-    /// Debug assertion that compacted sorted runs are kept in strictly descending id order.
-    fn assert_compacted_srs_in_id_order(compacted: &[SortedRun]) {
-        let mut last_sr_id = u32::MAX;
-        for sr in compacted.iter() {
-            assert!(sr.id < last_sr_id);
-            last_sr_id = sr.id;
-        }
     }
 }
 

@@ -206,11 +206,19 @@ impl SsTableView {
         range: &BytesRange,
     ) -> Option<BytesRange> {
         if let Some(next_view) = next_view {
-            BytesRange::new(
-                self.compacted_effective_start_bound(),
-                Excluded(next_view.compacted_effective_start_key().clone()),
-            )
-            .intersect(range)
+            let next_key = next_view.compacted_effective_start_key();
+            let end = if self.effective_range.contains(next_key) {
+                Included(next_key.clone())
+            } else {
+                Excluded(next_key.clone())
+            };
+            let intersection =
+                BytesRange::new(self.compacted_effective_start_bound(), end).intersect(range)?;
+            // A new projection must preserve gaps from earlier projections.
+            match &self.visible_range {
+                Some(visible) => intersection.intersect(visible),
+                None => Some(intersection),
+            }
         } else {
             self.effective_range.intersect(range)
         }
