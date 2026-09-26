@@ -1289,8 +1289,8 @@ pub struct CompactorOptions {
     /// longer, garbage collection may delete the SST, causing the operation to fail
     /// with a [`crate::ErrorKind::Data`] error backed by
     /// [`object_store::Error::NotFound`]. Shorter lifetimes reduce retained storage;
-    /// longer lifetimes give in-flight reads more time to finish. Defaults to 15
-    /// minutes.
+    /// longer lifetimes give in-flight reads more time to finish. Defaults to one
+    /// minute.
     #[serde(
         default = "default_compactor_checkpoint_lifetime",
         deserialize_with = "deserialize_duration",
@@ -1465,7 +1465,7 @@ fn default_compaction_worker_options() -> Option<CompactionWorkerOptions> {
 }
 
 fn default_compactor_checkpoint_lifetime() -> Duration {
-    Duration::from_mins(15)
+    Duration::from_mins(1)
 }
 
 /// Options for the Size-Tiered Compaction Scheduler
@@ -1923,7 +1923,7 @@ mod tests {
 
     #[test]
     fn test_compactor_checkpoint_lifetime_config() {
-        let default_lifetime = Duration::from_mins(15);
+        let default_lifetime = Duration::from_mins(1);
         assert_eq!(
             default_lifetime,
             CompactorOptions::default().checkpoint_lifetime
