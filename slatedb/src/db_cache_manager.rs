@@ -261,15 +261,71 @@ mod tests {
     use super::*;
     use std::ops::Bound::Unbounded;
 
-    use crate::config::{FlushOptions, FlushType, PutOptions, Settings, WriteOptions};
+    use crate::config::{
+        FlushOptions, FlushType, ObjectStoreCacheOptions, PutOptions, Settings, WriteOptions,
+    };
     use crate::db::Db;
     use crate::db_cache::{CachedKey, DbCache};
     use crate::manifest::VersionedManifest;
     use crate::DbCacheManagerOps;
     use object_store::memory::InMemory;
-    use object_store::ObjectStore;
+    use object_store::{ObjectStore, ObjectStoreExt};
 
     const PATH: &str = "/cache_manager_test";
+
+    #[tokio::test]
+    async fn test_evict_sst_from_disk_cache_keeps_remote_data_readable() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemory::new());
+        let db = Db::builder(PATH, store.clone())
+            .with_settings(Settings {
+                flush_interval: None,
+                compactor_options: None,
+                garbage_collector_options: None,
+                object_store_cache_options: ObjectStoreCacheOptions {
+                    root_folder: Some(root.path().to_path_buf()),
+                    max_cache_size_bytes: None,
+                    part_size_bytes: 1024,
+                    cache_on_flush: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        write_keys(&db, 8).await;
+        flush_to_l0(&db).await;
+        let sst = first_l0_sst(&db);
+        let path = db.inner.table_store.path(&sst.id);
+        let local = root.path().join(path.as_ref());
+        assert!(local.is_dir());
+        let remote = store.get(&path).await.unwrap().bytes().await.unwrap();
+
+        db.evict_cached_sst(&sst, &CacheTarget::all())
+            .await
+            .unwrap();
+        db.evict_sst_from_disk_cache(&sst.id).await.unwrap();
+        assert!(!local.exists());
+        db.evict_sst_from_disk_cache(&sst.id).await.unwrap();
+        assert_eq!(
+            store.get(&path).await.unwrap().bytes().await.unwrap(),
+            remote
+        );
+
+        assert!(db.get(b"key000000").await.unwrap().is_some());
+        assert!(local.is_dir());
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_evict_sst_from_disk_cache_without_disk_cache() {
+        let db = open_db_single_sst(Arc::new(InMemory::new())).await;
+        db.evict_sst_from_disk_cache(&SsTableId::new(ulid::Ulid::new()))
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+    }
 
     async fn open_db_single_sst(object_store: Arc<dyn ObjectStore>) -> Db {
         // No l0_sst_size_bytes cap so one flush yields a single SST whose cache
@@ -560,6 +616,14 @@ mod tests {
             .expect_err("evict_cached_sst on closed db");
         assert_eq!(
             evict_err.kind(),
+            crate::ErrorKind::Closed(crate::CloseReason::Clean),
+        );
+        let disk_evict_err = db
+            .evict_sst_from_disk_cache(&sst.id)
+            .await
+            .expect_err("evict_sst_from_disk_cache on closed db");
+        assert_eq!(
+            disk_evict_err.kind(),
             crate::ErrorKind::Closed(crate::CloseReason::Clean),
         );
         let flush_err = db

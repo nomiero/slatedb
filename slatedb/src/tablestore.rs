@@ -934,7 +934,7 @@ impl TableStore {
         .await
     }
 
-    fn path(&self, id: &SsTableId) -> Path {
+    pub(crate) fn path(&self, id: &SsTableId) -> Path {
         self.path_resolver.sst_path(id)
     }
 

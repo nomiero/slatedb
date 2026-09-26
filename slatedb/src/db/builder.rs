@@ -872,9 +872,9 @@ impl<P: Into<Path>> DbBuilder<P> {
         inner.replay_wal(replay_iterator).await?;
 
         // Preload cache if enabled
-        if let Some(cached_obj_store) = cached_object_store {
+        if let Some(cached_obj_store) = &cached_object_store {
             inner
-                .preload_cache(&cached_obj_store, &path_resolver)
+                .preload_cache(cached_obj_store, &path_resolver)
                 .await?;
         }
 
@@ -882,6 +882,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         Ok(Db {
             inner,
             task_executor,
+            cached_object_store,
         })
     }
 }

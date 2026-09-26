@@ -178,6 +178,18 @@ impl CachedObjectStore {
         }
     }
 
+    /// Removes local cache files without deleting the object from remote storage.
+    ///
+    /// Removal is best effort and logs disk errors. With capacity eviction
+    /// enabled, the background task performs removal after this call returns.
+    /// Reads can cache the object again, including reads that overlap removal.
+    pub async fn evict(&self, location: &Path) {
+        self.cache_storage
+            .entry(location, self.part_size_bytes)
+            .delete()
+            .await;
+    }
+
     /// Loads files into the cache up to a maximum number of bytes.
     ///
     /// Fetches each object's raw bytes from the wrapped store and saves them
@@ -2300,7 +2312,11 @@ mod tests {
     #[case::no_evictor_uncached(false, false)]
     #[case::with_evictor_uncached(true, false)]
     #[tokio::test]
-    async fn test_delete(#[case] evictor: bool, #[case] cached: bool) {
+    async fn test_delete_or_evict(
+        #[case] evictor: bool,
+        #[case] cached: bool,
+        #[values(false, true)] evict_only: bool,
+    ) {
         const PART_SIZE: usize = 1024;
 
         let location1 = Path::from("/data/testfile1");
@@ -2332,7 +2348,7 @@ mod tests {
         ));
 
         let cached_store = CachedObjectStore::new(
-            object_store,
+            object_store.clone(),
             Arc::clone(&cache_storage) as Arc<dyn LocalCacheStorage>,
             PART_SIZE,
             CachePutConfig::default(),
@@ -2378,7 +2394,11 @@ mod tests {
         let parts2 = entry2.cached_parts().await.unwrap();
         assert_eq!(parts2.len(), 3, "{parts2:?}");
 
-        cached_store.delete(&location1).await.unwrap();
+        if evict_only {
+            cached_store.evict(&location1).await;
+        } else {
+            cached_store.delete(&location1).await.unwrap();
+        }
         if evictor {
             // XXX: If evictor is running, deletion is performed asynchronously
             //      from the evictor "thread".
@@ -2394,8 +2414,26 @@ mod tests {
         let parts2 = entry2.cached_parts().await.unwrap();
         assert_eq!(parts2.len(), 3, "{parts2:?}");
 
-        // verify repeated delete is idempotent
-        cached_store.delete(&location1).await.unwrap();
+        // Repeated removal succeeds when the cache files are absent.
+        if evict_only {
+            cached_store.evict(&location1).await;
+            assert_eq!(
+                object_store
+                    .get(&location1)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+                payload,
+            );
+        } else {
+            cached_store.delete(&location1).await.unwrap();
+            assert!(matches!(
+                object_store.head(&location1).await,
+                Err(object_store::Error::NotFound { .. })
+            ));
+        }
         let entry1 = cached_store.cache_storage.entry(&location1, PART_SIZE);
         let parts1 = entry1.cached_parts().await.unwrap();
         assert_eq!(parts1.len(), 0, "{parts1:?}");

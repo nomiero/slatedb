@@ -594,6 +594,8 @@ impl DbInner {
 pub struct Db {
     pub(crate) inner: Arc<DbInner>,
     task_executor: Arc<MessageHandlerExecutor>,
+    /// Disk cache created from the database settings.
+    cached_object_store: Option<Arc<CachedObjectStore>>,
 }
 
 impl Db {
@@ -2038,6 +2040,24 @@ impl Db {
     /// See [`DbMetadataOps::status`].
     pub fn status(&self) -> DbStatus {
         <Self as DbMetadataOps>::status(self)
+    }
+
+    /// Removes an SST from the disk cache configured through [`Settings`].
+    ///
+    /// This leaves the object in remote storage and the block cache unchanged.
+    /// The SST need not appear in the current manifest. Reads can fetch it
+    /// again, including reads that overlap this call.
+    ///
+    /// Removal is best effort. The cache logs disk errors and, when capacity
+    /// eviction is enabled, queues removal for its background task.
+    /// Does nothing if the settings do not configure a disk cache. Call
+    /// [`CachedObjectStore::evict`] directly for a cache supplied by the caller.
+    pub async fn evict_sst_from_disk_cache(&self, sst_id: &SsTableId) -> Result<(), crate::Error> {
+        self.inner.check_closed()?;
+        if let Some(cache) = &self.cached_object_store {
+            cache.evict(&self.inner.table_store.path(sst_id)).await;
+        }
+        Ok(())
     }
 }
 
